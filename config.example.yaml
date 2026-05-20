@@ -1,0 +1,16 @@
+listen_host: 0.0.0.0
+listen_port: 8787
+
+mitm:
+  port_base: 18000          # each user session takes one port starting here
+  ca_cert: ~/.mitmproxy/mitmproxy-ca-cert.pem
+
+claude:
+  binary: claude            # path to claude code CLI
+  home_template: ./users/{user_id}   # per-user HOME (so each user has own ~/.claude/)
+  idle_timeout_seconds: 900
+
+# bearer token -> user_id
+users:
+  sk-internal-alice: alice
+  sk-internal-bob: bob

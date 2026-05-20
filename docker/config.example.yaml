@@ -1,0 +1,28 @@
+# Docker-friendly config: absolute paths under /home/coder and /data.
+# Mount this file into the container at /data/config.yaml.
+
+listen_host: 0.0.0.0
+listen_port: 8787
+
+mitm:
+  # Per-user mitm listener: first user gets 18000, next 18001, etc.
+  port_base: 18000
+  # mitmproxy auto-generates this on first run; the directory is a named
+  # volume in compose so the CA survives restarts. Must match HOME=/home/coder.
+  ca_cert: /home/coder/.mitmproxy/mitmproxy-ca-cert.pem
+
+claude:
+  binary: claude
+  # Each API user gets an isolated HOME under /data/users/<user_id>/.
+  # _seed_home copies operator's .claude.json + .credentials.json here.
+  home_template: /data/users/{user_id}
+  idle_timeout_seconds: 900
+
+# Bearer/api-key → user_id mapping. Add your own entries here. Generate
+# a key with:
+#     echo "sk-internal-$(openssl rand -hex 24)"
+#
+# Example:
+#   sk-internal-1bf94b...e3: alice
+#   sk-internal-7c93af...91: bob
+users: {}

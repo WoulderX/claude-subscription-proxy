@@ -1,0 +1,69 @@
+# Run a Claude Code subscription proxy on this host.
+#
+# Before `docker compose up`:
+#   1. Have a logged-in claude CLI somewhere on this host, then mirror
+#      its ~/.claude/ into the shared auth directory:
+#
+#          mkdir -p /data/shared-auth
+#          # If claude is logged in as the same user running compose:
+#          cp -r ~/.claude /data/shared-auth/claude
+#          # Otherwise copy from wherever the logged-in HOME is.
+#
+#      Verify /data/shared-auth/claude/.credentials.json exists.
+#
+#   2. Copy the example config and add your API keys:
+#          cp docker/config.example.yaml config.yaml
+#          # edit `users:` — generate keys with:
+#          #     echo "sk-internal-$(openssl rand -hex 24)"
+#
+#   3. docker compose up --build -d
+#
+# Volumes:
+#   /data/shared-auth/claude   → /home/coder/.claude  (RO bind)
+#       Whole .claude/ directory from the host's logged-in claude install.
+#       Must contain .credentials.json. The host can keep refreshing it.
+#   mitm-ca (named)           → /home/coder/.mitmproxy
+#       mitm CA, generated on first run, persisted across restarts.
+#   ./users                   → /data/users
+#       Per-API-user transcripts / isolated $HOME directories.
+#
+services:
+  proxy:
+    user: 1000:1000
+    build: .
+    image: claude-subscription-proxy:latest
+    container_name: claude-subscription-proxy
+    restart: unless-stopped
+    ports:
+      # 外部 18787 → 容器内 8787。绑定 0.0.0.0：同网段其它主机
+      # (LiteLLM 等) 可直连。仅本机访问改成 "127.0.0.1:18787:8787"。
+      # 严禁暴露到公网 —— 项目无速率限制且违反 Anthropic ToS。
+      - "0.0.0.0:18787:8787"
+    environment:
+      LOG_LEVEL: INFO
+      HOME: /home/coder
+      CONFIG: /data/config.yaml
+    volumes:
+      # config (RO)
+      - ./config.yaml:/data/config.yaml:ro
+      # operator's whole claude state dir — bind from a shared host path.
+      # RW (not :ro): every per-API-user worker symlinks .credentials.json
+      # back to THIS file, so a claude-CLI OAuth token refresh writes the
+      # new token straight here — one shared, always-fresh credential for
+      # all users. A :ro mount still works (workers read the live token on
+      # each start) but then refreshes can't be persisted.
+      - /data/shared-auth/claude:/home/coder/.claude
+      # mitm CA — named volume so the auto-generated CA persists across
+      # `docker compose down` / restart. Wipe with `docker compose down -v`.
+      - mitm-ca:/home/coder/.mitmproxy
+      # per-API-user state (transcripts, isolated $HOME for each user)
+      - ./users:/data/users
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  mitm-ca:
