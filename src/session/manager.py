@@ -37,6 +37,21 @@ class SessionManager:
 
     async def start(self) -> None:
         self._restarter_task = asyncio.create_task(self._restarter())
+        # Prewarm: spawn a worker for every configured user during
+        # container startup so the first request from each user does
+        # not pay the cold-start cost (claude CLI TUI boot + mitm
+        # bring-up, ~10s). Serial to avoid CPU/IO contention between
+        # concurrently booting CLIs; per-user failures are logged but
+        # do not block service startup, so a misconfigured user falls
+        # back to lazy spawn on first request (same as before).
+        user_ids = sorted(set(self.config.users.values()))
+        for user_id in user_ids:
+            try:
+                await self.get_or_create(user_id)
+                log.info("prewarmed user=%s", user_id)
+            except Exception:
+                log.exception("prewarm failed user=%s; "
+                              "first request will cold-start", user_id)
 
     async def stop(self) -> None:
         if self._restarter_task:

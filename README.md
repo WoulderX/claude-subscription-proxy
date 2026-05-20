@@ -875,10 +875,11 @@ bind: address already in use
 
 ### 7.13 性能 / 限流
 
-- 首次请求 ~7s（worker 冷启动）；后续 1–2s TTFB
+- 容器启动时会把 `users:` 配置里所有用户的 worker 预热起来（每个 ~10s，串行）；之后首次请求 TTFB 1–2s
 - 同 user 串行；并发用多个 user
 - worker 默认每 12h 就地重启一次（清 CLI 累积状态）；重启期间该 user 的新请求会等新 worker 起来再走，在飞请求最多等 60s 排空，超时被截断
-- 想改：`claude.restart_interval_seconds`
+- 预热失败（凭证缺失 / claude 二进制找不到 / 端口冲突）只 log 不阻塞服务启动；该用户下次请求会回退到懒加载冷启动
+- 想改重启周期：`claude.restart_interval_seconds`
 
 ---
 
