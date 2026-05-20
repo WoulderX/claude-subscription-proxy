@@ -8,7 +8,7 @@ mitm:
 claude:
   binary: claude            # path to claude code CLI
   home_template: ./users/{user_id}   # per-user HOME (so each user has own ~/.claude/)
-  idle_timeout_seconds: 900
+  restart_interval_seconds: 43200        # 12h — worker is recycled in place to clear CLI state
 
 # bearer token -> user_id
 users:

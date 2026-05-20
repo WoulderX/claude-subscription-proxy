@@ -30,6 +30,7 @@ class ClaudeSession:
         self.config = config
         self.lock = asyncio.Lock()  # one in-flight request per user
         self.last_used = time.monotonic()
+        self.started_at = time.monotonic()
 
         self.proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -147,11 +148,14 @@ class ClaudeSession:
         Anthropic SSE response bytes verbatim. Lock holds until the
         request enters the worker — releasing the lock while the worker
         is still streaming back would let a second caller race with the
-        first, since the worker can only serve one model call at a time."""
-        if self.proc is None or self.proc.returncode is not None:
-            raise RuntimeError(f"worker for {self.user_id} not running")
+        first, since the worker can only serve one model call at a time.
 
+        The proc-alive check is inside the lock so a request arriving
+        during a scheduled restart waits for the new worker rather than
+        racing with the dead one."""
         async with self.lock:
+            if self.proc is None or self.proc.returncode is not None:
+                raise RuntimeError(f"worker for {self.user_id} not running")
             self.last_used = time.monotonic()
             req_id = self._next_req_id
             self._next_req_id += 1
@@ -211,3 +215,22 @@ class ClaudeSession:
 
     def idle_seconds(self) -> float:
         return time.monotonic() - self.last_used
+
+    def age_seconds(self) -> float:
+        return time.monotonic() - self.started_at
+
+    async def restart(self) -> None:
+        """Tear down the current worker subprocess and spin a fresh one
+        on the same mitm port. Caller MUST hold self.lock so no new
+        request is submitted mid-restart. In-flight SSE streams whose
+        bytes were already in transit get truncated (stop() drains their
+        channels with a None sentinel)."""
+        await self.stop()
+        self._closed = False
+        self.proc = None
+        self._reader_task = None
+        self._next_req_id = 0
+        self._channels = {}
+        self.started_at = time.monotonic()
+        self.last_used = time.monotonic()
+        await self.start()

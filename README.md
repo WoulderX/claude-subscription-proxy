@@ -294,7 +294,7 @@ mitm:
 claude:
   binary: claude
   home_template: /data/users/{user_id}
-  idle_timeout_seconds: 900
+  restart_interval_seconds: 43200   # 12h: worker recycled in place to clear CLI state
 
 # bearer token -> user_id
 users:
@@ -425,7 +425,7 @@ operator OAuth 账号（同一个订阅配额）。
 | `mitm.ca_cert` | mitm CA PEM 路径；首次启动自动生成。Docker 里固定 `/home/coder/.mitmproxy/mitmproxy-ca-cert.pem`。 |
 | `claude.binary` | `claude` 二进制；镜像里已在 `$PATH`。 |
 | `claude.home_template` | 每用户隔离 `$HOME` 路径模板。Docker 里 `/data/users/{user_id}`。 |
-| `claude.idle_timeout_seconds` | 闲置回收时长。idle 超时的 worker 会被 reaper 释放，下次请求重新冷启动。 |
+| `claude.restart_interval_seconds` | 定时重启间隔。worker 不再因 idle 被回收；到达 age 后**就地重启**（同 session、同端口），用来清掉 CLI 累积状态。优雅等待最多 60s 让在飞请求结束。默认 43200（12h）。 |
 | `users` | `bearer_token → user_id` 映射。 |
 
 ### 3.2 docker-compose.yml 关键项
@@ -877,8 +877,8 @@ bind: address already in use
 
 - 首次请求 ~7s（worker 冷启动）；后续 1–2s TTFB
 - 同 user 串行；并发用多个 user
-- idle 15 分钟后 worker 被回收，下次请求重新冷启动
-- 想改：`claude.idle_timeout_seconds`
+- worker 默认每 12h 就地重启一次（清 CLI 累积状态）；重启期间该 user 的新请求会等新 worker 起来再走，在飞请求最多等 60s 排空，超时被截断
+- 想改：`claude.restart_interval_seconds`
 
 ---
 

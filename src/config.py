@@ -16,7 +16,10 @@ class MitmConfig(BaseModel):
 class ClaudeConfig(BaseModel):
     binary: str = "claude"
     home_template: str = "./users/{user_id}"
-    idle_timeout_seconds: int = 900
+    # Worker stays alive between requests. To shed accumulated CLI state
+    # (Ink scroll buffer, in-memory transcript, cached OAuth access token,
+    # any leak) the manager restarts each worker after this many seconds.
+    restart_interval_seconds: int = 43200  # 12h
 
 
 class Config(BaseModel):
