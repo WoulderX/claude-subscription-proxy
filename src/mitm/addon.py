@@ -19,8 +19,13 @@ MESSAGES_PATH_PREFIX = "/v1/messages"
 
 # Body fields the user payload owns: claude's originals are dropped, user's
 # values win. Everything else from claude's body is preserved verbatim
-# (system prompt, tools list, metadata, anthropic_version, etc.) so the
-# request keeps its "subscription / interactive Claude Code" fingerprint.
+# (metadata, anthropic_version, etc.) so the request keeps its
+# "subscription / interactive Claude Code" fingerprint.
+#
+# `tools` is user-owned so callers can do real function calling against
+# their own schemas (e.g. get_weather). When the caller does not send
+# `tools`, claude CLI's built-in tools (Bash/Read/Edit/...) remain in
+# place — the merge only replaces fields the caller explicitly set.
 USER_OWNED_BODY_FIELDS = {
     "messages",
     "model",
@@ -31,6 +36,7 @@ USER_OWNED_BODY_FIELDS = {
     "stop_sequences",
     "stream",
     "tool_choice",
+    "tools",
 }
 
 # Request headers we never touch — these encode claude code's identity

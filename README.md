@@ -888,7 +888,7 @@ bind: address already in use
 
 | 限制 | 缓解 |
 |---|---|
-| 用户声明的 `tools` 被丢弃，CLI 内建工具列表始终在；模型可能尝试调用 `Bash`/`Read`/`Write` | 请求里加 `"tool_choice": {"type": "none"}` 完全禁用工具 |
+| 不传 `tools` 时 CLI 内建工具（`Bash`/`Read`/`Edit`/...）会保留在请求里，模型可能去调它们 | 传你自己的 `tools=[...]`（会完全覆盖 CLI 的），或请求里加 `"tool_choice": {"type": "none"}` 完全禁用工具 |
 | Anthropic 上游 4xx/5xx 会以 SSE error event 或非 SSE JSON 形式返回；HTTP 状态码不传递 | 已缓解：collapse 后的 message 含 `stop_reason: "error"` 和错误文本 |
 | 单 OAuth 账号 = 单一订阅配额，所有 user 共享 | 多账号池待实现 |
 | `assistant.content` 可能包含 `thinking` blocks（自适应思考模式） | 客户端兼容性问题；可在 API 层 strip |
