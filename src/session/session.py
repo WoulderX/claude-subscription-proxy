@@ -19,6 +19,39 @@ from .state import ResponseChannel
 log = logging.getLogger(__name__)
 
 
+def _summarize_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Produce a small log-safe summary of a request body for /status,
+    so operators can see what a worker is processing without expanding
+    the full JSON. Truncates user content to 80 chars to bound response
+    size and avoid dumping full prompts into a health endpoint."""
+    if not isinstance(body, dict):
+        return {}
+    msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
+    last_user_text = ""
+    for m in reversed(msgs):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            last_user_text = content
+        elif isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    last_user_text = blk.get("text", "")
+                    break
+        break
+    preview = last_user_text[:80]
+    if len(last_user_text) > 80:
+        preview += "…"
+    return {
+        "model": body.get("model"),
+        "max_tokens": body.get("max_tokens"),
+        "stream": bool(body.get("stream")),
+        "n_messages": len(msgs),
+        "last_user_preview": preview,
+    }
+
+
 class ClaudeSession:
     """Owns the worker subprocess for one user. Serialises requests with
     a per-session asyncio lock — one outbound /v1/messages per claude
@@ -181,7 +214,7 @@ class ClaudeSession:
             self.last_used = time.monotonic()
             req_id = self._next_req_id
             self._next_req_id += 1
-            channel = ResponseChannel()
+            channel = ResponseChannel(body_summary=_summarize_body(body))
             self._channels[req_id] = channel
 
             assert self.proc.stdin is not None
@@ -218,6 +251,7 @@ class ClaudeSession:
                     if data:
                         channel.queue.put_nowait(data)
                         channel.last_chunk_at = time.monotonic()
+                        channel.bytes_received += len(data)
                 elif t == "end":
                     channel.queue.put_nowait(None)
                     self._channels.pop(req_id, None)

@@ -73,6 +73,12 @@ def create_app(config: Config) -> FastAPI:
                     # channel pattern, the latter is upstream slowing
                     # down mid-stream.
                     "ever_received_bytes": ch.last_chunk_at != ch.created_at,
+                    "bytes_received": ch.bytes_received,
+                    # Tells you WHAT the worker is processing right now:
+                    # model, n_messages, max_tokens, first 80 chars of
+                    # the last user message. Helps spot "all 20 workers
+                    # are stuck on the same prompt" patterns at a glance.
+                    "body": ch.body_summary,
                 })
 
             # Stuck heuristic: any in-flight request older than

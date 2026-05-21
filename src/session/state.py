@@ -19,12 +19,23 @@ class PendingRequest:
 @dataclass
 class ResponseChannel:
     """Mitm addon writes raw SSE bytes here as they stream in from Anthropic.
-    API handler reads until sentinel (None) is enqueued. Timestamps let
-    /status distinguish a healthy in-flight request (bytes flowing) from
-    a stalled / orphaned channel (no bytes ever, or no bytes for >30s)."""
+    API handler reads until sentinel (None) is enqueued. Timestamps and
+    body_summary let /status distinguish a healthy in-flight request
+    (bytes flowing, recent chunk) from a stalled / orphaned channel
+    (no bytes ever, or no bytes for >30s), and show what each worker
+    is actually processing right now."""
     queue: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
     created_at: float = field(default_factory=time.monotonic)
     last_chunk_at: float = field(default_factory=time.monotonic)
+    # Total response bytes that have flowed through this channel from
+    # mitm to the API handler so far. Bumped by session._read_loop.
+    bytes_received: int = 0
+    # Small log-safe summary of the request that opened this channel
+    # (model / max_tokens / n_messages / preview of last user message).
+    # Populated by ClaudeSession.call at submission time so operators
+    # can see what a stuck worker was trying to do without expanding
+    # the full request body.
+    body_summary: dict[str, Any] = field(default_factory=dict)
 
     async def put(self, chunk: bytes | None) -> None:
         await self.queue.put(chunk)
