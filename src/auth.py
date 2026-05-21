@@ -7,7 +7,9 @@ from .config import Config
 
 def make_auth_dep(config: Config):
     async def auth(authorization: str | None = Header(default=None),
-                   x_api_key: str | None = Header(default=None)) -> str:
+                   x_api_key: str | None = Header(default=None)) -> list[str]:
+        """Resolve the bearer/x-api-key header to a user pool — always a
+        list, even for single-user tokens (Config normalises scalars)."""
         token = None
         if authorization and authorization.lower().startswith("bearer"):
             # Slice past the "bearer" literal then strip — tolerates clients

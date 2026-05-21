@@ -16,11 +16,11 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
     router = APIRouter()
 
     @router.post("/v1/messages")
-    async def messages(req: Request, user_id: str = Depends(auth_dep)) -> Any:
+    async def messages(req: Request, pool: list[str] = Depends(auth_dep)) -> Any:
         body = await req.json()
         wants_stream = bool(body.get("stream", False))
 
-        sess = await manager.get_or_create(user_id)
+        sess = await manager.pick(pool)
         channel = await sess.call(body)
 
         if wants_stream:

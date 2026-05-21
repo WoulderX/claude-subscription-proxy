@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class MitmConfig(BaseModel):
@@ -27,7 +27,30 @@ class Config(BaseModel):
     listen_port: int = 8787
     mitm: MitmConfig = Field(default_factory=MitmConfig)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
-    users: dict[str, str] = Field(default_factory=dict)
+    # token -> [user_id, ...]. A scalar in YAML (`sk-...: litellm`) is
+    # normalised to a single-element list so the rest of the codebase
+    # treats every token as a pool. A list (`sk-...: [a, b, c]`) is the
+    # pool form — incoming requests for that token are load-balanced
+    # across the listed workers.
+    users: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("users", mode="before")
+    @classmethod
+    def _normalise_users(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        out: dict[str, list[str]] = {}
+        for tok, val in raw.items():
+            if isinstance(val, str):
+                out[tok] = [val]
+            elif isinstance(val, list):
+                if not val:
+                    raise ValueError(f"users[{tok}] is empty list")
+                out[tok] = [str(x) for x in val]
+            else:
+                raise ValueError(
+                    f"users[{tok}] must be str or list of str, got {type(val).__name__}")
+        return out
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":

@@ -22,6 +22,9 @@ class SessionManager:
         self.lock = asyncio.Lock()
         self._next_port_offset = 0
         self._restarter_task: asyncio.Task | None = None
+        # Round-robin tiebreaker counter, keyed by the tuple of pool
+        # members. Used only when every worker in the pool is busy.
+        self._rr: dict[tuple[str, ...], int] = {}
 
     async def get_or_create(self, user_id: str) -> ClaudeSession:
         async with self.lock:
@@ -35,6 +38,33 @@ class SessionManager:
             self.sessions[user_id] = sess
             return sess
 
+    async def pick(self, pool: list[str]) -> ClaudeSession:
+        """Pick a session from a token's user pool. With one member this
+        is just get_or_create. With several, we prefer a worker that has
+        no in-flight request (len(_channels) == 0); if every worker is
+        busy, fall back to fewest-in-flight, breaking ties with a
+        round-robin counter so a steady stream of requests gets spread
+        across the pool rather than piling onto whichever worker happens
+        to win the min() comparison repeatedly."""
+        if len(pool) == 1:
+            return await self.get_or_create(pool[0])
+        sessions = [await self.get_or_create(u) for u in pool]
+        idle = [s for s in sessions if not s._channels]
+        if idle:
+            # Among idle workers, round-robin too so a burst of fast
+            # requests doesn't always hit pool[0].
+            key = tuple(pool)
+            idx = self._rr.get(key, 0) % len(idle)
+            self._rr[key] = idx + 1
+            return idle[idx]
+        # All busy — fewest in-flight wins, RR breaks ties.
+        min_inflight = min(len(s._channels) for s in sessions)
+        candidates = [s for s in sessions if len(s._channels) == min_inflight]
+        key = tuple(pool)
+        idx = self._rr.get(key, 0) % len(candidates)
+        self._rr[key] = idx + 1
+        return candidates[idx]
+
     async def start(self) -> None:
         self._restarter_task = asyncio.create_task(self._restarter())
         # Prewarm: spawn a worker for every configured user during
@@ -44,7 +74,11 @@ class SessionManager:
         # concurrently booting CLIs; per-user failures are logged but
         # do not block service startup, so a misconfigured user falls
         # back to lazy spawn on first request (same as before).
-        user_ids = sorted(set(self.config.users.values()))
+        user_ids: list[str] = []
+        for pool in self.config.users.values():
+            for u in pool:
+                if u not in user_ids:
+                    user_ids.append(u)
         for user_id in user_ids:
             try:
                 await self.get_or_create(user_id)

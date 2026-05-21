@@ -20,13 +20,13 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
     router = APIRouter()
 
     @router.post("/v1/chat/completions")
-    async def chat_completions(req: Request, user_id: str = Depends(auth_dep)) -> Any:
+    async def chat_completions(req: Request, pool: list[str] = Depends(auth_dep)) -> Any:
         oi_req = await req.json()
         model = oi_req.get("model", "claude-sonnet-4-5")
         wants_stream = bool(oi_req.get("stream", False))
 
         anth_req = openai_to_anthropic(oi_req)
-        sess = await manager.get_or_create(user_id)
+        sess = await manager.pick(pool)
         channel = await sess.call(anth_req)
 
         if wants_stream:

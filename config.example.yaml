@@ -3,14 +3,20 @@ listen_port: 8787
 
 mitm:
   port_base: 18000          # each user session takes one port starting here
-  ca_cert: ~/.mitmproxy/mitmproxy-ca-cert.pem
+  ca_cert: /home/coder/.mitmproxy/mitmproxy-ca-cert.pem
 
 claude:
   binary: claude            # path to claude code CLI
-  home_template: ./users/{user_id}   # per-user HOME (so each user has own ~/.claude/)
+  home_template: /data/users/{user_id}   # per-user HOME (so each user has own ~/.claude/)
   restart_interval_seconds: 43200        # 12h — worker is recycled in place to clear CLI state
 
-# bearer token -> user_id
+# bearer token -> user_id (scalar) OR list of user_ids (pool).
+# A list-form token round-robins requests across the listed workers,
+# so a single key in LiteLLM can drive N parallel claude PTYs.
 users:
   sk-internal-alice: alice
   sk-internal-bob: bob
+  sk-internal-litellm:
+    - litellm-0
+    - litellm-1
+    - litellm-2

@@ -18,11 +18,15 @@ claude:
   home_template: /data/users/{user_id}
   idle_timeout_seconds: 900
 
-# Bearer/api-key → user_id mapping. Add your own entries here. Generate
-# a key with:
+# Bearer/api-key → user_id (scalar) or pool (list). A list-form token
+# is round-robined across the listed workers, so a single LiteLLM key
+# can drive N parallel claude PTYs in this proxy. Generate keys with:
 #     echo "sk-internal-$(openssl rand -hex 24)"
 #
-# Example:
-#   sk-internal-1bf94b...e3: alice
-#   sk-internal-7c93af...91: bob
+# Examples:
+#   sk-internal-1bf94b...e3: alice          # single worker, requests serialised
+#   sk-internal-7c93af...91:                # pool: 3 parallel workers behind one key
+#     - litellm-0
+#     - litellm-1
+#     - litellm-2
 users: {}

@@ -86,43 +86,57 @@ class ClaudeSession:
                  self.user_id, self.proc.pid, self.mitm_port)
 
     def _seed_home(self, home: Path) -> None:
-        """Populate the user's isolated HOME from the operator's HOME so
-        claude code skips its first-run onboarding (theme picker, etc.)
-        and uses the operator's OAuth credentials.
+        """Populate the user's isolated HOME so claude code skips its
+        first-run onboarding and shares the operator's OAuth credentials.
 
-          - $HOME/.claude.json            -> copied once (onboarding marker;
-            claude CLI mutates it heavily, so each user keeps a private one)
-          - $HOME/.claude/.credentials.json -> SYMLINKED to the operator's
-            file. Every worker shares one credentials source; no per-user
-            copy is ever kept. A refreshed / re-logged-in operator token is
-            picked up automatically on the next worker start, with no stale
-            copy left behind to purge.
-
-        Transcripts, sessions, telemetry stay isolated per-user."""
-        op_home = Path(os.path.expanduser("~"))
+          - $HOME/.claude.json  -> copied once. claude CLI mutates this
+            heavily per session, so each user keeps a private copy to
+            avoid concurrent-write races between workers.
+          - $HOME/.claude/      -> SYMLINKED (entire directory) to the
+            operator's ~/.claude/. Sharing at the directory level means a
+            claude-CLI atomic token refresh (write tmp + rename) happens
+            *inside* the shared directory — the new file lands directly
+            at the operator's source path. All other workers transparently
+            read the rotated token on their next call; no copy-back or
+            propagation logic is needed. Per-user transcript isolation
+            still works because claude stores sessions under cwd-encoded
+            subdirs (.claude/projects/<encoded-cwd>/sessions/), and each
+            worker's cwd is its own HOME."""
+        op_home = Path(os.path.expanduser("~")).resolve()
         marker = home / ".claude.json"
-        creds_dst = home / ".claude" / ".credentials.json"
-        creds_dst.parent.mkdir(parents=True, exist_ok=True)
-
         src_marker = op_home / ".claude.json"
-        src_creds = op_home / ".claude" / ".credentials.json"
         if src_marker.is_file() and not marker.exists():
             shutil.copy2(src_marker, marker)
             log.info("seeded %s/.claude.json", home)
 
-        # Credentials: (re)point a symlink at the operator's file on every
-        # start. Unlink whatever is there first — a stale copy from an older
-        # build, a dangling link, or a regular file a claude-CLI token
-        # refresh may have written over the link — so the worker always
-        # reads the single live operator credential.
-        if src_creds.is_file():
-            if creds_dst.is_symlink() or creds_dst.exists():
-                creds_dst.unlink()
-            creds_dst.symlink_to(src_creds)
-            log.info("linked %s/.claude/.credentials.json -> %s",
-                     home, src_creds)
-        else:
-            log.warning("operator credentials missing at %s", src_creds)
+        claude_dir = home / ".claude"
+        src_claude = op_home / ".claude"
+        if not src_claude.is_dir():
+            log.warning("operator .claude/ missing at %s", src_claude)
+            return
+
+        # Idempotent: leave a correct symlink alone, otherwise rebuild it.
+        # The legacy branch handles upgrades from the file-symlink build
+        # where a token-refresh rename had replaced the link with a real
+        # dir/file holding a now-stale credential.
+        if claude_dir.is_symlink():
+            try:
+                current = Path(os.readlink(claude_dir))
+            except OSError:
+                current = None
+            if current == src_claude:
+                return
+            claude_dir.unlink()
+        elif claude_dir.is_dir():
+            log.info("migrating legacy per-user %s into directory symlink",
+                     claude_dir)
+            shutil.rmtree(claude_dir)
+        elif claude_dir.exists():
+            claude_dir.unlink()
+
+        claude_dir.symlink_to(src_claude)
+        log.info("linked %s -> %s (shared with operator)",
+                 claude_dir, src_claude)
 
     async def stop(self) -> None:
         self._closed = True
