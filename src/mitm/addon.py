@@ -184,6 +184,22 @@ class HijackAddon:
                     log.info("user=%s dropped CLI %s=%s (model %s != CLI %s)",
                              self.session.user_id, k, json.dumps(dropped),
                              merged.get("model"), base.get("model"))
+
+        # Coerce legacy effort tier. Anthropic's current API rejects
+        # output_config.effort="xhigh" with:
+        #   This model does not support effort level 'xhigh'.
+        #   Supported levels: high, low, max, medium.
+        # claude CLI 2.1.x still defaults to xhigh; when the caller's
+        # model matches the CLI's the model-mismatch block above leaves
+        # output_config in place and the request 400s. Translate to
+        # "high" so the call always lands.
+        oc = merged.get("output_config")
+        if isinstance(oc, dict) and oc.get("effort") == "xhigh":
+            oc = dict(oc)
+            oc["effort"] = "high"
+            merged["output_config"] = oc
+            log.info("user=%s normalized output_config.effort xhigh→high "
+                     "(upstream rejects xhigh)", self.session.user_id)
         return merged
 
     @staticmethod
