@@ -60,6 +60,14 @@ class ClaudeSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=None,  # inherit — worker logs flow to server stderr
             env=worker_env,
+            # Worker streams SSE chunks back as base64-wrapped JSON lines.
+            # A single Anthropic chunk over ~48 KB raw bytes (≈ 64 KB after
+            # base64 + JSON envelope) overflows the default StreamReader
+            # buffer, _read_loop raises LimitOverrunError, the read coroutine
+            # dies and the worker process exits. Large tool_use inputs and
+            # long text_delta blocks hit this regularly. 16 MiB has room
+            # for anything Anthropic emits in one chunk.
+            limit=16 * 1024 * 1024,
         )
         assert self.proc.stdout is not None
 

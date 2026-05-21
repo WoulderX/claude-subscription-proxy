@@ -120,7 +120,11 @@ async def _handle(session: WorkerSession, req_id: int, body: dict[str, Any]) -> 
 
 async def _stdin_lines() -> "asyncio.StreamReader":
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
+    # 16 MiB buffer: a request body with a large system prompt or many
+    # messages can exceed the asyncio StreamReader default of 64 KiB,
+    # causing readline() to raise LimitOverrunError and the worker to
+    # die. Match the server-side stdout limit (src/session/session.py).
+    reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
     proto = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: proto, sys.stdin)
     return reader

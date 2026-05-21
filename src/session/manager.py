@@ -30,7 +30,30 @@ class SessionManager:
         async with self.lock:
             sess = self.sessions.get(user_id)
             if sess is not None:
-                return sess
+                # Liveness check: a worker can die between requests
+                # (claude CLI crash, OOM kill, mitm fault). Without this
+                # the stale ClaudeSession lives on in the dict and the
+                # next call() raises "worker not running" forever, since
+                # nothing else evicts it before _restarter's age-based
+                # cycle (default 12h).
+                if sess.proc is None or sess.proc.returncode is not None:
+                    rc = sess.proc.returncode if sess.proc else "never started"
+                    log.warning("user=%s worker dead (rc=%s); reviving in place",
+                                user_id, rc)
+                    # restart() reuses the same mitm port; needs sess.lock
+                    # per its contract so an in-flight _restarter doesn't
+                    # collide with us.
+                    async with sess.lock:
+                        try:
+                            await sess.restart()
+                        except Exception:
+                            log.exception("user=%s in-place revive failed; "
+                                          "dropping session, cold-creating",
+                                          user_id)
+                            self.sessions.pop(user_id, None)
+                            sess = None
+                if sess is not None:
+                    return sess
             port = self.config.mitm.port_base + self._next_port_offset
             self._next_port_offset += 1
             sess = ClaudeSession(user_id=user_id, mitm_port=port, config=self.config)
