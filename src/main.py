@@ -36,25 +36,64 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/status")
     async def status():
-        """Per-worker runtime state. Useful to see which workers are
-        idle / busy, how many requests they've handled, whether any
-        died unnoticed. Unauthenticated — same trust model as /healthz;
-        protect with reverse-proxy ACL if exposed beyond trusted hosts."""
+        """Per-worker runtime state. Distinguishes healthy in-flight
+        requests (bytes flowing) from stalled ones (no bytes received
+        recently, likely a leaked channel from a missed mitm intercept
+        or an upstream that froze mid-stream). Unauthenticated — same
+        trust model as /healthz; protect with reverse-proxy ACL if
+        exposed beyond trusted hosts."""
+        import time as _time
+        now = _time.monotonic()
+        # A request that's been alive for > this many seconds without
+        # receiving a single byte from upstream is almost certainly
+        # leaked rather than just slow. Anthropic typically emits its
+        # first SSE event within ~3s; 30s is comfortably past any
+        # plausible cold-start.
+        STALL_THRESHOLD = 30.0
+
         workers = []
         # Snapshot the dict so a concurrent restart can't mutate under us.
         for user_id, sess in list(manager.sessions.items()):
             pid = sess.proc.pid if sess.proc else None
             alive = sess.proc is not None and sess.proc.returncode is None
             rc = sess.proc.returncode if sess.proc else None
+
+            in_flight_detail = []
+            for req_id, ch in list(sess._channels.items()):
+                age = now - ch.created_at
+                stalled = now - ch.last_chunk_at
+                in_flight_detail.append({
+                    "req_id": req_id,
+                    "age_seconds": round(age, 1),
+                    "stalled_seconds": round(stalled, 1),
+                    # No bytes received yet on this channel: stalled and
+                    # age are equal (last_chunk_at = created_at). Useful
+                    # to distinguish "never got a byte" vs "got bytes,
+                    # then went silent" — the former is the leaked-
+                    # channel pattern, the latter is upstream slowing
+                    # down mid-stream.
+                    "ever_received_bytes": ch.last_chunk_at != ch.created_at,
+                })
+
+            # Stuck heuristic: any in-flight request older than
+            # STALL_THRESHOLD that has either received no bytes ever, or
+            # gone silent for STALL_THRESHOLD. Healthy long-running calls
+            # still emit a chunk every couple of seconds, so a 30 s gap
+            # is decisive.
+            stuck = any(d["stalled_seconds"] > STALL_THRESHOLD
+                        for d in in_flight_detail)
+
             workers.append({
                 "user_id": user_id,
                 "mitm_port": sess.mitm_port,
                 "pid": pid,
                 "alive": alive,
                 "exit_code": rc,                          # null if alive
-                "in_flight": len(sess._channels),         # active requests right now
-                "lock_held": sess.lock.locked(),          # submission lock state
-                "total_requests": sess._next_req_id,      # since last restart (resets every 12h)
+                "in_flight": len(sess._channels),         # active right now
+                "stuck": stuck,                           # heuristic
+                "in_flight_detail": in_flight_detail,     # per-request timing
+                "lock_held": sess.lock.locked(),
+                "total_requests": sess._next_req_id,      # since last restart
                 "age_seconds": round(sess.age_seconds(), 1),
                 "idle_seconds": round(sess.idle_seconds(), 1),
             })
@@ -70,6 +109,7 @@ def create_app(config: Config) -> FastAPI:
             "worker_count": len(workers),
             "alive_count": sum(1 for w in workers if w["alive"]),
             "busy_count": sum(1 for w in workers if w["in_flight"] > 0),
+            "stuck_count": sum(1 for w in workers if w["stuck"]),
             "workers": workers,
             "pools": pools,
         }

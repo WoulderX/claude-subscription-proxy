@@ -217,6 +217,7 @@ class ClaudeSession:
                         data = b""
                     if data:
                         channel.queue.put_nowait(data)
+                        channel.last_chunk_at = time.monotonic()
                 elif t == "end":
                     channel.queue.put_nowait(None)
                     self._channels.pop(req_id, None)

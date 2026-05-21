@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,8 +19,12 @@ class PendingRequest:
 @dataclass
 class ResponseChannel:
     """Mitm addon writes raw SSE bytes here as they stream in from Anthropic.
-    API handler reads until sentinel (None) is enqueued."""
+    API handler reads until sentinel (None) is enqueued. Timestamps let
+    /status distinguish a healthy in-flight request (bytes flowing) from
+    a stalled / orphaned channel (no bytes ever, or no bytes for >30s)."""
     queue: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
+    created_at: float = field(default_factory=time.monotonic)
+    last_chunk_at: float = field(default_factory=time.monotonic)
 
     async def put(self, chunk: bytes | None) -> None:
         await self.queue.put(chunk)
