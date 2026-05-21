@@ -97,6 +97,15 @@ class SessionManager:
         # concurrently booting CLIs; per-user failures are logged but
         # do not block service startup, so a misconfigured user falls
         # back to lazy spawn on first request (same as before).
+        #
+        # After the TUI reaches the prompt we ALSO send one tiny dummy
+        # request through the normal IPC path so claude CLI's lazy
+        # bootstrap (feature flag fetches, mcp-registry pagination,
+        # /api/eval, /api/claude_code_*) completes here on startup
+        # instead of on the first real user request. Without this the
+        # first request fires 7+ HTTP calls to api.anthropic.com in
+        # ~30 ms — the per-OAuth rate limiter trips on that burst and
+        # the actual /v1/messages comes back rate_limit_error.
         user_ids: list[str] = []
         for pool in self.config.users.values():
             for u in pool:
@@ -109,6 +118,52 @@ class SessionManager:
             except Exception:
                 log.exception("prewarm failed user=%s; "
                               "first request will cold-start", user_id)
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._prewarm_bootstrap(user_id), timeout=60)
+            except asyncio.TimeoutError:
+                log.warning("bootstrap prewarm timed out user=%s; "
+                            "first real request may hit rate limit", user_id)
+            except Exception:
+                log.exception("bootstrap prewarm failed user=%s; "
+                              "first real request may hit rate limit", user_id)
+
+    async def _prewarm_bootstrap(self, user_id: str) -> None:
+        """Force claude CLI's lazy bootstrap to run during startup by
+        sending one tiny dummy /v1/messages to the freshly-warm worker.
+
+        We use haiku + max_tokens=1 so the actual model call is
+        ~free against the subscription quota. The expensive part isn't
+        that call — it's the 6 sibling HTTP calls (eval / grove /
+        penguin_mode / claude_cli/bootstrap / mcp-registry pagination)
+        that claude CLI fires alongside the first model interaction.
+        Those land here, get cached under /home/coder/.claude/, and
+        the pool's shared directory symlink means every subsequent
+        worker's first trigger finds the cache populated and skips the
+        burst. Net effect: the rate-limit risk moves from "first real
+        request" to "container startup" where no user is waiting.
+
+        Failure to bootstrap (timeout, upstream 429, anything) is
+        non-fatal — the worker is still usable; the user might just
+        see a rate_limit_error on their first request and need to
+        retry once."""
+        sess = self.sessions.get(user_id)
+        if sess is None:
+            return
+        body = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ok"}],
+        }
+        log.info("bootstrap prewarm starting user=%s", user_id)
+        channel = await sess.call(body)
+        # Drain and discard. We don't care about the content — the
+        # value was in the side-effect HTTP calls that fired in
+        # parallel with the /v1/messages request.
+        async for _ in channel.iter():
+            pass
+        log.info("bootstrap prewarm complete user=%s", user_id)
 
     async def stop(self) -> None:
         if self._restarter_task:
