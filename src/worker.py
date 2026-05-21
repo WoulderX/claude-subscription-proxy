@@ -85,8 +85,21 @@ class WorkerSession:
                 await asyncio.wait_for(self.pending.consumed.wait(),
                                        timeout=30)
             except asyncio.TimeoutError:
-                log.warning("user=%s mitm did not intercept within 30s",
+                # mitm never saw a /v1/messages it could claim — most
+                # often claude TUI is in a "rate limited / error" UI
+                # state that swallowed our keystroke instead of firing
+                # a model call. The channel will *never* receive bytes
+                # (mitm's _tap is what feeds it, and _tap wasn't set
+                # because the flow wasn't hijacked), so without an
+                # explicit close the caller's `async for chunk in
+                # channel.iter()` hangs forever, leaks the channel into
+                # the server's _channels dict, and the worker looks
+                # busy forever even though nothing is happening.
+                log.warning("user=%s mitm did not intercept within 30s; "
+                            "closing response and clearing pending slot",
                             self.user_id)
+                self.pending = None
+                await self.response.put(None)
             return self.response
 
 
