@@ -94,14 +94,41 @@ def openai_to_anthropic(req: dict[str, Any]) -> dict[str, Any]:
 async def anthropic_sse_to_openai_sse(
     channel_iter: AsyncIterator[bytes], model: str,
 ) -> AsyncIterator[bytes]:
-    """Convert Anthropic SSE byte stream to OpenAI Chat Completions SSE."""
+    """Convert Anthropic SSE byte stream to OpenAI Chat Completions SSE.
+
+    Tracks token usage from Anthropic's message_start (input_tokens +
+    cache_*) and message_delta (output_tokens) events and emits a
+    terminal usage chunk before [DONE]. Without this, downstream chains
+    that reconstruct an Anthropic-format response (e.g. claude code
+    talking through LiteLLM in OpenAI mode) end up with a response that
+    has no `usage` object — claude code then crashes locally with
+    "Cannot read properties of undefined (reading 'input_tokens')".
+
+    Also surfaces upstream Anthropic error events as a final
+    finish-with-content chunk so the client gets a well-formed close
+    instead of a silently-truncated stream."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     buf = b""
     role_emitted = False
+    finish_emitted = False
     content_blocks: dict[int, dict[str, Any]] = {}
     tool_index_to_oi_index: dict[int, int] = {}
     next_oi_tool_index = 0
+    usage: dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0,
+                             "total_tokens": 0}
+
+    def _emit_role():
+        nonlocal role_emitted
+        if role_emitted:
+            return None
+        role_emitted = True
+        return _oi_sse({
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"},
+                         "finish_reason": None}],
+        })
 
     async for chunk in channel_iter:
         buf += chunk
@@ -113,13 +140,16 @@ async def anthropic_sse_to_openai_sse(
             etype = event["event"]
             data = event["data"]
 
-            if etype == "message_start" and not role_emitted:
-                role_emitted = True
-                yield _oi_sse({
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                })
+            if etype == "message_start":
+                u = (data.get("message", {}) or {}).get("usage") or {}
+                usage["prompt_tokens"] = u.get("input_tokens", 0)
+                if "cache_creation_input_tokens" in u:
+                    usage["cache_creation_input_tokens"] = u["cache_creation_input_tokens"]
+                if "cache_read_input_tokens" in u:
+                    usage["cache_read_input_tokens"] = u["cache_read_input_tokens"]
+                role_chunk = _emit_role()
+                if role_chunk:
+                    yield role_chunk
             elif etype == "content_block_start":
                 idx = data.get("index", 0)
                 block = data.get("content_block", {})
@@ -160,7 +190,10 @@ async def anthropic_sse_to_openai_sse(
                     })
             elif etype == "message_delta":
                 stop_reason = data.get("delta", {}).get("stop_reason")
-                if stop_reason:
+                u = data.get("usage") or {}
+                if "output_tokens" in u:
+                    usage["completion_tokens"] = u["output_tokens"]
+                if stop_reason and not finish_emitted:
                     finish = {
                         "end_turn": "stop", "max_tokens": "length",
                         "stop_sequence": "stop", "tool_use": "tool_calls",
@@ -170,8 +203,64 @@ async def anthropic_sse_to_openai_sse(
                         "created": created, "model": model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                     })
+                    finish_emitted = True
+            elif etype == "error":
+                # Surface upstream error as a finish-with-content chunk
+                # so the downstream gets a well-formed response with
+                # usage instead of an unterminated stream.
+                err = data.get("error") if isinstance(data, dict) else {}
+                err_type = (err or {}).get("type", "error") if isinstance(err, dict) else "error"
+                err_msg = (err or {}).get("message", "") if isinstance(err, dict) else str(data)
+                role_chunk = _emit_role()
+                if role_chunk:
+                    yield role_chunk
+                yield _oi_sse({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0,
+                                 "delta": {"content": f"[upstream {err_type}] {err_msg}"},
+                                 "finish_reason": "stop"}],
+                })
+                finish_emitted = True
             elif etype == "message_stop":
+                # Anthropic finished cleanly; if upstream didn't emit
+                # message_delta with stop_reason (rare), synthesise a
+                # stop here so OpenAI clients don't see a missing
+                # finish_reason.
+                if not finish_emitted:
+                    yield _oi_sse({
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    })
+                    finish_emitted = True
+                usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                yield _oi_sse({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [],
+                    "usage": usage,
+                })
                 yield b"data: [DONE]\n\n"
+                return
+
+    # Stream ended without a message_stop (worker died, mitm missed the
+    # tail, upstream truncated). Emit a synthetic close so the client
+    # always sees finish_reason + usage + [DONE].
+    if not finish_emitted:
+        yield _oi_sse({
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    yield _oi_sse({
+        "id": completion_id, "object": "chat.completion.chunk",
+        "created": created, "model": model,
+        "choices": [],
+        "usage": usage,
+    })
+    yield b"data: [DONE]\n\n"
 
 
 def _oi_sse(payload: dict[str, Any]) -> bytes:
