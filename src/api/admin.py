@@ -24,6 +24,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from ..account_quota import AccountQuotaService
 from ..config import Config
 from ..oauth_refresh import OAuthRefresher
 from ..session.manager import SessionManager
@@ -66,6 +67,7 @@ def build_router(
     auth_dep,
     refresher_state: SimpleNamespace,
     credentials_path,
+    quota_service: AccountQuotaService,
 ) -> APIRouter:
     """Build the admin router.
 
@@ -184,6 +186,22 @@ def build_router(
             log.exception("/admin/refresh-now failed")
             raise HTTPException(500, f"refresh failed: {e}")
         return {"ok": True, "result": result}
+
+    @router.get("/quota")
+    async def quota(_pool: list[str] = Depends(auth_dep)) -> dict[str, Any]:
+        """Anthropic 订阅 OAuth 用量当前缓存值（不触发网络请求）。
+
+        前端定时轮询这个端点画图；想强制重新抓取上游用
+        POST /admin/quota/refresh（受 60s 频控保护）。"""
+        return {"ok": True, **quota_service.get_state()}
+
+    @router.post("/quota/refresh")
+    async def quota_refresh(_pool: list[str] = Depends(auth_dep)) -> dict[str, Any]:
+        """强制刷新订阅用量。60 秒最小间隔——距离上次抓取不足则不打上
+        游，直接回包当前缓存 + rate_limited=true。返回里包含
+        seconds_until_next_refresh，前端用来 disable 按钮 + 倒计时。"""
+        state = await quota_service.refresh()
+        return {"ok": True, **state}
 
     return router
 

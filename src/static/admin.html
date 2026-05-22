@@ -5,197 +5,483 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Claude Subscription Proxy 监控面板</title>
   <style>
+    /* ── Reset & base (dark theme) ──────────────────────────── */
     * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
                    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
-                   sans-serif;
-      margin: 0; background: #f5f5f7; color: #1d1d1f;
+                   "Helvetica Neue", Arial, sans-serif;
+      background: #0a0c12;
+      color: #e5e7eb;
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
-    .container { max-width: 1500px; margin: 0 auto; padding: 20px; }
-    h1 {
-      font-size: 22px; margin: 0 0 4px 0; font-weight: 600;
-    }
-    .subtitle { color: #6e6e73; font-size: 13px; margin-bottom: 20px; }
+    button, input, select { font-family: inherit; }
+    button { cursor: pointer; }
 
-    .controls {
-      background: white; border-radius: 10px; padding: 14px 16px;
-      margin-bottom: 16px; display: flex; gap: 12px;
-      align-items: center; flex-wrap: wrap;
+    /* ── App bar (sticky top) ───────────────────────────────── */
+    .app-bar {
+      background: rgba(15, 18, 26, 0.85);
+      backdrop-filter: saturate(180%) blur(12px);
+      -webkit-backdrop-filter: saturate(180%) blur(12px);
+      border-bottom: 1px solid #1f2433;
+      position: sticky; top: 0; z-index: 50;
     }
-    .controls > * { font-size: 13px; }
-    .controls label { display: flex; align-items: center; gap: 6px; color: #6e6e73; }
-    .controls input, .controls select, .controls button {
-      padding: 7px 12px; border: 1px solid #d2d2d7;
-      border-radius: 6px; font-size: 13px;
-      font-family: inherit;
+    .app-bar-inner {
+      max-width: 1500px; margin: 0 auto;
+      padding: 12px 28px;
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     }
-    .controls input { width: 320px; font-family: monospace; font-size: 12px; }
-    .controls button {
-      background: #007aff; color: white; border: none;
-      cursor: pointer; font-weight: 500;
+    .brand {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 15px; font-weight: 600; color: #f3f4f6;
+      letter-spacing: -0.1px;
     }
-    .controls button:hover { background: #0051d5; }
-    .controls button:disabled { background: #999; cursor: not-allowed; }
-    .controls button.secondary { background: #e5e5ea; color: #1d1d1f; }
-    .controls button.secondary:hover { background: #d2d2d7; }
-    .controls button.danger { background: #ff3b30; }
-    .controls button.danger:hover { background: #c0241b; }
-    .controls .spacer { flex: 1; }
-    .controls .last-update { color: #6e6e73; font-size: 12px; }
+    .brand-mark {
+      width: 24px; height: 24px; border-radius: 7px;
+      background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+      display: inline-flex; align-items: center; justify-content: center;
+      color: #fff; font-weight: 700; font-size: 12px;
+      box-shadow: 0 2px 10px rgba(99,102,241,0.4);
+    }
+    .brand-sub {
+      font-size: 11.5px; color: #6b7280; font-weight: 400;
+      margin-left: 2px; letter-spacing: 0.2px;
+    }
+    .spacer { flex: 1; }
 
-    .stats {
+    /* ── Form controls (dark) ───────────────────────────────── */
+    input, select, button.btn-base {
+      font-size: 13px;
+      border: 1px solid #2a3142; border-radius: 7px;
+      background: #131722; color: #e5e7eb;
+      padding: 7px 12px;
+      transition: border-color 0.12s, background 0.12s, color 0.12s;
+    }
+    input { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+    input::placeholder { color: #4b5563; }
+    input:focus,
+    select:focus {
+      outline: none; border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,0.18);
+    }
+    select {
+      cursor: pointer; padding-right: 28px;
+      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%239ca3af' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      -webkit-appearance: none; appearance: none;
+    }
+    .app-bar input { width: 260px; }
+
+    .btn-primary {
+      background: #3b82f6; color: #fff;
+      border: 1px solid #3b82f6;
+      padding: 7px 14px; border-radius: 7px;
+      font-size: 13px; font-weight: 500;
+    }
+    .btn-primary:hover:not(:disabled) { background: #2563eb; border-color: #2563eb; }
+    .btn-primary:disabled { background: #1e3a8a; border-color: #1e3a8a; color: #93c5fd; cursor: not-allowed; opacity: 0.7; }
+
+    .btn-ghost {
+      background: transparent; color: #9ca3af;
+      border: 1px solid #2a3142;
+      padding: 7px 12px; border-radius: 7px;
+      font-size: 13px;
+    }
+    .btn-ghost:hover:not(:disabled) { background: #1a1f2e; color: #e5e7eb; border-color: #374151; }
+    .btn-ghost:disabled { color: #4b5563; border-color: #1f2433; cursor: not-allowed; }
+
+    .btn-section {
+      font-size: 12px; padding: 6px 14px;
+      background: #131722; color: #d1d5db; font-weight: 500;
+      border: 1px solid #2a3142; border-radius: 7px;
+    }
+    .btn-section:hover:not(:disabled) { background: #1a1f2e; border-color: #374151; color: #f3f4f6; }
+    .btn-section:disabled { color: #4b5563; background: #0f1219; border-color: #1f2433; cursor: not-allowed; }
+
+    /* ── Page container ─────────────────────────────────────── */
+    .page { max-width: 1500px; margin: 0 auto; padding: 24px 28px 60px; }
+
+    /* ── Section ────────────────────────────────────────────── */
+    .section { margin-bottom: 32px; }
+    .section-head {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      margin-bottom: 12px; padding: 0 2px;
+    }
+    .section-title {
+      font-size: 11px; font-weight: 600;
+      letter-spacing: 0.8px; text-transform: uppercase;
+      color: #6b7280;
+    }
+    .section-meta { font-size: 12px; color: #6b7280; }
+    .section-controls {
+      display: flex; gap: 8px; align-items: center;
+    }
+    .section-controls select {
+      font-size: 12px; padding: 5px 28px 5px 10px;
+      border-radius: 6px;
+    }
+
+    /* ── Card ───────────────────────────────────────────────── */
+    .card {
+      background: #131722;
+      border: 1px solid #1f2433;
+      border-radius: 12px;
+      padding: 18px 22px;
+    }
+
+    /* ── Stat grid ──────────────────────────────────────────── */
+    .stat-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 10px; margin-bottom: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
     }
-    .stat {
-      background: white; border-radius: 10px; padding: 14px 16px;
+    .stat-card {
+      background: #131722;
+      border: 1px solid #1f2433;
+      border-radius: 12px;
+      padding: 16px 18px;
+      position: relative;
+      overflow: hidden;
     }
-    .stat .label { font-size: 12px; color: #6e6e73; }
-    .stat .value {
-      font-size: 26px; font-weight: 600; margin-top: 2px;
-      line-height: 1.1;
+    .stat-card::before {
+      content: '';
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 3px; background: transparent;
     }
-    .stat.busy .value { color: #007aff; }
-    .stat.stuck .value { color: #ff3b30; }
-    .stat.alive .value { color: #34c759; }
-    .stat.version .value { font-size: 14px; font-weight: 500; color: #1d1d1f; margin-top: 6px; font-family: monospace; }
+    .stat-card.alive::before  { background: #10b981; }
+    .stat-card.busy::before   { background: #3b82f6; }
+    .stat-card.stuck::before  { background: #ef4444; }
+    .stat-card.version::before { background: #a855f7; }
+    .stat-label {
+      font-size: 11px; font-weight: 600;
+      letter-spacing: 0.7px; text-transform: uppercase;
+      color: #6b7280; margin-bottom: 8px;
+    }
+    .stat-value {
+      font-size: 28px; font-weight: 600; line-height: 1.1;
+      color: #f3f4f6;
+      font-variant-numeric: tabular-nums;
+    }
+    .stat-value .sub { font-size: 15px; color: #6b7280; font-weight: 400; margin-left: 4px; }
+    .stat-card.alive .stat-value   { color: #34d399; }
+    .stat-card.busy  .stat-value   { color: #60a5fa; }
+    .stat-card.stuck .stat-value   { color: #f87171; }
+    .stat-card.version .stat-value {
+      font-size: 15px; font-weight: 500;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      color: #d1d5db;
+    }
 
-    .pools {
-      background: white; border-radius: 10px; padding: 12px 16px;
-      margin-bottom: 16px; font-size: 13px;
+    /* ── Quota tiers ────────────────────────────────────────── */
+    .quota-tiers {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
     }
-    .pools-title { color: #6e6e73; margin-bottom: 6px; }
-    .pool-row { font-family: monospace; font-size: 12px; }
-    .pool-row .pool-members { color: #007aff; }
+    .quota-tier {
+      background: #0f1219;
+      border: 1px solid #1f2433;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .quota-tier .tier-head {
+      display: flex; justify-content: space-between; gap: 8px;
+      align-items: baseline; margin-bottom: 8px;
+    }
+    .quota-tier .tier-name { font-size: 12px; color: #d1d5db; font-weight: 500; }
+    .quota-tier .reset { font-size: 11px; color: #6b7280; }
+    .quota-tier .bar {
+      height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px;
+      overflow: hidden; margin-bottom: 6px;
+    }
+    .quota-tier .fill { height: 100%; background: #10b981; transition: width 0.4s ease; }
+    .quota-tier.warn  .fill { background: #f59e0b; }
+    .quota-tier.danger .fill { background: #ef4444; }
+    .quota-tier .util {
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px; color: #f3f4f6;
+    }
+    .quota-tier.extra-usage { border-color: rgba(59,130,246,0.4); background: rgba(59,130,246,0.06); }
+    .quota-tier.extra-usage .fill { background: #3b82f6; }
+    .quota-empty { color: #6b7280; font-size: 13px; padding: 4px 2px; }
+    .quota-error {
+      font-size: 13px; color: #fca5a5;
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.25);
+      padding: 10px 14px; border-radius: 8px;
+      margin-bottom: 12px;
+      display: flex; gap: 8px; align-items: flex-start;
+    }
+    .quota-error::before { content: '⚠'; flex: none; }
 
-    .table-wrap {
-      background: white; border-radius: 10px; overflow: hidden;
+    /* ── Pool chips ─────────────────────────────────────────── */
+    .pool-list { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pool-chip {
+      background: rgba(59,130,246,0.1); color: #93c5fd;
+      border: 1px solid rgba(59,130,246,0.25);
+      padding: 4px 12px; border-radius: 999px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px;
     }
-    table { width: 100%; border-collapse: collapse; }
-    th {
-      background: #f5f5f7; padding: 10px 12px; text-align: left;
-      font-size: 12px; color: #6e6e73; font-weight: 600;
-      border-bottom: 1px solid #e5e5ea; white-space: nowrap;
+
+    /* ── Worker table ───────────────────────────────────────── */
+    .table-card {
+      background: #131722;
+      border: 1px solid #1f2433;
+      border-radius: 12px;
+      overflow: hidden;
     }
-    td {
-      padding: 12px; border-bottom: 1px solid #e5e5ea;
-      font-size: 13px; vertical-align: top;
+    table.workers { width: 100%; border-collapse: collapse; }
+    table.workers th {
+      text-align: left;
+      font-size: 11px; font-weight: 600;
+      letter-spacing: 0.6px; text-transform: uppercase;
+      color: #6b7280;
+      padding: 12px 18px;
+      background: #0f1219;
+      border-bottom: 1px solid #1f2433;
+      white-space: nowrap;
     }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: #fafafa; }
+    table.workers td {
+      padding: 14px 18px;
+      font-size: 13px; color: #e5e7eb;
+      border-bottom: 1px solid #1a1f2e;
+      vertical-align: top;
+    }
+    table.workers tr:last-child td { border-bottom: none; }
+    table.workers tr:hover td { background: #161b27; }
+
+    /* ── Badge ──────────────────────────────────────────────── */
     .badge {
-      display: inline-block; padding: 3px 10px; border-radius: 12px;
-      font-size: 12px; font-weight: 500; white-space: nowrap;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 10px 3px 8px; border-radius: 999px;
+      font-size: 11.5px; font-weight: 500;
     }
-    .badge.idle    { background: #34c75920; color: #1c7a34; }
-    .badge.working { background: #ff990020; color: #b25800; }
-    .badge.stuck   { background: #ff3b3020; color: #c0241b; }
-    .badge.dead    { background: #8e8e9320; color: #555;    }
-    .restart-btn {
-      background: #ff3b30; color: white; border: none;
-      padding: 5px 12px; border-radius: 5px; cursor: pointer;
+    .badge::before {
+      content: ''; width: 6px; height: 6px; border-radius: 50%;
+      flex: none;
+    }
+    .badge.idle    { background: rgba(16,185,129,0.12); color: #34d399; }
+    .badge.idle::before    { background: #10b981; box-shadow: 0 0 6px rgba(16,185,129,0.6); }
+    .badge.working { background: rgba(245,158,11,0.12); color: #fbbf24; }
+    .badge.working::before { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.6); }
+    .badge.stuck   { background: rgba(239,68,68,0.12); color: #f87171; }
+    .badge.stuck::before   { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.6); }
+    .badge.dead    { background: rgba(156,163,175,0.1); color: #9ca3af; }
+    .badge.dead::before    { background: #6b7280; }
+
+    /* ── Restart button (in table) ──────────────────────────── */
+    .btn-restart {
+      background: transparent; color: #f87171;
+      border: 1px solid rgba(239,68,68,0.35);
+      padding: 4px 12px; border-radius: 6px;
       font-size: 12px; font-weight: 500;
+      transition: background 0.12s, border-color 0.12s;
     }
-    .restart-btn:hover { background: #c0241b; }
-    .restart-btn:disabled { background: #999; cursor: not-allowed; }
+    .btn-restart:hover:not(:disabled) { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.55); }
+    .btn-restart:disabled { color: #4b5563; background: transparent; border-color: #1f2433; cursor: not-allowed; }
+
+    /* ── Task cell ──────────────────────────────────────────── */
+    .task-meta { font-size: 11.5px; color: #9ca3af; line-height: 1.6; }
+    .task-meta .key { color: #f3f4f6; font-weight: 500; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+    .text-blue  { color: #60a5fa; }
+    .text-red   { color: #f87171; }
+    .text-muted { color: #6b7280; }
+
+    /* ── Preview pill ───────────────────────────────────────── */
     .preview {
-      font-family: monospace; font-size: 11px; color: #1d1d1f;
-      background: #f5f5f7; padding: 4px 6px; border-radius: 4px;
-      margin-top: 4px; max-width: 480px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 11px; color: #d1d5db;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      padding: 4px 8px; border-radius: 6px;
+      margin-top: 6px; max-width: 480px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      cursor: help;
     }
-    .task-meta { font-size: 11px; color: #6e6e73; }
-    .task-meta .key { color: #1d1d1f; font-weight: 500; }
-    .mono { font-family: monospace; font-size: 12px; }
 
+    /* ── Message tooltip ────────────────────────────────────── */
+    #msg-tooltip {
+      position: fixed; display: none; pointer-events: none;
+      background: #1a1f2e;
+      border: 1px solid #2a3142;
+      color: #e5e7eb;
+      padding: 12px 14px; border-radius: 8px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+      white-space: pre-wrap; word-break: break-word;
+      max-width: 640px; max-height: 420px; overflow-y: auto;
+      z-index: 1000;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 4px 10px rgba(0,0,0,0.3);
+      line-height: 1.6;
+    }
+
+    /* ── Banner ─────────────────────────────────────────────── */
     .banner {
-      padding: 12px 16px; border-radius: 8px;
-      margin-bottom: 16px; font-size: 13px;
+      padding: 11px 16px; border-radius: 8px;
+      font-size: 13px; margin-bottom: 8px;
     }
-    .banner.error { background: #ff3b3015; color: #c0241b; }
-    .banner.info  { background: #007aff15; color: #0051d5; }
-
-    .toast {
-      position: fixed; bottom: 20px; right: 20px;
-      background: #1d1d1f; color: white; padding: 12px 18px;
-      border-radius: 8px; opacity: 0; transition: opacity 0.3s;
-      pointer-events: none; max-width: 480px; font-size: 13px;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    .banner.error {
+      background: rgba(239,68,68,0.1);
+      color: #fca5a5;
+      border: 1px solid rgba(239,68,68,0.3);
     }
-    .toast.show { opacity: 1; }
-    .toast.error   { background: #c0241b; }
-    .toast.success { background: #248a3d; }
+    .banner.info {
+      background: rgba(59,130,246,0.1);
+      color: #93c5fd;
+      border: 1px solid rgba(59,130,246,0.3);
+    }
 
+    /* ── Reload output (console-style) ──────────────────────── */
     .reload-output {
-      background: #1d1d1f; color: #e5e5ea;
-      padding: 14px 16px; border-radius: 8px;
-      font-family: monospace; font-size: 12px;
-      margin-bottom: 16px; white-space: pre-wrap;
+      background: #050709; color: #d1d5db;
+      border: 1px solid #1f2433;
+      padding: 14px 18px; border-radius: 8px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+      white-space: pre-wrap;
       max-height: 240px; overflow: auto;
+      margin-bottom: 12px;
     }
-    .reload-output .header { color: #34c759; font-weight: 600; }
-    .reload-output .warn { color: #ff9500; }
+    .reload-output .header { color: #34d399; font-weight: 600; }
+    .reload-output .warn   { color: #fbbf24; }
+
+    /* ── Toast ──────────────────────────────────────────────── */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: #1a1f2e;
+      border: 1px solid #2a3142;
+      color: #f3f4f6;
+      padding: 12px 18px; border-radius: 8px;
+      font-size: 13px;
+      opacity: 0; transition: opacity 0.25s, transform 0.25s;
+      transform: translateY(8px);
+      pointer-events: none; max-width: 480px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.error   { background: rgba(127,29,29,0.95); border-color: rgba(239,68,68,0.5); color: #fecaca; }
+    .toast.success { background: rgba(6,78,59,0.95);   border-color: rgba(16,185,129,0.5); color: #a7f3d0; }
+
+    /* ── Empty state ────────────────────────────────────────── */
+    .empty-state {
+      text-align: center; padding: 56px 24px;
+      color: #4b5563; font-size: 13px;
+    }
+
+    /* ── Scrollbar dark ─────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: #0a0c12; }
+    ::-webkit-scrollbar-thumb { background: #2a3142; border-radius: 5px; }
+    ::-webkit-scrollbar-thumb:hover { background: #374151; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <h1>Claude Subscription Proxy 监控面板</h1>
-    <div class="subtitle">实时查看各 worker 状态与当前任务，支持单 worker 重启、配置重新加载、凭据刷新</div>
 
-    <div class="controls">
-      <label>
-        API Key
-        <input type="password" id="apiKey" placeholder="sk-internal-...">
-      </label>
-      <button id="refreshBtn">立即刷新</button>
-      <label>
-        自动刷新
-        <select id="autoRefresh">
-          <option value="0">关闭</option>
-          <option value="5">5 秒</option>
-          <option value="10">10 秒</option>
-          <option value="30">30 秒</option>
-          <option value="60" selected>1 分钟</option>
-          <option value="300">5 分钟</option>
-        </select>
-      </label>
-      <button id="reloadBtn" class="secondary" title="重新读取 config.yaml 并应用可热重载的字段">重新加载配置</button>
-      <button id="refreshTokenBtn" class="secondary" title="跳过 5 分钟周期，立即向 Anthropic 请求一次 OAuth 凭据刷新">刷新 OAuth 凭据</button>
+  <!-- ── Top app bar ─────────────────────────────────────────── -->
+  <div class="app-bar">
+    <div class="app-bar-inner">
+      <div class="brand">
+        <span class="brand-mark">C</span>
+        Subscription Proxy
+        <span class="brand-sub">监控面板</span>
+      </div>
       <span class="spacer"></span>
-      <span class="last-update" id="lastUpdate">尚未加载</span>
+      <input type="password" id="apiKey" placeholder="API Key">
+      <button id="reloadBtn" class="btn-ghost" title="重新读取 config.yaml 并应用可热重载的字段">重新加载</button>
+      <button id="refreshTokenBtn" class="btn-ghost" title="跳过 5 分钟周期，立即向 Anthropic 请求一次 OAuth 凭据刷新">刷新凭据</button>
     </div>
+  </div>
+
+  <div class="page">
 
     <div id="banner"></div>
     <div id="reloadOutput"></div>
 
-    <div class="stats" id="stats"></div>
+    <!-- ── 系统概览 ─────────────────────────────────────────── -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">系统概览</span>
+        <span class="section-meta" id="lastUpdate">尚未加载</span>
+      </div>
+      <div class="stat-grid" id="stats">
+        <div class="stat-card version"><div class="stat-label">CLI 版本</div><div class="stat-value">—</div></div>
+        <div class="stat-card alive"><div class="stat-label">存活 worker</div><div class="stat-value">—</div></div>
+        <div class="stat-card busy"><div class="stat-label">活跃</div><div class="stat-value">—</div></div>
+        <div class="stat-card stuck"><div class="stat-label">异常</div><div class="stat-value">—</div></div>
+      </div>
+    </div>
 
-    <div id="poolsBox"></div>
+    <!-- ── 订阅配额 ─────────────────────────────────────────── -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">订阅配额</span>
+        <span class="section-meta" id="quotaMeta">未加载</span>
+        <span class="spacer"></span>
+        <div class="section-controls">
+          <button id="quotaRefreshBtn" class="btn-section" title="向 Anthropic 拉取一次最新用量；服务端 60 秒频控">刷新配额</button>
+        </div>
+      </div>
+      <div class="card">
+        <div id="quotaBody"><div class="quota-empty">点击右上「刷新配额」获取最新用量</div></div>
+      </div>
+    </div>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>用户 ID</th>
-            <th>状态</th>
-            <th>PID</th>
-            <th>mitm 端口</th>
-            <th>运行时长</th>
-            <th>空闲时长</th>
-            <th>累计请求</th>
-            <th>进行中</th>
-            <th>当前任务</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="workerBody">
-          <tr><td colspan="10" style="text-align:center;color:#6e6e73;padding:32px;">
-            请在上方填写 API Key 后点击「立即刷新」
-          </td></tr>
-        </tbody>
-      </table>
+    <!-- ── 用户池拓扑（隐藏空状态） ────────────────────────── -->
+    <div class="section" id="poolsSection" style="display:none;">
+      <div class="section-head">
+        <span class="section-title">用户池拓扑</span>
+        <span class="section-meta">按 token 分组，同组共享并发负载</span>
+      </div>
+      <div class="card">
+        <div class="pool-list" id="poolList"></div>
+      </div>
+    </div>
+
+    <!-- ── Worker 运行状态 ──────────────────────────────────── -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">Worker 运行状态</span>
+        <span class="section-meta">每个 worker 内部通过 PTY 锁严格串行处理请求</span>
+        <span class="spacer"></span>
+        <div class="section-controls">
+          <select id="autoRefresh" title="自动刷新间隔">
+            <option value="0">自动 · 关</option>
+            <option value="5">自动 · 5 秒</option>
+            <option value="10">自动 · 10 秒</option>
+            <option value="30">自动 · 30 秒</option>
+            <option value="60" selected>自动 · 1 分钟</option>
+            <option value="300">自动 · 5 分钟</option>
+          </select>
+          <button id="refreshBtn" class="btn-primary">立即刷新</button>
+        </div>
+      </div>
+      <div class="table-card">
+        <table class="workers">
+          <thead>
+            <tr>
+              <th>用户 ID</th>
+              <th>状态</th>
+              <th>模型</th>
+              <th>LiteLLM 用户</th>
+              <th>运行时长</th>
+              <th>空闲时长</th>
+              <th>累计请求</th>
+              <th>进行中</th>
+              <th>当前任务</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="workerBody">
+            <tr><td colspan="10" class="empty-state">
+              在右上角填写 API Key 后点击「立即刷新」加载数据
+            </td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -209,13 +495,18 @@
     const refreshTokenBtn = $('refreshTokenBtn');
     const autoRefreshSel  = $('autoRefresh');
     const statsDiv        = $('stats');
-    const poolsBox        = $('poolsBox');
+    const poolsSection    = $('poolsSection');
+    const poolList        = $('poolList');
     const workerBody      = $('workerBody');
     const lastUpdate      = $('lastUpdate');
     const banner          = $('banner');
     const reloadOutput    = $('reloadOutput');
     const toast           = $('toast');
+    const quotaBody       = $('quotaBody');
+    const quotaMeta       = $('quotaMeta');
+    const quotaRefreshBtn = $('quotaRefreshBtn');
     let autoRefreshTimer  = null;
+    let quotaCooldownTimer = null;
 
     // Restore from localStorage
     apiKeyInput.value = localStorage.getItem('apiKey') || '';
@@ -232,6 +523,7 @@
     refreshBtn.addEventListener('click', () => refresh());
     reloadBtn.addEventListener('click', () => hotReload());
     refreshTokenBtn.addEventListener('click', () => forceRefreshToken());
+    quotaRefreshBtn.addEventListener('click', () => refreshQuota());
 
     function setupAutoRefresh() {
       if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
@@ -310,101 +602,116 @@
     }
 
     function render(data) {
-      // stats
+      // stat grid
       const activeCount = (data.busy_count || 0) - (data.stuck_count || 0);
       statsDiv.innerHTML = `
-        <div class="stat version">
-          <div class="label">CLI 版本</div>
-          <div class="value">${escapeHtml(data.claude_version || '未知')}</div>
+        <div class="stat-card version">
+          <div class="stat-label">CLI 版本</div>
+          <div class="stat-value">${escapeHtml(data.claude_version || '未知')}</div>
         </div>
-        <div class="stat alive">
-          <div class="label">存活 / 总数</div>
-          <div class="value">${data.alive_count}<span style="font-size:18px;color:#6e6e73;"> / ${data.worker_count}</span></div>
+        <div class="stat-card alive">
+          <div class="stat-label">存活 worker</div>
+          <div class="stat-value">${data.alive_count}<span class="sub">/ ${data.worker_count}</span></div>
         </div>
-        <div class="stat busy">
-          <div class="label">活跃</div>
-          <div class="value">${activeCount}</div>
+        <div class="stat-card busy">
+          <div class="stat-label">活跃</div>
+          <div class="stat-value">${activeCount}</div>
         </div>
-        <div class="stat stuck">
-          <div class="label">异常</div>
-          <div class="value">${data.stuck_count}</div>
+        <div class="stat-card stuck">
+          <div class="stat-label">异常</div>
+          <div class="stat-value">${data.stuck_count}</div>
         </div>
       `;
 
       // pools
       if (data.pools && data.pools.length > 0) {
-        poolsBox.innerHTML = `
-          <div class="pools">
-            <div class="pools-title">用户池（按 token 分组，同组共享并发负载）：</div>
-            ${data.pools.map(p => `
-              <div class="pool-row">
-                <span class="pool-members">[${p.map(escapeHtml).join(', ')}]</span>
-              </div>`).join('')}
-          </div>
-        `;
+        poolsSection.style.display = '';
+        poolList.innerHTML = data.pools.map(p =>
+          `<span class="pool-chip">${p.map(escapeHtml).join(' · ')}</span>`
+        ).join('');
       } else {
-        poolsBox.innerHTML = '';
+        poolsSection.style.display = 'none';
+        poolList.innerHTML = '';
       }
 
       // worker table
       if (!data.workers || data.workers.length === 0) {
-        workerBody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#6e6e73;padding:32px;">暂无 worker</td></tr>';
+        workerBody.innerHTML = '<tr><td colspan="10" class="empty-state">暂无 worker</td></tr>';
         return;
       }
       workerBody.innerHTML = data.workers.map(w => {
         const status = classifyWorker(w);
-        const detail = (w.in_flight_detail && w.in_flight_detail[0]) || null;
-        let taskCell = '<span style="color:#6e6e73;">—</span>';
-        if (w.in_flight > 0 && detail) {
-          const model   = detail.body && detail.body.model       ? detail.body.model       : '?';
-          const preview = detail.body && detail.body.last_user_preview ? detail.body.last_user_preview : '';
-          const litellm = (detail.body && detail.body.litellm) || null;
-          const stalledColor = detail.stalled_seconds > 30 ? '#c0241b' : '#6e6e73';
-          const stalledLabel = detail.stalled_seconds > 30
-            ? `已停滞 ${fmtSeconds(detail.stalled_seconds)}`
-            : `${fmtSeconds(detail.stalled_seconds)}前更新`;
-          // LiteLLM 上游身份信息 (x-litellm-* headers)
-          let litellmRow = '';
-          if (litellm) {
-            const main = litellm.user_id || litellm.user_alias
-                      || litellm.user_email || litellm.team_id || '(未知)';
+        // in_flight_detail[0] 是插入顺序最早的 channel——也就是当前真正
+        // 占用 worker 内部 PTY 锁的那个请求。后面的是 worker 内部排队等
+        // PTY 锁的请求（Session.lock 只持有到 stdin 写完）。
+        const details = w.in_flight_detail || [];
+        const head = details[0] || null;
+        const dash = '<span class="text-muted">—</span>';
+        let modelCell = dash, litellmCell = dash, taskCell = dash;
+
+        const counts = { active: 0, queued: 0, stuck: 0 };
+        details.forEach(d => {
+          if (d.stalled_seconds > 30)      counts.stuck  += 1;
+          else if (d.bytes_received > 0)   counts.active += 1;
+          else                             counts.queued += 1;
+        });
+
+        if (w.in_flight > 0 && head) {
+          const model   = head.body && head.body.model       ? head.body.model       : '?';
+          const preview = head.body && head.body.last_user_preview ? head.body.last_user_preview : '';
+          const litellm = (head.body && head.body.litellm) || null;
+          const isStalled = head.stalled_seconds > 30;
+          const stalledLabel = isStalled
+            ? `已停滞 ${fmtSeconds(head.stalled_seconds)}`
+            : `${fmtSeconds(head.stalled_seconds)}前更新`;
+
+          modelCell = `<span class="mono key">${escapeHtml(model)}</span>`;
+
+          if (litellm && litellm.user_api_key_alias) {
             const fullJson = JSON.stringify(litellm, null, 2);
-            litellmRow = `
-              <div class="task-meta" style="margin-top:4px;color:#0051d5;" title="${escapeHtml(fullJson)}">
-                LiteLLM 用户：<span class="key">${escapeHtml(main)}</span>${litellm.team_id ? ` · 团队 ${escapeHtml(litellm.team_id)}` : ''}
-              </div>
-            `;
+            litellmCell = `<span class="key text-blue" title="${escapeHtml(fullJson)}">${escapeHtml(litellm.user_api_key_alias)}</span>`;
           }
+
+          const previewHtml = preview
+            ? `<div class="preview" data-full="${escapeHtml(preview)}">${escapeHtml(preview)}</div>`
+            : '';
+
+          let queueLine = '';
+          if (details.length > 1) {
+            const parts = [];
+            if (counts.active > 0) parts.push(`<span class="text-blue">处理中 ${counts.active}</span>`);
+            if (counts.queued > 0) parts.push(`<span>排队中 ${counts.queued}</span>`);
+            if (counts.stuck  > 0) parts.push(`<span class="text-red">卡死 ${counts.stuck}</span>`);
+            queueLine = `<div class="task-meta" style="margin-top:6px;">${parts.join(' · ')}</div>`;
+          }
+
           taskCell = `
             <div class="task-meta">
-              <span class="key">${escapeHtml(model)}</span>
-              · 已接收 ${fmtBytes(detail.bytes_received)}
-              · 已运行 ${fmtSeconds(detail.age_seconds)}
-              · <span style="color:${stalledColor};">${stalledLabel}</span>
+              已接收 ${fmtBytes(head.bytes_received)}
+              · 已运行 ${fmtSeconds(head.age_seconds)}
+              · <span class="${isStalled ? 'text-red' : ''}">${stalledLabel}</span>
             </div>
-            ${litellmRow}
-            ${preview ? `<div class="preview" title="${escapeHtml(preview)}">${escapeHtml(preview)}</div>` : ''}
-            ${w.in_flight > 1 ? `<div class="task-meta" style="margin-top:4px;color:#ff9500;">⚠ 并发处理 ${w.in_flight} 个请求</div>` : ''}
+            ${previewHtml}
+            ${queueLine}
           `;
         }
         return `
           <tr>
             <td><strong>${escapeHtml(w.user_id)}</strong></td>
             <td><span class="badge ${status.cls}">${status.label}</span></td>
-            <td class="mono">${w.pid || '-'}</td>
-            <td class="mono">${w.mitm_port}</td>
+            <td>${modelCell}</td>
+            <td>${litellmCell}</td>
             <td>${fmtSeconds(w.age_seconds)}</td>
             <td>${fmtSeconds(w.idle_seconds)}</td>
             <td class="mono">${w.total_requests}</td>
             <td class="mono">${w.in_flight}</td>
             <td>${taskCell}</td>
-            <td><button class="restart-btn" data-uid="${escapeHtml(w.user_id)}">重启</button></td>
+            <td><button class="btn-restart" data-uid="${escapeHtml(w.user_id)}">重启</button></td>
           </tr>
         `;
       }).join('');
 
-      // Wire restart buttons (delegating would also work; this is fine for ~10 rows)
-      workerBody.querySelectorAll('.restart-btn').forEach(btn => {
+      workerBody.querySelectorAll('.btn-restart').forEach(btn => {
         btn.addEventListener('click', () => restartWorker(btn.dataset.uid));
       });
     }
@@ -418,7 +725,7 @@
         `然后销毁进程并重建（含 bootstrap 预热，约 10-30 秒）。` +
         `期间该 worker 不接收新请求；若它在用户池中，其它成员会接管流量。`);
       if (!ok) return;
-      const buttons = document.querySelectorAll('.restart-btn');
+      const buttons = document.querySelectorAll('.btn-restart');
       buttons.forEach(b => b.disabled = true);
       try {
         const resp = await fetch(
@@ -476,9 +783,192 @@
       data.changes.forEach(c => lines.push('  ✓ ' + escapeHtml(c)));
       data.warnings.forEach(w => lines.push(`  <span class="warn">⚠ ${escapeHtml(w)}</span>`));
       reloadOutput.innerHTML = `<div class="reload-output">${lines.join('\n')}</div>`;
-      // 30 秒后自动清掉，避免视觉残留
       clearTimeout(reloadOutput._t);
       reloadOutput._t = setTimeout(() => reloadOutput.innerHTML = '', 30000);
+    }
+
+    // ── 订阅配额 ──────────────────────────────────────────
+    const QUOTA_TIER_LABELS = {
+      five_hour:        '5 小时滚动窗口',
+      seven_day:        '7 天总配额',
+      seven_day_opus:   '7 天 · Opus',
+      seven_day_sonnet: '7 天 · Sonnet',
+    };
+
+    function fmtResetTime(iso) {
+      if (!iso) return '';
+      const dt = new Date(iso);
+      if (isNaN(dt)) return iso;
+      const now = new Date();
+      const diffSec = (dt - now) / 1000;
+      const abs = Math.abs(diffSec);
+      let rel;
+      if (abs < 60)         rel = Math.round(diffSec) + ' 秒';
+      else if (abs < 3600)  rel = Math.round(diffSec / 60) + ' 分钟';
+      else if (abs < 86400) rel = (diffSec / 3600).toFixed(1) + ' 小时';
+      else                  rel = (diffSec / 86400).toFixed(1) + ' 天';
+      const sign = diffSec >= 0 ? '后' : '前';
+      return rel + sign + '重置';
+    }
+
+    function tierClass(util) {
+      if (util >= 90) return 'danger';
+      if (util >= 70) return 'warn';
+      return '';
+    }
+
+    function renderQuotaTier(name, tier) {
+      if (!tier || tier.utilization == null) return '';
+      const util  = Number(tier.utilization);
+      const cls   = tierClass(util);
+      const label = QUOTA_TIER_LABELS[name] || name;
+      const reset = tier.resets_at
+        ? `<span class="reset">${escapeHtml(fmtResetTime(tier.resets_at))}</span>`
+        : '';
+      return `
+        <div class="quota-tier ${cls}">
+          <div class="tier-head">
+            <span class="tier-name">${escapeHtml(label)}</span>
+            ${reset}
+          </div>
+          <div class="bar"><div class="fill" style="width:${Math.min(100, util)}%"></div></div>
+          <div class="util">${util.toFixed(1)}% 已用</div>
+        </div>
+      `;
+    }
+
+    function renderQuota(state) {
+      const snap = state && state.snapshot;
+      const err  = state && state.last_error;
+
+      if (snap) {
+        const fetchedAt = new Date(snap.fetched_at_unix * 1000).toLocaleString('zh-CN');
+        let meta = `数据抓取于 ${fetchedAt}`;
+        if (err) {
+          const errAt = new Date(err.attempted_at_unix * 1000).toLocaleString('zh-CN');
+          meta += ` · 最近一次尝试（${errAt}）失败`;
+        }
+        quotaMeta.textContent = meta;
+      } else if (err) {
+        const errAt = new Date(err.attempted_at_unix * 1000).toLocaleString('zh-CN');
+        quotaMeta.textContent = `${errAt} 抓取失败，未有成功记录`;
+      } else {
+        quotaMeta.textContent = '未加载';
+      }
+
+      let errBanner = '';
+      if (err) {
+        const rateNote = err.is_rate_limited
+          ? `Anthropic 限速中，${err.retry_after_seconds ? Math.round(err.retry_after_seconds) + ' 秒后' : '稍候'}再试。`
+          : '';
+        errBanner = `<div class="quota-error"><div>${escapeHtml(rateNote)}${escapeHtml(err.error || '未知错误')}</div></div>`;
+      }
+
+      if (!snap) {
+        quotaBody.innerHTML = errBanner
+          || '<div class="quota-empty">点击右上「刷新配额」获取最新用量</div>';
+        return;
+      }
+
+      const tiers = [];
+      ['five_hour','seven_day','seven_day_opus','seven_day_sonnet'].forEach(k => {
+        const html = renderQuotaTier(k, snap[k]);
+        if (html) tiers.push(html);
+      });
+      if (snap.extra_tiers) {
+        Object.entries(snap.extra_tiers).forEach(([k, v]) => {
+          const html = renderQuotaTier(k, v);
+          if (html) tiers.push(html);
+        });
+      }
+
+      let extraUsageHtml = '';
+      const eu = snap.extra_usage;
+      if (eu && eu.is_enabled) {
+        const cur = eu.currency || 'USD';
+        const used = eu.used_credits != null ? eu.used_credits.toFixed(2) : '?';
+        const limit = eu.monthly_limit != null ? eu.monthly_limit.toFixed(2) : '?';
+        const util = eu.utilization != null ? Number(eu.utilization).toFixed(1) : '?';
+        extraUsageHtml = `
+          <div class="quota-tier extra-usage" style="grid-column: 1 / -1;">
+            <div class="tier-head">
+              <span class="tier-name">超额按量付费（extra usage）</span>
+              <span class="reset">${escapeHtml(util)}% 已用</span>
+            </div>
+            <div class="bar"><div class="fill" style="width:${Math.min(100, Number(util)||0)}%;"></div></div>
+            <div class="util">${escapeHtml(used)} / ${escapeHtml(limit)} ${escapeHtml(cur)}</div>
+          </div>
+        `;
+      }
+
+      const tiersHtml = tiers.length || extraUsageHtml
+        ? `<div class="quota-tiers">${tiers.join('')}${extraUsageHtml}</div>`
+        : '<div class="quota-empty">API 未返回任何配额窗口</div>';
+      quotaBody.innerHTML = errBanner + tiersHtml;
+    }
+
+    function startQuotaCooldown(seconds) {
+      if (quotaCooldownTimer) clearInterval(quotaCooldownTimer);
+      if (!(seconds > 0)) {
+        quotaRefreshBtn.disabled = false;
+        quotaRefreshBtn.textContent = '刷新配额';
+        return;
+      }
+      let remaining = Math.ceil(seconds);
+      quotaRefreshBtn.disabled = true;
+      const tick = () => {
+        if (remaining <= 0) {
+          clearInterval(quotaCooldownTimer); quotaCooldownTimer = null;
+          quotaRefreshBtn.disabled = false;
+          quotaRefreshBtn.textContent = '刷新配额';
+          return;
+        }
+        quotaRefreshBtn.textContent = `刷新配额（${remaining}s）`;
+        remaining -= 1;
+      };
+      tick();
+      quotaCooldownTimer = setInterval(tick, 1000);
+    }
+
+    async function loadQuotaCached() {
+      const auth = authHeader();
+      if (!auth) return;
+      try {
+        const resp = await fetch('/admin/quota', { headers: auth });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        renderQuota(data);
+        startQuotaCooldown(data.seconds_until_next_refresh || 0);
+      } catch (e) { /* 静默 */ }
+    }
+
+    async function refreshQuota() {
+      const auth = authHeader();
+      if (!auth) { showBanner('请先填写 API Key'); return; }
+      quotaRefreshBtn.disabled = true;
+      const prevText = quotaRefreshBtn.textContent;
+      quotaRefreshBtn.textContent = '刷新中…';
+      try {
+        const resp = await fetch('/admin/quota/refresh', { method: 'POST', headers: auth });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showToast(`刷新失败：${data.detail || resp.statusText}`, 'error');
+          quotaRefreshBtn.textContent = prevText;
+          quotaRefreshBtn.disabled = false;
+          return;
+        }
+        renderQuota(data);
+        if (data.rate_limited) {
+          showToast(`未刷新——服务端 ${data.rate_limit_seconds}s 频控保护中`, 'error');
+        } else {
+          showToast('订阅配额已刷新', 'success');
+        }
+        startQuotaCooldown(data.seconds_until_next_refresh || 0);
+      } catch (e) {
+        showToast('请求失败：' + e.message, 'error');
+        quotaRefreshBtn.textContent = prevText;
+        quotaRefreshBtn.disabled = false;
+      }
     }
 
     async function forceRefreshToken() {
@@ -506,9 +996,52 @@
       }
     }
 
+    // ── Hover tooltip for truncated user-message preview ──────
+    const msgTooltip = document.createElement('div');
+    msgTooltip.id = 'msg-tooltip';
+    document.body.appendChild(msgTooltip);
+
+    function positionTooltip(anchor) {
+      const rect = anchor.getBoundingClientRect();
+      const margin = 8;
+      msgTooltip.style.display = 'block';
+      msgTooltip.style.left = '0px';
+      msgTooltip.style.top  = '0px';
+      const t = msgTooltip.getBoundingClientRect();
+      let left = rect.left;
+      let top  = rect.bottom + 4;
+      if (left + t.width > window.innerWidth - margin) {
+        left = window.innerWidth - t.width - margin;
+      }
+      if (left < margin) left = margin;
+      if (top + t.height > window.innerHeight - margin) {
+        top = rect.top - t.height - 4;
+        if (top < margin) top = margin;
+      }
+      msgTooltip.style.left = left + 'px';
+      msgTooltip.style.top  = top  + 'px';
+    }
+
+    workerBody.addEventListener('mouseover', e => {
+      const el = e.target.closest('.preview[data-full]');
+      if (!el) return;
+      msgTooltip.textContent = el.dataset.full;
+      positionTooltip(el);
+    });
+    workerBody.addEventListener('mouseout', e => {
+      const el = e.target.closest('.preview[data-full]');
+      if (!el) return;
+      msgTooltip.style.display = 'none';
+    });
+    window.addEventListener('scroll',  () => msgTooltip.style.display = 'none', true);
+    window.addEventListener('resize',  () => msgTooltip.style.display = 'none');
+
     // initial run
     setupAutoRefresh();
-    if (apiKeyInput.value) refresh();
+    if (apiKeyInput.value) {
+      refresh();
+      loadQuotaCached();
+    }
   </script>
 </body>
 </html>

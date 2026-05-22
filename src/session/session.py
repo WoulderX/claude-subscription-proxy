@@ -49,8 +49,11 @@ def _summarize_body(
                     last_user_text = blk.get("text", "")
                     break
         break
-    preview = last_user_text[:80]
-    if len(last_user_text) > 80:
+    # 留够多让 /ui 的 hover tooltip 能显示完整消息体；上限是为了避免
+    # 把整段 system prompt / 多 KB 用户输入塞进 /status 响应。
+    _PREVIEW_LIMIT = 2000
+    preview = last_user_text[:_PREVIEW_LIMIT]
+    if len(last_user_text) > _PREVIEW_LIMIT:
         preview += "…"
     summary: dict[str, Any] = {
         "model": body.get("model"),
