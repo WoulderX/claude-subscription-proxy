@@ -58,6 +58,62 @@ PRESERVED_HEADER_PREFIXES = (
 STRIP_BETA_PREFIX = "context-1m"
 
 
+class _FlowState:
+    """Per-hijacked-flow state shared between the request hook (which
+    arms the stall watchdog the moment hijack completes), the
+    responseheaders hook (which mounts a stream tap that resets the
+    watchdog on each chunk), and the error hook (which closes the
+    channel on upstream connection failure).
+
+    Holding state per flow.id (rather than a single self._ slot) keeps
+    a stale flow that times out late from clobbering a fresh hijack
+    that already took over self._active_flow_id."""
+
+    def __init__(self, addon: "HijackAddon", flow_id: str,
+                 channel, stall_timeout: float) -> None:
+        self.addon = addon
+        self.flow_id = flow_id
+        self.flow_id_short = flow_id[:8]
+        self.channel = channel
+        self.user = addon.session.user_id
+        self.stall_timeout = stall_timeout
+        self.loop = asyncio.get_running_loop()
+        self.watchdog: asyncio.TimerHandle | None = None
+        self.closed = False
+
+    def arm(self) -> None:
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+        self.watchdog = self.loop.call_later(self.stall_timeout, self._fire)
+
+    def _fire(self) -> None:
+        if self.closed:
+            return
+        log.warning("user=%s response went silent for %.0fs (no chunk from "
+                    "upstream); closing channel flow=%s",
+                    self.user, self.stall_timeout, self.flow_id_short)
+        self.close("force-closed by stall watchdog")
+
+    def close(self, reason: str) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+            self.watchdog = None
+        if self.channel is not None:
+            try:
+                self.channel.queue.put_nowait(None)
+            except Exception:
+                pass
+        # Drop from addon's per-flow dict so we don't leak entries
+        # forever (a stuck request that never sees responseheaders
+        # would otherwise sit in the dict for the worker's whole life).
+        self.addon._flow_states.pop(self.flow_id, None)
+        log.info("user=%s response stream %s flow=%s",
+                 self.user, reason, self.flow_id_short)
+
+
 class HijackAddon:
     """One instance per ClaudeSession (and per mitm listener port).
     Holds a back-reference to its session to read the pending request
@@ -67,6 +123,11 @@ class HijackAddon:
         self.session = session
         # the flow currently being streamed back to the API client (if any)
         self._active_flow_id: str | None = None
+        # Per-flow watchdog/channel state, keyed by mitm flow.id. An
+        # entry is added when the request hook hijacks the flow and
+        # removed by _FlowState.close (normal EOS, watchdog fire, or
+        # upstream error).
+        self._flow_states: dict[str, _FlowState] = {}
 
     # ---- request hook: swap body ----
 
@@ -130,6 +191,27 @@ class HijackAddon:
         # Clear the slot so subsequent outbound calls from claude don't get
         # hijacked by this same pending request.
         self.session.pending = None
+
+        # Arm the stall watchdog NOW (at hijack time, not at
+        # responseheaders time) so an upstream that accepts the request
+        # but never sends response headers at all — a silent hang
+        # before the first byte — is still recoverable. The earlier
+        # version armed only in responseheaders, which left this gap:
+        # in production we saw worker stuck with in_flight=1, bytes=0,
+        # stalled=215s, because Anthropic's TCP connection was open
+        # but no HTTP response had ever come back, so responseheaders
+        # never fired, so the watchdog never armed.
+        stall_timeout = getattr(
+            self.session, "response_stall_timeout", 90.0)
+        state = _FlowState(
+            addon=self,
+            flow_id=flow.id,
+            channel=self.session.response,
+            stall_timeout=stall_timeout,
+        )
+        state.arm()
+        self._flow_states[flow.id] = state
+
         log.info("user=%s hijacked outbound /v1/messages flow=%s model=%s",
                  self.session.user_id, flow.id[:8], merged.get("model"))
 
@@ -245,78 +327,51 @@ class HijackAddon:
     # ---- response streaming ----
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
+        """Install the stream tap that mirrors each upstream chunk into
+        our channel and resets the watchdog. The watchdog itself was
+        already armed by the request hook at hijack time; this hook
+        just hands it the per-chunk reset signal once data starts
+        flowing. mitmproxy 11 contract for `flow.response.stream`:
+
+          - Set to True for pass-through streaming.
+          - Set to a callable `(data: bytes) -> bytes | list[bytes]`
+            to transform each chunk. An empty `b""` argument signals
+            end-of-stream.
+        """
         if flow.id != self._active_flow_id:
             return
-        # mitmproxy 11 contract for `flow.response.stream`:
-        #   - Set to True for pass-through streaming.
-        #   - Set to a callable `(data: bytes) -> bytes | list[bytes]`
-        #     to transform each chunk. An empty `b""` argument signals
-        #     end-of-stream (after which the callable may also return
-        #     bytes to append).
-        # We use the callable form so we can mirror each chunk into the
-        # user's ResponseChannel while still letting it flow to claude.
-        channel = self.session.response
-        user = self.session.user_id
-        flow_id_short = flow.id[:8]
-
-        # Stall watchdog. Recovers from the pattern where Anthropic
-        # returns a small non-SSE error body (~150 bytes for a
-        # rate_limit_error JSON) then leaves the connection idle
-        # without a proper end-of-stream signal. Without this, _tap
-        # never sees b"", the channel never gets a None sentinel, the
-        # worker's _handle stays in `async for chunk in channel.iter()`
-        # forever, and the worker looks busy on /status indefinitely.
-        # The watchdog re-arms on every chunk; if no chunk arrives for
-        # the configured window we synthesise the EOS ourselves.
-        stall_timeout = getattr(self.session, "response_stall_timeout", 90.0)
-        loop = asyncio.get_running_loop()
-        # Mutable single-slot holder so the nested closures can swap
-        # the TimerHandle without `nonlocal` gymnastics.
-        watchdog: list = [None]
-        closed = [False]
-
-        def _close_channel(reason: str) -> None:
-            if closed[0]:
-                return
-            closed[0] = True
-            if watchdog[0] is not None:
-                watchdog[0].cancel()
-                watchdog[0] = None
-            if channel is not None:
-                try:
-                    channel.queue.put_nowait(None)
-                except Exception:
-                    pass
-            log.info("user=%s response stream %s flow=%s",
-                     user, reason, flow_id_short)
-
-        def _fire_watchdog() -> None:
-            log.warning("user=%s response went silent for %.0fs (no chunk "
-                        "from upstream); closing channel to recover from "
-                        "stuck non-SSE response or upstream hang flow=%s",
-                        user, stall_timeout, flow_id_short)
-            _close_channel("force-closed by stall watchdog")
-
-        def _arm_watchdog() -> None:
-            if watchdog[0] is not None:
-                watchdog[0].cancel()
-            watchdog[0] = loop.call_later(stall_timeout, _fire_watchdog)
+        state = self._flow_states.get(flow.id)
+        if state is None:
+            # request hook didn't hijack this flow (e.g., not a /v1/messages
+            # path, or hijacked then a stale entry was already cleared).
+            # Pass-through with no tapping.
+            return
 
         def _tap(data: bytes) -> bytes:
             if data:
-                if channel is not None and not closed[0]:
+                if state.channel is not None and not state.closed:
                     try:
-                        channel.queue.put_nowait(bytes(data))
+                        state.channel.queue.put_nowait(bytes(data))
                     except Exception:
-                        log.exception("user=%s failed pushing chunk", user)
-                _arm_watchdog()
+                        log.exception("user=%s failed pushing chunk", state.user)
+                state.arm()  # reset stall watchdog on each chunk
                 return data
             # data == b"" → end-of-stream marker from mitm
-            _close_channel("complete")
+            state.close("complete")
             return b""
 
-        # Arm immediately so a response that yields ZERO chunks (e.g.
-        # mitm sets up the stream then the connection silently drops
-        # before any body bytes arrive) still gets recovered.
-        _arm_watchdog()
         flow.response.stream = _tap
+
+    def error(self, flow: http.HTTPFlow) -> None:
+        """Mitm hit a flow-level error — typically upstream connection
+        reset, TLS handshake failure, or server hangup before sending
+        any response. _tap will never fire (no body stream) so close
+        the channel directly so the worker's _handle unblocks instead
+        of waiting for the watchdog timeout."""
+        state = self._flow_states.get(flow.id)
+        if state is None:
+            return
+        err = getattr(flow, "error", None)
+        log.warning("user=%s upstream flow error: %s flow=%s",
+                    state.user, err, state.flow_id_short)
+        state.close("upstream error")
