@@ -6,10 +6,12 @@ import os
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
+from .api.admin import build_router as build_admin_router
 from .api.anthropic import build_router as build_anthropic_router
 from .api.openai import build_router as build_openai_router
 from .auth import make_auth_dep
@@ -36,21 +38,36 @@ def _detect_claude_version(binary: str) -> str:
         return "unknown"
 
 
-def create_app(config: Config) -> FastAPI:
+def create_app(config: Config, config_path: str | None = None) -> FastAPI:
+    """Build the FastAPI app.
+
+    config_path is used by /admin/reload to re-read config.yaml from
+    disk; if None (e.g. config was loaded from somewhere other than a
+    file), /admin/reload returns 503."""
     manager = SessionManager(config)
     auth_dep = make_auth_dep(config)
     claude_version = _detect_claude_version(config.claude.binary)
     log.info("claude code CLI version: %s", claude_version)
 
-    # One refresher per deployment, watching the operator's shared
-    # .credentials.json (the same file every worker's HOME/.claude
-    # is symlinked into). Centralising refresh here makes the main
-    # process the single writer of /v1/oauth/token requests, which
-    # eliminates the multi-worker refresh_token rotation race.
-    refresher = OAuthRefresher(
-        credentials_path=Path(os.path.expanduser("~"))
-            / ".claude" / ".credentials.json",
-    )
+    credentials_path = Path(os.path.expanduser("~")) / ".claude" / ".credentials.json"
+
+    # Refresher + its task are owned by lifespan but admin/reload also
+    # needs to swap them (when oauth_refresh.enabled toggles). Holding
+    # them on a SimpleNamespace gives both code paths a stable
+    # reference; this is single-threaded asyncio so plain attribute
+    # access is safe.
+    refresher_state = SimpleNamespace(refresher=None, task=None)
+
+    if config.oauth_refresh.enabled:
+        refresher_state.refresher = OAuthRefresher(
+            credentials_path=credentials_path,
+            check_interval_seconds=config.oauth_refresh.check_interval_seconds,
+            refresh_when_expires_within_seconds=
+                config.oauth_refresh.refresh_when_expires_within_seconds,
+        )
+    else:
+        log.warning("oauth_refresh.enabled=false — workers will self-refresh; "
+                    "multi-worker refresh_token rotation race may re-emerge")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -58,23 +75,30 @@ def create_app(config: Config) -> FastAPI:
         # first worker's HOME read picks up a fresh token if the
         # deployment had been sitting on a stale one. Then kick off
         # the background loop to keep it fresh.
-        await refresher.initial_refresh()
-        refresher_task = asyncio.create_task(
-            refresher.run(), name="oauth-refresher")
+        if refresher_state.refresher is not None:
+            await refresher_state.refresher.initial_refresh()
+            refresher_state.task = asyncio.create_task(
+                refresher_state.refresher.run(), name="oauth-refresher")
         await manager.start()
         try:
             yield
         finally:
             await manager.stop()
-            refresher_task.cancel()
-            try:
-                await refresher_task
-            except asyncio.CancelledError:
-                pass
+            if refresher_state.task is not None:
+                refresher_state.task.cancel()
+                try:
+                    await refresher_state.task
+                except asyncio.CancelledError:
+                    pass
 
     app = FastAPI(lifespan=lifespan)
     app.include_router(build_anthropic_router(manager, auth_dep))
     app.include_router(build_openai_router(manager, auth_dep))
+    app.include_router(build_admin_router(
+        manager=manager, config=config, config_path=config_path,
+        auth_dep=auth_dep, refresher_state=refresher_state,
+        credentials_path=credentials_path,
+    ))
 
     @app.get("/healthz")
     async def healthz():
@@ -85,21 +109,28 @@ def create_app(config: Config) -> FastAPI:
         }
 
     @app.get("/status")
-    async def status():
+    async def status(_pool: list[str] = Depends(auth_dep)):
         """Per-worker runtime state. Distinguishes healthy in-flight
         requests (bytes flowing) from stalled ones (no bytes received
         recently, likely a leaked channel from a missed mitm intercept
-        or an upstream that froze mid-stream). Unauthenticated — same
-        trust model as /healthz; protect with reverse-proxy ACL if
-        exposed beyond trusted hosts."""
+        or an upstream that froze mid-stream).
+
+        Auth: any configured API key (Bearer or x-api-key). /status
+        leaks request metadata (model, n_messages, last_user_preview
+        of in-flight prompts), so it must not be world-readable. We
+        reuse the tenant key space rather than introduce a separate
+        admin token because every legitimate caller already has one;
+        /healthz stays open for container liveness probes."""
         import time as _time
         now = _time.monotonic()
         # A request that's been alive for > this many seconds without
         # receiving a single byte from upstream is almost certainly
         # leaked rather than just slow. Anthropic typically emits its
-        # first SSE event within ~3s; 30s is comfortably past any
-        # plausible cold-start.
-        STALL_THRESHOLD = 30.0
+        # first SSE event within ~3s; the default 30s is comfortably
+        # past any plausible cold-start, but is configurable via
+        # claude.timeouts.status_stall_seconds for workloads with
+        # genuinely long initial latency.
+        STALL_THRESHOLD = config.claude.timeouts.status_stall_seconds
 
         workers = []
         # Snapshot the dict so a concurrent restart can't mutate under us.
@@ -181,7 +212,7 @@ def main() -> None:
     )
     config_path = os.environ.get("CONFIG", "config.yaml")
     config = Config.load(config_path)
-    app = create_app(config)
+    app = create_app(config, config_path=config_path)
     uvicorn.run(app, host=config.listen_host, port=config.listen_port)
 
 

@@ -10,6 +10,25 @@ claude:
   home_template: /data/users/{user_id}   # per-user HOME (so each user has own ~/.claude/)
   restart_interval_seconds: 14400        # 4h — must stay under OAuth token lifetime (~8h) so workers always restart before their in-memory token expires; main process handles refresh on disk
 
+  # Operational tuning knobs. All optional; defaults match what was
+  # previously hardcoded in the source. Adjust only if you actually
+  # see the corresponding failure mode under your real workload.
+  timeouts:
+    mitm_intercept_seconds: 30           # how long mitm has to hijack TUI's outbound /v1/messages
+    status_stall_seconds: 30             # /status marks an in-flight request as "stuck" after this many bytes-free seconds
+    restart_drain_seconds: 60            # scheduled restart waits this long for in-flight streams to finish
+    worker_ready_seconds: 60             # how long a new worker has to signal ready on stdout
+    prewarm_seconds: 60                  # bootstrap prewarm upper bound (non-fatal on miss)
+    restart_check_interval_seconds: 60   # how often the restarter loop polls workers for age-based recycling
+
+# Centralised proactive OAuth token refresh. Eliminates the per-worker
+# refresh_token rotation race. Disable only for debugging — with this
+# off, workers self-refresh and the multi-worker race can re-emerge.
+oauth_refresh:
+  enabled: true
+  check_interval_seconds: 300                  # how often to check expiry
+  refresh_when_expires_within_seconds: 3600    # refresh if token expires within this window
+
 # bearer token -> user_id (scalar) OR list of user_ids (pool).
 # A list-form token round-robins requests across the listed workers,
 # so a single key in LiteLLM can drive N parallel claude PTYs.

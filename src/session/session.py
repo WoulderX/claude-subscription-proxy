@@ -89,6 +89,8 @@ class ClaudeSession:
             "--ca-cert", str(self.config.ca_cert_path()),
             "--claude-binary", self.config.claude.binary,
             "--log-level", os.environ.get("LOG_LEVEL", "INFO"),
+            "--mitm-intercept-timeout",
+                str(self.config.claude.timeouts.mitm_intercept_seconds),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=None,  # inherit — worker logs flow to server stderr
@@ -108,11 +110,13 @@ class ClaudeSession:
         # so a hung worker doesn't block the API request indefinitely.
         try:
             ready_line = await asyncio.wait_for(
-                self.proc.stdout.readline(), timeout=60)
+                self.proc.stdout.readline(),
+                timeout=self.config.claude.timeouts.worker_ready_seconds)
         except asyncio.TimeoutError:
             self.proc.kill()
             raise RuntimeError(
-                f"worker for {self.user_id} did not signal ready within 60s")
+                f"worker for {self.user_id} did not signal ready within "
+                f"{self.config.claude.timeouts.worker_ready_seconds:.0f}s")
         if not ready_line:
             raise RuntimeError(
                 f"worker for {self.user_id} exited before signalling ready")

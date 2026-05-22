@@ -9,11 +9,6 @@ from .session import ClaudeSession
 
 log = logging.getLogger(__name__)
 
-# Wait up to this long for in-flight SSE streams to finish before tearing
-# down a worker during a scheduled restart. After this we force the
-# restart anyway; the truncated streams get a None sentinel via stop().
-_RESTART_DRAIN_TIMEOUT = 60.0
-
 
 class SessionManager:
     def __init__(self, config: Config) -> None:
@@ -144,7 +139,9 @@ class SessionManager:
         and need to retry. Caller must hold sess.lock so the dummy
         /v1/messages we submit can't be interleaved with a real one."""
         try:
-            await asyncio.wait_for(self._prewarm_bootstrap(sess), timeout=60)
+            await asyncio.wait_for(
+                self._prewarm_bootstrap(sess),
+                timeout=self.config.claude.timeouts.prewarm_seconds)
         except asyncio.TimeoutError:
             log.warning("bootstrap prewarm timed out user=%s; "
                         "first real request may hit rate limit", sess.user_id)
@@ -199,9 +196,11 @@ class SessionManager:
         session object and its mitm port are reused; only the worker
         subprocess (and the claude/mitm processes it owns) is replaced."""
         interval = self.config.claude.restart_interval_seconds
+        check_interval = self.config.claude.timeouts.restart_check_interval_seconds
+        drain_timeout = self.config.claude.timeouts.restart_drain_seconds
         while True:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(check_interval)
                 for user_id, sess in list(self.sessions.items()):
                     if sess.age_seconds() <= interval:
                         continue
@@ -211,7 +210,7 @@ class SessionManager:
                         # Hold the session lock to block new submissions;
                         # wait for any already-streaming responses to
                         # finish before tearing the worker down.
-                        deadline = time.monotonic() + _RESTART_DRAIN_TIMEOUT
+                        deadline = time.monotonic() + drain_timeout
                         while sess._channels and time.monotonic() < deadline:
                             await asyncio.sleep(0.5)
                         if sess._channels:

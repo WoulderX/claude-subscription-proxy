@@ -63,6 +63,35 @@ class OAuthRefresher:
         self.check_interval = check_interval_seconds
         self.refresh_window = refresh_when_expires_within_seconds
 
+    async def refresh_now(self) -> str:
+        """Force one immediate check + refresh, bypassing the periodic
+        loop's sleep. Returns a short status string for admin tooling:
+        "refreshed" (we hit /v1/oauth/token and got a new token),
+        "not_needed" (token has more life than refresh_window), or
+        "failed" (any error). Used by POST /admin/refresh-now."""
+        creds = self._read_credentials()
+        if creds is None:
+            return "failed"
+        oauth = creds.get("claudeAiOauth")
+        if not isinstance(oauth, dict):
+            return "failed"
+        expires_at_ms = oauth.get("expiresAt")
+        if not isinstance(expires_at_ms, (int, float)):
+            return "failed"
+        remaining = expires_at_ms / 1000.0 - time.time()
+        rt = oauth.get("refreshToken")
+        if not isinstance(rt, str) or not rt:
+            return "failed"
+        new_fields = await self._refresh(rt)
+        if new_fields is None:
+            return "failed"
+        oauth.update(new_fields)
+        creds["claudeAiOauth"] = oauth
+        self._atomic_write(creds)
+        log.info("forced refresh: token had %.0fs left; new expiresAt=%d",
+                 remaining, oauth["expiresAt"])
+        return "refreshed"
+
     async def initial_refresh(self) -> None:
         """One-shot pre-startup check. Call before spawning any worker so
         that workers' first read of .credentials.json picks up a fresh

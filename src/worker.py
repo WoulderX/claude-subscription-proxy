@@ -48,9 +48,11 @@ class WorkerSession:
     the worker subprocess."""
 
     def __init__(self, user_id: str, mitm_port: int,
-                 home: Path, claude_binary: str, ca_cert: Path) -> None:
+                 home: Path, claude_binary: str, ca_cert: Path,
+                 mitm_intercept_timeout: float = 30.0) -> None:
         self.user_id = user_id
         self.mitm_port = mitm_port
+        self.mitm_intercept_timeout = mitm_intercept_timeout
         self.lock = asyncio.Lock()
 
         self.pending: PendingRequest | None = None
@@ -83,7 +85,7 @@ class WorkerSession:
             await self.pty.trigger()
             try:
                 await asyncio.wait_for(self.pending.consumed.wait(),
-                                       timeout=30)
+                                       timeout=self.mitm_intercept_timeout)
             except asyncio.TimeoutError:
                 # mitm never saw a /v1/messages it could claim — most
                 # often claude TUI is in a "rate limited / error" UI
@@ -95,9 +97,9 @@ class WorkerSession:
                 # channel.iter()` hangs forever, leaks the channel into
                 # the server's _channels dict, and the worker looks
                 # busy forever even though nothing is happening.
-                log.warning("user=%s mitm did not intercept within 30s; "
+                log.warning("user=%s mitm did not intercept within %.0fs; "
                             "closing response and clearing pending slot",
-                            self.user_id)
+                            self.user_id, self.mitm_intercept_timeout)
                 self.pending = None
                 await self.response.put(None)
             return self.response
@@ -151,6 +153,9 @@ async def amain() -> None:
     parser.add_argument("--claude-binary", default="claude")
     parser.add_argument("--ca-cert", required=True)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--mitm-intercept-timeout", type=float, default=30.0,
+                        help="seconds to wait for mitm to hijack TUI's "
+                             "outbound /v1/messages before failing the call")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -165,6 +170,7 @@ async def amain() -> None:
         home=Path(args.home),
         claude_binary=args.claude_binary,
         ca_cert=Path(args.ca_cert),
+        mitm_intercept_timeout=args.mitm_intercept_timeout,
     )
     await session.start()
     await _send({"type": "ready"})
