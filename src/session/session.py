@@ -209,21 +209,31 @@ class ClaudeSession:
         during a scheduled restart waits for the new worker rather than
         racing with the dead one."""
         async with self.lock:
-            if self.proc is None or self.proc.returncode is not None:
-                raise RuntimeError(f"worker for {self.user_id} not running")
-            self.last_used = time.monotonic()
-            req_id = self._next_req_id
-            self._next_req_id += 1
-            channel = ResponseChannel(body_summary=_summarize_body(body))
-            self._channels[req_id] = channel
+            return await self._submit(body)
 
-            assert self.proc.stdin is not None
-            line = json.dumps({"type": "request", "id": req_id,
-                               "body": body}) + "\n"
-            self.proc.stdin.write(line.encode())
-            await self.proc.stdin.drain()
-            log.info("user=%s submitted req id=%d", self.user_id, req_id)
-            return channel
+    async def _submit(self, body: dict[str, Any]) -> ResponseChannel:
+        """Lock-free body submission. Caller MUST hold self.lock (or
+        guarantee single-writer access some other way). Exists so that
+        prewarm flows already running under a restart-held lock can
+        submit the dummy bootstrap request without trying to re-enter
+        the lock, and without releasing it (which would let a real
+        user request race in before bootstrap has populated the
+        per-process feature-flag cache)."""
+        if self.proc is None or self.proc.returncode is not None:
+            raise RuntimeError(f"worker for {self.user_id} not running")
+        self.last_used = time.monotonic()
+        req_id = self._next_req_id
+        self._next_req_id += 1
+        channel = ResponseChannel(body_summary=_summarize_body(body))
+        self._channels[req_id] = channel
+
+        assert self.proc.stdin is not None
+        line = json.dumps({"type": "request", "id": req_id,
+                           "body": body}) + "\n"
+        self.proc.stdin.write(line.encode())
+        await self.proc.stdin.drain()
+        log.info("user=%s submitted req id=%d", self.user_id, req_id)
+        return channel
 
     async def _read_loop(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None

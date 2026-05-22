@@ -27,6 +27,15 @@ class SessionManager:
         self._rr: dict[tuple[str, ...], int] = {}
 
     async def get_or_create(self, user_id: str) -> ClaudeSession:
+        # Two-phase: under self.lock we decide what to do and, if a
+        # worker is born or reborn, acquire sess.lock so no concurrent
+        # caller can grab it. We then release self.lock and run prewarm
+        # while still holding sess.lock — this keeps the prewarm window
+        # short (other users unaffected) while preventing a real user
+        # request from racing in and firing the first /v1/messages on a
+        # worker whose claude CLI hasn't done its lazy bootstrap yet
+        # (which causes the 7-call burst -> per-OAuth rate limit).
+        needs_prewarm = False
         async with self.lock:
             sess = self.sessions.get(user_id)
             if sess is not None:
@@ -40,26 +49,41 @@ class SessionManager:
                     rc = sess.proc.returncode if sess.proc else "never started"
                     log.warning("user=%s worker dead (rc=%s); reviving in place",
                                 user_id, rc)
-                    # restart() reuses the same mitm port; needs sess.lock
-                    # per its contract so an in-flight _restarter doesn't
-                    # collide with us.
-                    async with sess.lock:
-                        try:
-                            await sess.restart()
-                        except Exception:
-                            log.exception("user=%s in-place revive failed; "
-                                          "dropping session, cold-creating",
-                                          user_id)
-                            self.sessions.pop(user_id, None)
-                            sess = None
-                if sess is not None:
-                    return sess
-            port = self.config.mitm.port_base + self._next_port_offset
-            self._next_port_offset += 1
-            sess = ClaudeSession(user_id=user_id, mitm_port=port, config=self.config)
-            await sess.start()
-            self.sessions[user_id] = sess
-            return sess
+                    # Acquire sess.lock and hold it across both restart
+                    # and the subsequent prewarm. Manual acquire (not
+                    # `async with`) because the prewarm runs *after* we
+                    # release self.lock — keeping it in a block here
+                    # would either pin self.lock for the prewarm
+                    # duration (blocks other users) or release sess.lock
+                    # too early (lets a real request race ahead of
+                    # prewarm).
+                    await sess.lock.acquire()
+                    try:
+                        await sess.restart()
+                        needs_prewarm = True
+                    except Exception:
+                        sess.lock.release()
+                        log.exception("user=%s in-place revive failed; "
+                                      "dropping session, cold-creating",
+                                      user_id)
+                        self.sessions.pop(user_id, None)
+                        sess = None
+            if sess is None:
+                port = self.config.mitm.port_base + self._next_port_offset
+                self._next_port_offset += 1
+                sess = ClaudeSession(user_id=user_id, mitm_port=port,
+                                     config=self.config)
+                await sess.start()
+                self.sessions[user_id] = sess
+                await sess.lock.acquire()
+                needs_prewarm = True
+
+        if needs_prewarm:
+            try:
+                await self._safe_prewarm(sess)
+            finally:
+                sess.lock.release()
+        return sess
 
     async def pick(self, pool: list[str]) -> ClaudeSession:
         """Pick a session from a token's user pool. With one member this
@@ -93,19 +117,13 @@ class SessionManager:
         # Prewarm: spawn a worker for every configured user during
         # container startup so the first request from each user does
         # not pay the cold-start cost (claude CLI TUI boot + mitm
-        # bring-up, ~10s). Serial to avoid CPU/IO contention between
-        # concurrently booting CLIs; per-user failures are logged but
-        # do not block service startup, so a misconfigured user falls
-        # back to lazy spawn on first request (same as before).
-        #
-        # After the TUI reaches the prompt we ALSO send one tiny dummy
-        # request through the normal IPC path so claude CLI's lazy
-        # bootstrap (feature flag fetches, mcp-registry pagination,
-        # /api/eval, /api/claude_code_*) completes here on startup
-        # instead of on the first real user request. Without this the
-        # first request fires 7+ HTTP calls to api.anthropic.com in
-        # ~30 ms — the per-OAuth rate limiter trips on that burst and
-        # the actual /v1/messages comes back rate_limit_error.
+        # bring-up + lazy bootstrap, ~10s + 7 HTTP calls). Serial to
+        # avoid CPU/IO contention between concurrently booting CLIs.
+        # get_or_create now runs the bootstrap prewarm itself for any
+        # freshly-born worker, so this loop is just "spawn each user".
+        # Per-user failures are logged but do not block service startup;
+        # the misconfigured user falls back to lazy spawn on first
+        # request (which also includes its own prewarm).
         user_ids: list[str] = []
         for pool in self.config.users.values():
             for u in pool:
@@ -118,52 +136,55 @@ class SessionManager:
             except Exception:
                 log.exception("prewarm failed user=%s; "
                               "first request will cold-start", user_id)
-                continue
-            try:
-                await asyncio.wait_for(
-                    self._prewarm_bootstrap(user_id), timeout=60)
-            except asyncio.TimeoutError:
-                log.warning("bootstrap prewarm timed out user=%s; "
-                            "first real request may hit rate limit", user_id)
-            except Exception:
-                log.exception("bootstrap prewarm failed user=%s; "
-                              "first real request may hit rate limit", user_id)
 
-    async def _prewarm_bootstrap(self, user_id: str) -> None:
-        """Force claude CLI's lazy bootstrap to run during startup by
-        sending one tiny dummy /v1/messages to the freshly-warm worker.
+    async def _safe_prewarm(self, sess: ClaudeSession) -> None:
+        """Run bootstrap prewarm with timeout + error containment.
+        Failure is non-fatal — the worker is still serviceable; the
+        user may just see a rate_limit_error on their first request
+        and need to retry. Caller must hold sess.lock so the dummy
+        /v1/messages we submit can't be interleaved with a real one."""
+        try:
+            await asyncio.wait_for(self._prewarm_bootstrap(sess), timeout=60)
+        except asyncio.TimeoutError:
+            log.warning("bootstrap prewarm timed out user=%s; "
+                        "first real request may hit rate limit", sess.user_id)
+        except Exception:
+            log.exception("bootstrap prewarm failed user=%s; "
+                          "first real request may hit rate limit", sess.user_id)
 
-        We use haiku + max_tokens=1 so the actual model call is
-        ~free against the subscription quota. The expensive part isn't
-        that call — it's the 6 sibling HTTP calls (eval / grove /
-        penguin_mode / claude_cli/bootstrap / mcp-registry pagination)
-        that claude CLI fires alongside the first model interaction.
-        Those land here, get cached under /home/coder/.claude/, and
-        the pool's shared directory symlink means every subsequent
-        worker's first trigger finds the cache populated and skips the
-        burst. Net effect: the rate-limit risk moves from "first real
-        request" to "container startup" where no user is waiting.
+    async def _prewarm_bootstrap(self, sess: ClaudeSession) -> None:
+        """Force claude CLI's lazy bootstrap to run NOW by submitting
+        one tiny dummy /v1/messages to a freshly-born worker. Caller
+        must hold sess.lock; we use sess._submit (lock-free path) so
+        the prewarm doesn't release the lock between restart and the
+        dummy request — a real user request slipping in there would
+        be the very thing the prewarm is supposed to protect against.
 
-        Failure to bootstrap (timeout, upstream 429, anything) is
-        non-fatal — the worker is still usable; the user might just
-        see a rate_limit_error on their first request and need to
-        retry once."""
-        sess = self.sessions.get(user_id)
-        if sess is None:
-            return
+        Why this matters: a fresh claude CLI process fires 6 sibling
+        HTTP calls (eval / grove / penguin_mode / claude_cli/bootstrap
+        / mcp-registry pagination / mcp_servers) alongside its first
+        /v1/messages, in ~30 ms — the per-OAuth rate limiter trips on
+        that burst and the /v1/messages comes back rate_limit_error.
+        By running this dummy call at startup / restart / revive, the
+        burst happens while no user is waiting and the on-disk caches
+        (shared via the .claude/ directory symlink) get populated, so
+        subsequent worker spawns may also skip the burst.
+
+        Model is haiku + max_tokens=1 so the call itself is ~free
+        against the subscription quota."""
         body = {
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "ok"}],
         }
-        log.info("bootstrap prewarm starting user=%s", user_id)
-        channel = await sess.call(body)
+        log.info("bootstrap prewarm starting user=%s", sess.user_id)
+        channel = await sess._submit(body)
         # Drain and discard. We don't care about the content — the
         # value was in the side-effect HTTP calls that fired in
         # parallel with the /v1/messages request.
         async for _ in channel.iter():
             pass
-        log.info("bootstrap prewarm complete user=%s", user_id)
+        log.info("bootstrap prewarm complete user=%s", sess.user_id)
 
     async def stop(self) -> None:
         if self._restarter_task:
@@ -198,6 +219,13 @@ class SessionManager:
                                         user_id, len(sess._channels))
                         try:
                             await sess.restart()
+                            # Same rationale as get_or_create: a fresh
+                            # claude CLI process needs its lazy
+                            # bootstrap forced now, while we still hold
+                            # sess.lock, or the first real user request
+                            # post-restart will trip the per-OAuth rate
+                            # limiter.
+                            await self._safe_prewarm(sess)
                             log.info("restart complete user=%s", user_id)
                         except Exception:
                             log.exception("restart failed user=%s; dropping session",
