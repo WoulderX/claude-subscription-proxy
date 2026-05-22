@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,10 +17,30 @@ from .config import Config
 from .oauth_refresh import OAuthRefresher
 from .session.manager import SessionManager
 
+log = logging.getLogger(__name__)
+
+
+def _detect_claude_version(binary: str) -> str:
+    """Run `<binary> --version` once at startup so the running CLI
+    version can be surfaced via /healthz. The proxy is tightly coupled
+    to specific CLI internals (billing-header layout, OAuth client id,
+    prompt symbol); when something silently breaks after a build, the
+    first thing to check is whether the pinned version actually got
+    pinned. Failure is non-fatal — we'll just report "unknown"."""
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True,
+                             text=True, timeout=10)
+        return (out.stdout or out.stderr).strip() or "unknown"
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("could not detect claude CLI version: %s", e)
+        return "unknown"
+
 
 def create_app(config: Config) -> FastAPI:
     manager = SessionManager(config)
     auth_dep = make_auth_dep(config)
+    claude_version = _detect_claude_version(config.claude.binary)
+    log.info("claude code CLI version: %s", claude_version)
 
     # One refresher per deployment, watching the operator's shared
     # .credentials.json (the same file every worker's HOME/.claude
@@ -57,7 +78,11 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True, "sessions": list(manager.sessions.keys())}
+        return {
+            "ok": True,
+            "sessions": list(manager.sessions.keys()),
+            "claude_version": claude_version,
+        }
 
     @app.get("/status")
     async def status():
@@ -137,6 +162,7 @@ def create_app(config: Config) -> FastAPI:
 
         return {
             "ok": True,
+            "claude_version": claude_version,
             "worker_count": len(workers),
             "alive_count": sum(1 for w in workers if w["alive"]),
             "busy_count": sum(1 for w in workers if w["in_flight"] > 0),

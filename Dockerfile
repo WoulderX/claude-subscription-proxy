@@ -17,6 +17,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NODE_VERSION=20 \
     TZ=UTC
 
+# Pin claude code CLI to a known-good version. The proxy depends on
+# private CLI internals (system[0] billing header, anthropic-beta token
+# layout, `❯` prompt symbol, lazy-bootstrap endpoint list, OAuth client
+# id at `9d1c250a-…` and token endpoint `/v1/oauth/token`); any of those
+# could break across CLI releases without notice. Bumping is a manual
+# act: change this default, rebuild, run the smoke test, ship.
+# Override at build time when validating a new upstream:
+#   docker build --build-arg CLAUDE_CODE_VERSION=2.1.140 .
+ARG CLAUDE_CODE_VERSION=2.1.139
+
 # --- system deps ---
 # python3 / python3-pip:        Ubuntu 22.04 自带 Python 3.10
 # curl ca-certificates gnupg:   装 NodeSource 仓库 + claude 网络调用
@@ -38,7 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- node + claude code CLI ---
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get update && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g --no-audit --no-fund @anthropic-ai/claude-code \
+    && npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && claude --version \
     && rm -rf /var/lib/apt/lists/*
 
