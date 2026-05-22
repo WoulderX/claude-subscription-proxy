@@ -12,6 +12,27 @@ from ..session.manager import SessionManager
 log = logging.getLogger(__name__)
 
 
+def _extract_litellm_headers(headers) -> dict[str, str]:
+    """Pick up x-litellm-* headers forwarded by LiteLLM Proxy when
+    `add_user_information_to_llm_headers: true` is set in its config.
+    These carry the original virtual-key user identity (user_id,
+    org_id, team_id, etc.) which is otherwise invisible to us since
+    LiteLLM authenticates upstream with its own configured api_key.
+
+    Returns a dict keyed by the suffix in snake_case
+    (`x-litellm-user-id` → `user_id`), or an empty dict if no such
+    headers are present. Stored under `body_summary.litellm` so it
+    shows up on /status and the /ui dashboard."""
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl.startswith("x-litellm-"):
+            key = kl[len("x-litellm-"):].replace("-", "_")
+            if key:
+                out[key] = v
+    return out
+
+
 def build_router(manager: SessionManager, auth_dep) -> APIRouter:
     router = APIRouter()
 
@@ -19,9 +40,11 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
     async def messages(req: Request, pool: list[str] = Depends(auth_dep)) -> Any:
         body = await req.json()
         wants_stream = bool(body.get("stream", False))
+        litellm = _extract_litellm_headers(req.headers)
+        request_metadata = {"litellm": litellm} if litellm else None
 
         sess = await manager.pick(pool)
-        channel = await sess.call(body)
+        channel = await sess.call(body, request_metadata=request_metadata)
 
         if wants_stream:
             async def gen():

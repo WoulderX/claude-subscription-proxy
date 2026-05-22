@@ -358,10 +358,23 @@
         if (w.in_flight > 0 && detail) {
           const model   = detail.body && detail.body.model       ? detail.body.model       : '?';
           const preview = detail.body && detail.body.last_user_preview ? detail.body.last_user_preview : '';
+          const litellm = (detail.body && detail.body.litellm) || null;
           const stalledColor = detail.stalled_seconds > 30 ? '#c0241b' : '#6e6e73';
           const stalledLabel = detail.stalled_seconds > 30
             ? `已停滞 ${fmtSeconds(detail.stalled_seconds)}`
             : `${fmtSeconds(detail.stalled_seconds)}前更新`;
+          // LiteLLM 上游身份信息 (x-litellm-* headers)
+          let litellmRow = '';
+          if (litellm) {
+            const main = litellm.user_id || litellm.user_alias
+                      || litellm.user_email || litellm.team_id || '(未知)';
+            const fullJson = JSON.stringify(litellm, null, 2);
+            litellmRow = `
+              <div class="task-meta" style="margin-top:4px;color:#0051d5;" title="${escapeHtml(fullJson)}">
+                LiteLLM 用户：<span class="key">${escapeHtml(main)}</span>${litellm.team_id ? ` · 团队 ${escapeHtml(litellm.team_id)}` : ''}
+              </div>
+            `;
+          }
           taskCell = `
             <div class="task-meta">
               <span class="key">${escapeHtml(model)}</span>
@@ -369,6 +382,7 @@
               · 已运行 ${fmtSeconds(detail.age_seconds)}
               · <span style="color:${stalledColor};">${stalledLabel}</span>
             </div>
+            ${litellmRow}
             ${preview ? `<div class="preview" title="${escapeHtml(preview)}">${escapeHtml(preview)}</div>` : ''}
             ${w.in_flight > 1 ? `<div class="task-meta" style="margin-top:4px;color:#ff9500;">⚠ 并发处理 ${w.in_flight} 个请求</div>` : ''}
           `;

@@ -1211,6 +1211,23 @@ curl -sS http://127.0.0.1:4000/v1/chat/completions \
 > 一样，结果 LiteLLM 把 `claude-opus-sub` 当真实模型 ID 发给 Anthropic，
 > Anthropic 返回 error 事件 → LiteLLM 解析时 `KeyError: 'stop_reason'`。
 
+**透传 LiteLLM 用户身份到 /status 和 /ui**（可选）：
+
+LiteLLM Proxy 默认用自己配置里的 `api_key` 鉴权到我们，所以我们只看到
+LiteLLM 的"出口身份"，不知道终端用户是谁。打开下面这个开关后 LiteLLM
+会自动给上游请求加 `x-litellm-user-id` / `x-litellm-org-id` / `x-litellm-team-id`
+等 header，我们这边自动捕获并展示到 `/status` 的 `in_flight_detail[].body.litellm`
+和 `/ui` 监控页的"当前任务"一栏：
+
+```yaml
+# 加在 LiteLLM proxy_config.yaml 顶层
+litellm_settings:
+  add_user_information_to_llm_headers: true
+```
+
+不开也完全能用，只是 /status 看不到上游用户归属。详见
+[LiteLLM 文档](https://docs.litellm.ai/docs/proxy/forward_client_headers#user-information-headers-optional)。
+
 **LiteLLM Python SDK 直调**：
 
 ```python

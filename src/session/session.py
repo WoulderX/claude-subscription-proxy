@@ -19,13 +19,22 @@ from .state import ResponseChannel
 log = logging.getLogger(__name__)
 
 
-def _summarize_body(body: dict[str, Any]) -> dict[str, Any]:
+def _summarize_body(
+    body: dict[str, Any],
+    request_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Produce a small log-safe summary of a request body for /status,
     so operators can see what a worker is processing without expanding
     the full JSON. Truncates user content to 80 chars to bound response
-    size and avoid dumping full prompts into a health endpoint."""
+    size and avoid dumping full prompts into a health endpoint.
+
+    request_metadata is merged into the top-level summary (typically
+    holds {"litellm": {...}} extracted from x-litellm-* request headers
+    so the operator can attribute the in-flight task to the original
+    LiteLLM virtual user — by default the proxy only sees LiteLLM's
+    upstream API key, not the end user behind it)."""
     if not isinstance(body, dict):
-        return {}
+        return dict(request_metadata) if request_metadata else {}
     msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
     last_user_text = ""
     for m in reversed(msgs):
@@ -43,13 +52,16 @@ def _summarize_body(body: dict[str, Any]) -> dict[str, Any]:
     preview = last_user_text[:80]
     if len(last_user_text) > 80:
         preview += "…"
-    return {
+    summary: dict[str, Any] = {
         "model": body.get("model"),
         "max_tokens": body.get("max_tokens"),
         "stream": bool(body.get("stream")),
         "n_messages": len(msgs),
         "last_user_preview": preview,
     }
+    if request_metadata:
+        summary.update(request_metadata)
+    return summary
 
 
 class ClaudeSession:
@@ -204,7 +216,11 @@ class ClaudeSession:
         self._channels.clear()
         log.info("session stopped user=%s", self.user_id)
 
-    async def call(self, body: dict[str, Any]) -> ResponseChannel:
+    async def call(
+        self,
+        body: dict[str, Any],
+        request_metadata: dict[str, Any] | None = None,
+    ) -> ResponseChannel:
         """Submit a /v1/messages body. Returns a channel streaming the
         Anthropic SSE response bytes verbatim. Lock holds until the
         request enters the worker — releasing the lock while the worker
@@ -213,11 +229,20 @@ class ClaudeSession:
 
         The proc-alive check is inside the lock so a request arriving
         during a scheduled restart waits for the new worker rather than
-        racing with the dead one."""
-        async with self.lock:
-            return await self._submit(body)
+        racing with the dead one.
 
-    async def _submit(self, body: dict[str, Any]) -> ResponseChannel:
+        request_metadata is opaque side-info (e.g. forwarded
+        x-litellm-* headers) merged into the channel's body_summary so
+        operators can attribute the task on /status without our IPC
+        having to know what's in it."""
+        async with self.lock:
+            return await self._submit(body, request_metadata)
+
+    async def _submit(
+        self,
+        body: dict[str, Any],
+        request_metadata: dict[str, Any] | None = None,
+    ) -> ResponseChannel:
         """Lock-free body submission. Caller MUST hold self.lock (or
         guarantee single-writer access some other way). Exists so that
         prewarm flows already running under a restart-held lock can
@@ -230,7 +255,8 @@ class ClaudeSession:
         self.last_used = time.monotonic()
         req_id = self._next_req_id
         self._next_req_id += 1
-        channel = ResponseChannel(body_summary=_summarize_body(body))
+        channel = ResponseChannel(
+            body_summary=_summarize_body(body, request_metadata))
         self._channels[req_id] = channel
 
         assert self.proc.stdin is not None
