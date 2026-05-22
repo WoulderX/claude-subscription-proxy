@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import uvicorn
 from fastapi import Depends, FastAPI
+from fastapi.responses import FileResponse
 
 from .api.admin import build_router as build_admin_router
 from .api.anthropic import build_router as build_anthropic_router
@@ -107,6 +108,19 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
             "sessions": list(manager.sessions.keys()),
             "claude_version": claude_version,
         }
+
+    # Static admin/monitoring page. Unauthenticated by design — the HTML
+    # itself doesn't expose any state, only loads if the user fills in
+    # an API key (stored in their browser's localStorage), and from then
+    # on the page uses that key to call /status and /admin/* (both of
+    # which ARE auth-protected). Serving the HTML behind auth_dep would
+    # create a chicken-and-egg: the browser can't supply the Bearer
+    # header on its initial document GET.
+    _admin_html = Path(__file__).parent / "static" / "admin.html"
+
+    @app.get("/ui")
+    async def admin_ui():
+        return FileResponse(_admin_html, media_type="text/html")
 
     @app.get("/status")
     async def status(_pool: list[str] = Depends(auth_dep)):

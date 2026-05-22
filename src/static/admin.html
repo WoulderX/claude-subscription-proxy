@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Subscription Proxy 监控面板</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                   "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+                   sans-serif;
+      margin: 0; background: #f5f5f7; color: #1d1d1f;
+    }
+    .container { max-width: 1500px; margin: 0 auto; padding: 20px; }
+    h1 {
+      font-size: 22px; margin: 0 0 4px 0; font-weight: 600;
+    }
+    .subtitle { color: #6e6e73; font-size: 13px; margin-bottom: 20px; }
+
+    .controls {
+      background: white; border-radius: 10px; padding: 14px 16px;
+      margin-bottom: 16px; display: flex; gap: 12px;
+      align-items: center; flex-wrap: wrap;
+    }
+    .controls > * { font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; color: #6e6e73; }
+    .controls input, .controls select, .controls button {
+      padding: 7px 12px; border: 1px solid #d2d2d7;
+      border-radius: 6px; font-size: 13px;
+      font-family: inherit;
+    }
+    .controls input { width: 320px; font-family: monospace; font-size: 12px; }
+    .controls button {
+      background: #007aff; color: white; border: none;
+      cursor: pointer; font-weight: 500;
+    }
+    .controls button:hover { background: #0051d5; }
+    .controls button:disabled { background: #999; cursor: not-allowed; }
+    .controls button.secondary { background: #e5e5ea; color: #1d1d1f; }
+    .controls button.secondary:hover { background: #d2d2d7; }
+    .controls button.danger { background: #ff3b30; }
+    .controls button.danger:hover { background: #c0241b; }
+    .controls .spacer { flex: 1; }
+    .controls .last-update { color: #6e6e73; font-size: 12px; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px; margin-bottom: 16px;
+    }
+    .stat {
+      background: white; border-radius: 10px; padding: 14px 16px;
+    }
+    .stat .label { font-size: 12px; color: #6e6e73; }
+    .stat .value {
+      font-size: 26px; font-weight: 600; margin-top: 2px;
+      line-height: 1.1;
+    }
+    .stat.busy .value { color: #007aff; }
+    .stat.stuck .value { color: #ff3b30; }
+    .stat.alive .value { color: #34c759; }
+    .stat.version .value { font-size: 14px; font-weight: 500; color: #1d1d1f; margin-top: 6px; font-family: monospace; }
+
+    .pools {
+      background: white; border-radius: 10px; padding: 12px 16px;
+      margin-bottom: 16px; font-size: 13px;
+    }
+    .pools-title { color: #6e6e73; margin-bottom: 6px; }
+    .pool-row { font-family: monospace; font-size: 12px; }
+    .pool-row .pool-members { color: #007aff; }
+
+    .table-wrap {
+      background: white; border-radius: 10px; overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      background: #f5f5f7; padding: 10px 12px; text-align: left;
+      font-size: 12px; color: #6e6e73; font-weight: 600;
+      border-bottom: 1px solid #e5e5ea; white-space: nowrap;
+    }
+    td {
+      padding: 12px; border-bottom: 1px solid #e5e5ea;
+      font-size: 13px; vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafafa; }
+    .badge {
+      display: inline-block; padding: 3px 10px; border-radius: 12px;
+      font-size: 12px; font-weight: 500; white-space: nowrap;
+    }
+    .badge.idle    { background: #34c75920; color: #1c7a34; }
+    .badge.working { background: #ff990020; color: #b25800; }
+    .badge.stuck   { background: #ff3b3020; color: #c0241b; }
+    .badge.dead    { background: #8e8e9320; color: #555;    }
+    .restart-btn {
+      background: #ff3b30; color: white; border: none;
+      padding: 5px 12px; border-radius: 5px; cursor: pointer;
+      font-size: 12px; font-weight: 500;
+    }
+    .restart-btn:hover { background: #c0241b; }
+    .restart-btn:disabled { background: #999; cursor: not-allowed; }
+    .preview {
+      font-family: monospace; font-size: 11px; color: #1d1d1f;
+      background: #f5f5f7; padding: 4px 6px; border-radius: 4px;
+      margin-top: 4px; max-width: 480px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .task-meta { font-size: 11px; color: #6e6e73; }
+    .task-meta .key { color: #1d1d1f; font-weight: 500; }
+    .mono { font-family: monospace; font-size: 12px; }
+
+    .banner {
+      padding: 12px 16px; border-radius: 8px;
+      margin-bottom: 16px; font-size: 13px;
+    }
+    .banner.error { background: #ff3b3015; color: #c0241b; }
+    .banner.info  { background: #007aff15; color: #0051d5; }
+
+    .toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: #1d1d1f; color: white; padding: 12px 18px;
+      border-radius: 8px; opacity: 0; transition: opacity 0.3s;
+      pointer-events: none; max-width: 480px; font-size: 13px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    }
+    .toast.show { opacity: 1; }
+    .toast.error   { background: #c0241b; }
+    .toast.success { background: #248a3d; }
+
+    .reload-output {
+      background: #1d1d1f; color: #e5e5ea;
+      padding: 14px 16px; border-radius: 8px;
+      font-family: monospace; font-size: 12px;
+      margin-bottom: 16px; white-space: pre-wrap;
+      max-height: 240px; overflow: auto;
+    }
+    .reload-output .header { color: #34c759; font-weight: 600; }
+    .reload-output .warn { color: #ff9500; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Claude Subscription Proxy 监控面板</h1>
+    <div class="subtitle">实时查看各 worker 状态与当前任务，支持单 worker 重启、配置重新加载、凭据刷新</div>
+
+    <div class="controls">
+      <label>
+        API Key
+        <input type="password" id="apiKey" placeholder="sk-internal-...">
+      </label>
+      <button id="refreshBtn">立即刷新</button>
+      <label>
+        自动刷新
+        <select id="autoRefresh">
+          <option value="0">关闭</option>
+          <option value="5">5 秒</option>
+          <option value="10">10 秒</option>
+          <option value="30">30 秒</option>
+          <option value="60" selected>1 分钟</option>
+          <option value="300">5 分钟</option>
+        </select>
+      </label>
+      <button id="reloadBtn" class="secondary" title="重新读取 config.yaml 并应用可热重载的字段">重新加载配置</button>
+      <button id="refreshTokenBtn" class="secondary" title="跳过 5 分钟周期，立即向 Anthropic 请求一次 OAuth 凭据刷新">刷新 OAuth 凭据</button>
+      <span class="spacer"></span>
+      <span class="last-update" id="lastUpdate">尚未加载</span>
+    </div>
+
+    <div id="banner"></div>
+    <div id="reloadOutput"></div>
+
+    <div class="stats" id="stats"></div>
+
+    <div id="poolsBox"></div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>用户 ID</th>
+            <th>状态</th>
+            <th>PID</th>
+            <th>mitm 端口</th>
+            <th>运行时长</th>
+            <th>空闲时长</th>
+            <th>累计请求</th>
+            <th>进行中</th>
+            <th>当前任务</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="workerBody">
+          <tr><td colspan="10" style="text-align:center;color:#6e6e73;padding:32px;">
+            请在上方填写 API Key 后点击「立即刷新」
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const apiKeyInput     = $('apiKey');
+    const refreshBtn      = $('refreshBtn');
+    const reloadBtn       = $('reloadBtn');
+    const refreshTokenBtn = $('refreshTokenBtn');
+    const autoRefreshSel  = $('autoRefresh');
+    const statsDiv        = $('stats');
+    const poolsBox        = $('poolsBox');
+    const workerBody      = $('workerBody');
+    const lastUpdate      = $('lastUpdate');
+    const banner          = $('banner');
+    const reloadOutput    = $('reloadOutput');
+    const toast           = $('toast');
+    let autoRefreshTimer  = null;
+
+    // Restore from localStorage
+    apiKeyInput.value = localStorage.getItem('apiKey') || '';
+    const savedInterval = localStorage.getItem('autoRefreshInterval');
+    if (savedInterval !== null) autoRefreshSel.value = savedInterval;
+
+    apiKeyInput.addEventListener('change', () => {
+      localStorage.setItem('apiKey', apiKeyInput.value);
+    });
+    autoRefreshSel.addEventListener('change', () => {
+      localStorage.setItem('autoRefreshInterval', autoRefreshSel.value);
+      setupAutoRefresh();
+    });
+    refreshBtn.addEventListener('click', () => refresh());
+    reloadBtn.addEventListener('click', () => hotReload());
+    refreshTokenBtn.addEventListener('click', () => forceRefreshToken());
+
+    function setupAutoRefresh() {
+      if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+      const seconds = parseInt(autoRefreshSel.value, 10);
+      if (seconds > 0) {
+        autoRefreshTimer = setInterval(() => refresh(true), seconds * 1000);
+      }
+    }
+
+    function fmtSeconds(s) {
+      if (s == null) return '-';
+      if (s < 60)   return s.toFixed(1) + ' 秒';
+      if (s < 3600) return (s / 60).toFixed(1) + ' 分';
+      return (s / 3600).toFixed(1) + ' 小时';
+    }
+    function fmtBytes(n) {
+      if (n == null) return '0';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1024 / 1024).toFixed(1) + ' MB';
+    }
+    function escapeHtml(s) {
+      return String(s == null ? '' : s).replace(/[&<>"]/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    }
+
+    function classifyWorker(w) {
+      if (!w.alive)           return { label: '已停止', cls: 'dead'    };
+      if (w.in_flight === 0)  return { label: '空闲',   cls: 'idle'    };
+      if (w.stuck)            return { label: '异常',   cls: 'stuck'   };
+      return                       { label: '处理中', cls: 'working' };
+    }
+
+    function showToast(msg, type = '') {
+      toast.textContent = msg;
+      toast.className = 'toast show ' + type;
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => toast.classList.remove('show'), 3500);
+    }
+    function showBanner(msg, type = 'error') {
+      banner.innerHTML = `<div class="banner ${type}">${escapeHtml(msg)}</div>`;
+    }
+    function clearBanner() { banner.innerHTML = ''; }
+
+    function authHeader() {
+      const key = apiKeyInput.value.trim();
+      return key ? { 'Authorization': 'Bearer ' + key } : null;
+    }
+
+    async function refresh(silent = false) {
+      const auth = authHeader();
+      if (!auth) {
+        if (!silent) showBanner('请先填写 API Key');
+        return;
+      }
+      if (!silent) refreshBtn.disabled = true;
+      try {
+        const resp = await fetch('/status', { headers: auth });
+        if (resp.status === 401) {
+          showBanner('API Key 无效（HTTP 401）');
+          return;
+        }
+        if (!resp.ok) {
+          showBanner(`HTTP ${resp.status} ${resp.statusText}`);
+          return;
+        }
+        const data = await resp.json();
+        render(data);
+        clearBanner();
+        lastUpdate.textContent = '最近更新于 ' + new Date().toLocaleTimeString('zh-CN');
+      } catch (e) {
+        showBanner('请求失败：' + e.message);
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    }
+
+    function render(data) {
+      // stats
+      const activeCount = (data.busy_count || 0) - (data.stuck_count || 0);
+      statsDiv.innerHTML = `
+        <div class="stat version">
+          <div class="label">CLI 版本</div>
+          <div class="value">${escapeHtml(data.claude_version || '未知')}</div>
+        </div>
+        <div class="stat alive">
+          <div class="label">存活 / 总数</div>
+          <div class="value">${data.alive_count}<span style="font-size:18px;color:#6e6e73;"> / ${data.worker_count}</span></div>
+        </div>
+        <div class="stat busy">
+          <div class="label">活跃</div>
+          <div class="value">${activeCount}</div>
+        </div>
+        <div class="stat stuck">
+          <div class="label">异常</div>
+          <div class="value">${data.stuck_count}</div>
+        </div>
+      `;
+
+      // pools
+      if (data.pools && data.pools.length > 0) {
+        poolsBox.innerHTML = `
+          <div class="pools">
+            <div class="pools-title">用户池（按 token 分组，同组共享并发负载）：</div>
+            ${data.pools.map(p => `
+              <div class="pool-row">
+                <span class="pool-members">[${p.map(escapeHtml).join(', ')}]</span>
+              </div>`).join('')}
+          </div>
+        `;
+      } else {
+        poolsBox.innerHTML = '';
+      }
+
+      // worker table
+      if (!data.workers || data.workers.length === 0) {
+        workerBody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#6e6e73;padding:32px;">暂无 worker</td></tr>';
+        return;
+      }
+      workerBody.innerHTML = data.workers.map(w => {
+        const status = classifyWorker(w);
+        const detail = (w.in_flight_detail && w.in_flight_detail[0]) || null;
+        let taskCell = '<span style="color:#6e6e73;">—</span>';
+        if (w.in_flight > 0 && detail) {
+          const model   = detail.body && detail.body.model       ? detail.body.model       : '?';
+          const preview = detail.body && detail.body.last_user_preview ? detail.body.last_user_preview : '';
+          const stalledColor = detail.stalled_seconds > 30 ? '#c0241b' : '#6e6e73';
+          const stalledLabel = detail.stalled_seconds > 30
+            ? `已停滞 ${fmtSeconds(detail.stalled_seconds)}`
+            : `${fmtSeconds(detail.stalled_seconds)}前更新`;
+          taskCell = `
+            <div class="task-meta">
+              <span class="key">${escapeHtml(model)}</span>
+              · 已接收 ${fmtBytes(detail.bytes_received)}
+              · 已运行 ${fmtSeconds(detail.age_seconds)}
+              · <span style="color:${stalledColor};">${stalledLabel}</span>
+            </div>
+            ${preview ? `<div class="preview" title="${escapeHtml(preview)}">${escapeHtml(preview)}</div>` : ''}
+            ${w.in_flight > 1 ? `<div class="task-meta" style="margin-top:4px;color:#ff9500;">⚠ 并发处理 ${w.in_flight} 个请求</div>` : ''}
+          `;
+        }
+        return `
+          <tr>
+            <td><strong>${escapeHtml(w.user_id)}</strong></td>
+            <td><span class="badge ${status.cls}">${status.label}</span></td>
+            <td class="mono">${w.pid || '-'}</td>
+            <td class="mono">${w.mitm_port}</td>
+            <td>${fmtSeconds(w.age_seconds)}</td>
+            <td>${fmtSeconds(w.idle_seconds)}</td>
+            <td class="mono">${w.total_requests}</td>
+            <td class="mono">${w.in_flight}</td>
+            <td>${taskCell}</td>
+            <td><button class="restart-btn" data-uid="${escapeHtml(w.user_id)}">重启</button></td>
+          </tr>
+        `;
+      }).join('');
+
+      // Wire restart buttons (delegating would also work; this is fine for ~10 rows)
+      workerBody.querySelectorAll('.restart-btn').forEach(btn => {
+        btn.addEventListener('click', () => restartWorker(btn.dataset.uid));
+      });
+    }
+
+    async function restartWorker(userId) {
+      const auth = authHeader();
+      if (!auth) { showBanner('请先填写 API Key'); return; }
+      const ok = confirm(
+        `确定重启 worker "${userId}" 吗？\n\n` +
+        `重启流程会先等待该 worker 的进行中请求完成（最多 60 秒），` +
+        `然后销毁进程并重建（含 bootstrap 预热，约 10-30 秒）。` +
+        `期间该 worker 不接收新请求；若它在用户池中，其它成员会接管流量。`);
+      if (!ok) return;
+      const buttons = document.querySelectorAll('.restart-btn');
+      buttons.forEach(b => b.disabled = true);
+      try {
+        const resp = await fetch(
+          `/admin/workers/${encodeURIComponent(userId)}/restart`,
+          { method: 'POST', headers: auth });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showToast(`重启失败：${data.detail || resp.statusText}`, 'error');
+          return;
+        }
+        const note = data.forced ? '（强制：等待超时仍有请求未完成）' : '';
+        showToast(
+          `Worker ${userId} 重启完成${note}，原运行时长 ${fmtSeconds(data.old_age_seconds)}`,
+          'success');
+        await refresh();
+      } catch (e) {
+        showToast('请求失败：' + e.message, 'error');
+      } finally {
+        buttons.forEach(b => b.disabled = false);
+      }
+    }
+
+    async function hotReload() {
+      const auth = authHeader();
+      if (!auth) { showBanner('请先填写 API Key'); return; }
+      if (!confirm('重新加载 config.yaml？\n\n' +
+                   '可热重载的字段会立即生效；不可热重载的字段会作为警告返回，' +
+                   '需要重启容器才能应用。')) return;
+      reloadBtn.disabled = true;
+      try {
+        const resp = await fetch('/admin/reload', { method: 'POST', headers: auth });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showToast(`重新加载失败：${data.detail || resp.statusText}`, 'error');
+          return;
+        }
+        renderReloadOutput(data);
+        showToast(
+          `重新加载完成：${data.changes.length} 项变更，${data.warnings.length} 项警告`,
+          'success');
+        await refresh();
+      } catch (e) {
+        showToast('请求失败：' + e.message, 'error');
+      } finally {
+        reloadBtn.disabled = false;
+      }
+    }
+
+    function renderReloadOutput(data) {
+      const lines = [];
+      lines.push(`<span class="header">==== 重新加载结果（${new Date().toLocaleTimeString('zh-CN')}）====</span>`);
+      if (data.changes.length === 0 && data.warnings.length === 0) {
+        lines.push('（配置无变化）');
+      }
+      data.changes.forEach(c => lines.push('  ✓ ' + escapeHtml(c)));
+      data.warnings.forEach(w => lines.push(`  <span class="warn">⚠ ${escapeHtml(w)}</span>`));
+      reloadOutput.innerHTML = `<div class="reload-output">${lines.join('\n')}</div>`;
+      // 30 秒后自动清掉，避免视觉残留
+      clearTimeout(reloadOutput._t);
+      reloadOutput._t = setTimeout(() => reloadOutput.innerHTML = '', 30000);
+    }
+
+    async function forceRefreshToken() {
+      const auth = authHeader();
+      if (!auth) { showBanner('请先填写 API Key'); return; }
+      refreshTokenBtn.disabled = true;
+      try {
+        const resp = await fetch('/admin/refresh-now', { method: 'POST', headers: auth });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showToast(`刷新失败：${data.detail || resp.statusText}`, 'error');
+          return;
+        }
+        const map = {
+          refreshed: 'OAuth 凭据已刷新',
+          not_needed: 'OAuth 凭据仍在有效期内，无需刷新',
+          failed: '刷新失败（详见服务端日志）',
+        };
+        showToast(map[data.result] || ('刷新结果：' + data.result),
+                  data.result === 'failed' ? 'error' : 'success');
+      } catch (e) {
+        showToast('请求失败：' + e.message, 'error');
+      } finally {
+        refreshTokenBtn.disabled = false;
+      }
+    }
+
+    // initial run
+    setupAutoRefresh();
+    if (apiKeyInput.value) refresh();
+  </script>
+</body>
+</html>
