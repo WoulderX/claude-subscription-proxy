@@ -29,6 +29,7 @@ claude:
   timeouts:
     mitm_intercept_seconds: 30           # how long mitm has to hijack TUI's outbound /v1/messages
     status_stall_seconds: 30             # /status marks an in-flight request as "stuck" after this many bytes-free seconds
+    response_stall_seconds: 90           # mitm watchdog auto-closes a channel if no new chunk arrives in this window (recovers from upstream-sent-tiny-error-and-hung pattern)
     restart_drain_seconds: 60            # scheduled restart waits this long for in-flight streams to finish
     worker_ready_seconds: 60             # how long a new worker has to signal ready on stdout
     prewarm_seconds: 60                  # bootstrap prewarm upper bound (non-fatal on miss)

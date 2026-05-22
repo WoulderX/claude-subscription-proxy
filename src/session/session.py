@@ -91,6 +91,8 @@ class ClaudeSession:
             "--log-level", os.environ.get("LOG_LEVEL", "INFO"),
             "--mitm-intercept-timeout",
                 str(self.config.claude.timeouts.mitm_intercept_seconds),
+            "--response-stall-timeout",
+                str(self.config.claude.timeouts.response_stall_seconds),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=None,  # inherit — worker logs flow to server stderr

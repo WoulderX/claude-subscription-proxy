@@ -29,6 +29,16 @@ class TimeoutConfig(BaseModel):
     # if you run prompts that genuinely produce long initial latency
     # (very large system prompt + reasoning models).
     status_stall_seconds: float = 30.0
+    # The mitm response-stream watchdog auto-closes a channel that has
+    # gone this long without a new chunk. Defends against the pattern
+    # where Anthropic sends a small non-SSE error body (e.g. a
+    # rate_limit_error JSON ~150 bytes) and then leaves the connection
+    # idle without a clean end-of-stream signal — the channel would
+    # otherwise hang in the worker forever, leaving the worker "busy"
+    # from /status's POV even though there's no actual work happening.
+    # Strictly more conservative than status_stall_seconds so a slow-
+    # but-real reasoning model isn't killed prematurely.
+    response_stall_seconds: float = 90.0
     # How long the manager will wait for in-flight streams to drain
     # during a scheduled restart before tearing the worker down. Raise
     # if your typical requests take longer than this.

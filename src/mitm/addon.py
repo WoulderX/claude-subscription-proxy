@@ -259,22 +259,64 @@ class HijackAddon:
         user = self.session.user_id
         flow_id_short = flow.id[:8]
 
-        def _tap(data: bytes) -> bytes:
-            if data:
-                if channel is not None:
-                    try:
-                        channel.queue.put_nowait(bytes(data))
-                    except Exception:
-                        log.exception("user=%s failed pushing chunk", user)
-                return data
-            # data == b"" → end-of-stream marker
+        # Stall watchdog. Recovers from the pattern where Anthropic
+        # returns a small non-SSE error body (~150 bytes for a
+        # rate_limit_error JSON) then leaves the connection idle
+        # without a proper end-of-stream signal. Without this, _tap
+        # never sees b"", the channel never gets a None sentinel, the
+        # worker's _handle stays in `async for chunk in channel.iter()`
+        # forever, and the worker looks busy on /status indefinitely.
+        # The watchdog re-arms on every chunk; if no chunk arrives for
+        # the configured window we synthesise the EOS ourselves.
+        stall_timeout = getattr(self.session, "response_stall_timeout", 90.0)
+        loop = asyncio.get_running_loop()
+        # Mutable single-slot holder so the nested closures can swap
+        # the TimerHandle without `nonlocal` gymnastics.
+        watchdog: list = [None]
+        closed = [False]
+
+        def _close_channel(reason: str) -> None:
+            if closed[0]:
+                return
+            closed[0] = True
+            if watchdog[0] is not None:
+                watchdog[0].cancel()
+                watchdog[0] = None
             if channel is not None:
                 try:
                     channel.queue.put_nowait(None)
                 except Exception:
                     pass
-            log.info("user=%s response stream complete flow=%s",
-                     user, flow_id_short)
+            log.info("user=%s response stream %s flow=%s",
+                     user, reason, flow_id_short)
+
+        def _fire_watchdog() -> None:
+            log.warning("user=%s response went silent for %.0fs (no chunk "
+                        "from upstream); closing channel to recover from "
+                        "stuck non-SSE response or upstream hang flow=%s",
+                        user, stall_timeout, flow_id_short)
+            _close_channel("force-closed by stall watchdog")
+
+        def _arm_watchdog() -> None:
+            if watchdog[0] is not None:
+                watchdog[0].cancel()
+            watchdog[0] = loop.call_later(stall_timeout, _fire_watchdog)
+
+        def _tap(data: bytes) -> bytes:
+            if data:
+                if channel is not None and not closed[0]:
+                    try:
+                        channel.queue.put_nowait(bytes(data))
+                    except Exception:
+                        log.exception("user=%s failed pushing chunk", user)
+                _arm_watchdog()
+                return data
+            # data == b"" → end-of-stream marker from mitm
+            _close_channel("complete")
             return b""
 
+        # Arm immediately so a response that yields ZERO chunks (e.g.
+        # mitm sets up the stream then the connection silently drops
+        # before any body bytes arrive) still gets recovered.
+        _arm_watchdog()
         flow.response.stream = _tap

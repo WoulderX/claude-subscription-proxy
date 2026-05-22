@@ -49,10 +49,15 @@ class WorkerSession:
 
     def __init__(self, user_id: str, mitm_port: int,
                  home: Path, claude_binary: str, ca_cert: Path,
-                 mitm_intercept_timeout: float = 30.0) -> None:
+                 mitm_intercept_timeout: float = 30.0,
+                 response_stall_timeout: float = 90.0) -> None:
         self.user_id = user_id
         self.mitm_port = mitm_port
         self.mitm_intercept_timeout = mitm_intercept_timeout
+        # Read by HijackAddon to arm a per-flow watchdog; if a chunk
+        # doesn't arrive within this window the channel is force-closed
+        # to recover from upstream-hung-after-tiny-error patterns.
+        self.response_stall_timeout = response_stall_timeout
         self.lock = asyncio.Lock()
 
         self.pending: PendingRequest | None = None
@@ -156,6 +161,10 @@ async def amain() -> None:
     parser.add_argument("--mitm-intercept-timeout", type=float, default=30.0,
                         help="seconds to wait for mitm to hijack TUI's "
                              "outbound /v1/messages before failing the call")
+    parser.add_argument("--response-stall-timeout", type=float, default=90.0,
+                        help="seconds with no new SSE chunk after which the "
+                             "mitm watchdog force-closes the response "
+                             "channel (recovers from upstream hangs)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -171,6 +180,7 @@ async def amain() -> None:
         claude_binary=args.claude_binary,
         ca_cert=Path(args.ca_cert),
         mitm_intercept_timeout=args.mitm_intercept_timeout,
+        response_stall_timeout=args.response_stall_timeout,
     )
     await session.start()
     await _send({"type": "ready"})

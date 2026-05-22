@@ -38,6 +38,7 @@ _HOT_RELOADABLE = {
     "claude.restart_interval_seconds",
     "claude.timeouts.mitm_intercept_seconds",
     "claude.timeouts.status_stall_seconds",
+    "claude.timeouts.response_stall_seconds",
     "claude.timeouts.restart_drain_seconds",
     "claude.timeouts.worker_ready_seconds",
     "claude.timeouts.prewarm_seconds",
@@ -111,8 +112,13 @@ def build_router(
             new = getattr(new_config.claude.timeouts, field)
             if old != new:
                 setattr(config.claude.timeouts, field, new)
+                # These two are baked into the worker subprocess's argv
+                # at spawn time, so reload only affects future spawns.
+                # Operator can force immediate effect via
+                # POST /admin/workers/{user_id}/restart.
                 note = (" (next worker spawn only)"
-                        if field == "mitm_intercept_seconds" else "")
+                        if field in {"mitm_intercept_seconds",
+                                     "response_stall_seconds"} else "")
                 changes.append(f"claude.timeouts.{field}: {old} -> {new}{note}")
 
         # --- oauth_refresh.* ---
