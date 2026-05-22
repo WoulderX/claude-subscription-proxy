@@ -14,9 +14,14 @@ mitm:
 claude:
   binary: claude
   # Each API user gets an isolated HOME under /data/users/<user_id>/.
-  # _seed_home copies operator's .claude.json + .credentials.json here.
+  # _seed_home copies operator's .claude.json + symlinks .claude/ here.
   home_template: /data/users/{user_id}
-  idle_timeout_seconds: 900
+  # Must stay under the OAuth token lifetime (~8h). The main process
+  # OAuthRefresher keeps .credentials.json on disk fresh, but workers
+  # cache the token in memory at startup — restarting them within the
+  # token lifetime guarantees they never need to self-refresh and race
+  # with the centralised refresher.
+  restart_interval_seconds: 14400        # 4h
 
 # Bearer/api-key → user_id (scalar) or pool (list). A list-form token
 # is round-robined across the listed workers, so a single LiteLLM key

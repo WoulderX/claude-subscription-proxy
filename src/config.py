@@ -17,9 +17,16 @@ class ClaudeConfig(BaseModel):
     binary: str = "claude"
     home_template: str = "./users/{user_id}"
     # Worker stays alive between requests. To shed accumulated CLI state
-    # (Ink scroll buffer, in-memory transcript, cached OAuth access token,
-    # any leak) the manager restarts each worker after this many seconds.
-    restart_interval_seconds: int = 43200  # 12h
+    # (Ink scroll buffer, in-memory transcript, cached OAuth access
+    # token, any leak) the manager restarts each worker after this many
+    # seconds. Keep this comfortably shorter than the OAuth token
+    # lifetime (~8h at time of writing): the main-process OAuthRefresher
+    # keeps .credentials.json fresh on disk, but workers' in-memory copy
+    # only refreshes on restart. If a worker outlives the AT it cached
+    # at startup it would try to self-refresh with its now-stale RT and
+    # collide with the main-process refresher (the rotated RT is
+    # single-use, so one of the two writers gets invalid_grant).
+    restart_interval_seconds: int = 14400  # 4h
 
 
 class Config(BaseModel):

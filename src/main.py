@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
@@ -11,6 +13,7 @@ from .api.anthropic import build_router as build_anthropic_router
 from .api.openai import build_router as build_openai_router
 from .auth import make_auth_dep
 from .config import Config
+from .oauth_refresh import OAuthRefresher
 from .session.manager import SessionManager
 
 
@@ -18,13 +21,35 @@ def create_app(config: Config) -> FastAPI:
     manager = SessionManager(config)
     auth_dep = make_auth_dep(config)
 
+    # One refresher per deployment, watching the operator's shared
+    # .credentials.json (the same file every worker's HOME/.claude
+    # is symlinked into). Centralising refresh here makes the main
+    # process the single writer of /v1/oauth/token requests, which
+    # eliminates the multi-worker refresh_token rotation race.
+    refresher = OAuthRefresher(
+        credentials_path=Path(os.path.expanduser("~"))
+            / ".claude" / ".credentials.json",
+    )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Refresh once SYNCHRONOUSLY before any worker spawns, so the
+        # first worker's HOME read picks up a fresh token if the
+        # deployment had been sitting on a stale one. Then kick off
+        # the background loop to keep it fresh.
+        await refresher.initial_refresh()
+        refresher_task = asyncio.create_task(
+            refresher.run(), name="oauth-refresher")
         await manager.start()
         try:
             yield
         finally:
             await manager.stop()
+            refresher_task.cancel()
+            try:
+                await refresher_task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(lifespan=lifespan)
     app.include_router(build_anthropic_router(manager, auth_dep))
