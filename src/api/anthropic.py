@@ -48,8 +48,94 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
 
         if wants_stream:
             async def gen():
+                """Forward upstream SSE bytes verbatim. But if upstream
+                degenerates into one of three shapes:
+                  (1) zero bytes ever (mitm intercept timeout, watchdog
+                      fired before responseheaders, etc.)
+                  (2) a plain JSON 4xx error body (429 / 401 from
+                      Anthropic — they don't always wrap these in SSE)
+                  (3) SSE that's cut off before message_stop
+                a strict client like Claude Code crashes on
+                `usage.input_tokens` because `usage` is undefined. So we
+                sniff the first non-whitespace byte and synthesize a
+                complete, valid Anthropic SSE sequence (with empty usage
+                + the upstream error text as the assistant message)
+                whenever we detect (1) or (2). For (3) we just append a
+                synthetic message_stop so clients don't hang."""
+                head = bytearray()
+                decided = False        # have we figured out SSE vs JSON yet?
+                is_sse = False
+                saw_message_stop = False
+                model_hint = (body.get("model") or "") if isinstance(body, dict) else ""
+
                 async for chunk in channel.iter():
-                    yield chunk
+                    if not decided:
+                        head.extend(chunk)
+                        stripped = bytes(head).lstrip()
+                        if not stripped:
+                            continue                # still only whitespace
+                        first = stripped[:1]
+                        if first in (b"e", b"d", b":"):
+                            # SSE: starts with "event:", "data:", or comment ":"
+                            is_sse = True
+                            decided = True
+                            if b"event: message_stop" in head:
+                                saw_message_stop = True
+                            yield bytes(head); head.clear()
+                            continue
+                        if first == b"{":
+                            # Non-SSE JSON body — keep buffering till EOF, then synthesize
+                            continue
+                        # Unknown prefix → fall back to passthrough
+                        is_sse = True
+                        decided = True
+                        yield bytes(head); head.clear()
+                        continue
+
+                    if is_sse:
+                        if b"event: message_stop" in chunk:
+                            saw_message_stop = True
+                        yield chunk
+                    else:
+                        head.extend(chunk)
+
+                # Channel closed. Decide synthesis.
+                if not decided:
+                    if head.strip():
+                        # Pure JSON body — parse and surface as synthetic SSE error
+                        text = bytes(head).decode("utf-8", "replace")
+                        err_type, err_msg = "error", text[:500]
+                        try:
+                            parsed = json.loads(text)
+                            err = parsed.get("error") if isinstance(parsed, dict) else None
+                            if isinstance(err, dict):
+                                err_type = err.get("type", "error")
+                                err_msg = err.get("message", text[:500])
+                        except json.JSONDecodeError:
+                            pass
+                        log.warning("synthesizing SSE error from non-SSE upstream body: %s",
+                                    text[:200])
+                        yield _synthetic_error_sse(err_type, err_msg, model_hint)
+                    else:
+                        # Channel closed with zero bytes — mitm intercept timeout, etc.
+                        log.warning("synthesizing SSE error: upstream channel closed without any bytes")
+                        yield _synthetic_error_sse(
+                            "upstream_unavailable",
+                            "上游 channel 在收到任何字节前已关闭（mitm intercept 超时 / "
+                            "PTY 卡 modal / watchdog 早期触发）。请稍后重试，或在 "
+                            "/ui dashboard 检查 worker 状态。",
+                            model_hint)
+                elif is_sse and not saw_message_stop:
+                    # SSE was cut off mid-stream (watchdog close, etc.).
+                    # Inject a final message_stop so the client side state
+                    # machine completes cleanly instead of hanging.
+                    log.warning("appending synthetic message_stop to truncated upstream stream")
+                    yield (b'event: message_delta\n'
+                           b'data: {"type":"message_delta",'
+                           b'"delta":{"stop_reason":"error","stop_sequence":null},'
+                           b'"usage":{"output_tokens":0}}\n\n'
+                           b'event: message_stop\n'
+                           b'data: {"type":"message_stop"}\n\n')
             return StreamingResponse(gen(), media_type="text/event-stream")
 
         # Buffer + collapse SSE events into a single Anthropic non-streaming
@@ -59,6 +145,55 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
         return JSONResponse(message)
 
     return router
+
+
+def _synthetic_error_sse(err_type: str, err_msg: str, model: str = "") -> bytes:
+    """Build a complete, schema-valid Anthropic SSE event sequence that
+    represents an error. Includes a populated `usage` object on
+    message_start so strict clients (Claude Code) that index
+    `data.usage.input_tokens` without a guard don't crash with
+    "Cannot read properties of undefined (reading 'input_tokens')".
+
+    Used by the streaming /v1/messages handler whenever the upstream
+    response degenerates into zero bytes or a non-SSE JSON error body,
+    so we never expose those raw shapes to downstream API clients."""
+    def evt(event_type: str, payload: dict) -> bytes:
+        return (f"event: {event_type}\ndata: "
+                + json.dumps(payload, ensure_ascii=False) + "\n\n").encode()
+
+    msg_id = "msg_synthetic_error"
+    body_text = f"[upstream {err_type}] {err_msg}"
+    return b"".join([
+        evt("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id, "type": "message", "role": "assistant",
+                "content": [], "model": model,
+                "stop_reason": None, "stop_sequence": None,
+                # 0/0 usage so input_tokens access is well-defined.
+                "usage": {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            },
+        }),
+        evt("content_block_start", {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }),
+        evt("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": body_text},
+        }),
+        evt("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        evt("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "error", "stop_sequence": None},
+            "usage": {"output_tokens": 0},
+        }),
+        evt("message_stop", {"type": "message_stop"}),
+    ])
 
 
 async def _collapse_stream(channel) -> dict[str, Any]:
@@ -173,6 +308,16 @@ async def _collapse_stream(channel) -> dict[str, Any]:
     message.setdefault("stop_sequence", None)
     message.setdefault("type", "message")
     message.setdefault("role", "assistant")
+    # Ensure usage always has the four fields Claude Code expects to be
+    # numeric. Without this, the error branches above leave usage = {}
+    # and CC crashes on `usage.input_tokens`. We overlay any real usage
+    # values on top of zeros so genuine numbers are preserved.
+    actual_usage = message.get("usage") or {}
+    message["usage"] = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        **actual_usage,
+    }
     return message
 
 

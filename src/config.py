@@ -20,9 +20,13 @@ class TimeoutConfig(BaseModel):
     workload — otherwise leave alone."""
     # How long the worker's mitm has to intercept the TUI's outbound
     # /v1/messages call. If exceeded, the channel is closed and the
-    # request fails. Raise if you see "mitm did not intercept within
-    # Ns" warnings under healthy load (slow upstream, noisy TUI state).
-    mitm_intercept_seconds: float = 30.0
+    # request fails. 90s default rather than 30s because after a long
+    # sub-agent burst (e.g. CC /explore with 30+ tool uses), claude CLI
+    # spends time on local work — auto-compact, transcript indexing,
+    # MCP tool execution — and the next PTY trigger gets ignored until
+    # that local work finishes. 30s was clipping legitimate "still
+    # thinking, give me a moment" states.
+    mitm_intercept_seconds: float = 90.0
     # /status marks an in-flight request as "stuck" if it has gone this
     # long without receiving a single byte. Anthropic typically emits a
     # chunk every couple of seconds, so 30s is a conservative gap. Raise

@@ -176,48 +176,6 @@
       color: #d1d5db;
     }
 
-    /* ── Quota tiers ────────────────────────────────────────── */
-    .quota-tiers {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 12px;
-    }
-    .quota-tier {
-      background: #0f1219;
-      border: 1px solid #1f2433;
-      border-radius: 10px;
-      padding: 12px 14px;
-    }
-    .quota-tier .tier-head {
-      display: flex; justify-content: space-between; gap: 8px;
-      align-items: baseline; margin-bottom: 8px;
-    }
-    .quota-tier .tier-name { font-size: 12px; color: #d1d5db; font-weight: 500; }
-    .quota-tier .reset { font-size: 11px; color: #6b7280; }
-    .quota-tier .bar {
-      height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px;
-      overflow: hidden; margin-bottom: 6px;
-    }
-    .quota-tier .fill { height: 100%; background: #10b981; transition: width 0.4s ease; }
-    .quota-tier.warn  .fill { background: #f59e0b; }
-    .quota-tier.danger .fill { background: #ef4444; }
-    .quota-tier .util {
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 12px; color: #f3f4f6;
-    }
-    .quota-tier.extra-usage { border-color: rgba(59,130,246,0.4); background: rgba(59,130,246,0.06); }
-    .quota-tier.extra-usage .fill { background: #3b82f6; }
-    .quota-empty { color: #6b7280; font-size: 13px; padding: 4px 2px; }
-    .quota-error {
-      font-size: 13px; color: #fca5a5;
-      background: rgba(239,68,68,0.08);
-      border: 1px solid rgba(239,68,68,0.25);
-      padding: 10px 14px; border-radius: 8px;
-      margin-bottom: 12px;
-      display: flex; gap: 8px; align-items: flex-start;
-    }
-    .quota-error::before { content: '⚠'; flex: none; }
-
     /* ── Pool chips ─────────────────────────────────────────── */
     .pool-list { display: flex; flex-wrap: wrap; gap: 8px; }
     .pool-chip {
@@ -415,21 +373,6 @@
       </div>
     </div>
 
-    <!-- ── 订阅配额 ─────────────────────────────────────────── -->
-    <div class="section">
-      <div class="section-head">
-        <span class="section-title">订阅配额</span>
-        <span class="section-meta" id="quotaMeta">未加载</span>
-        <span class="spacer"></span>
-        <div class="section-controls">
-          <button id="quotaRefreshBtn" class="btn-section" title="向 Anthropic 拉取一次最新用量；服务端 60 秒频控">刷新配额</button>
-        </div>
-      </div>
-      <div class="card">
-        <div id="quotaBody"><div class="quota-empty">点击右上「刷新配额」获取最新用量</div></div>
-      </div>
-    </div>
-
     <!-- ── 用户池拓扑（隐藏空状态） ────────────────────────── -->
     <div class="section" id="poolsSection" style="display:none;">
       <div class="section-head">
@@ -502,11 +445,7 @@
     const banner          = $('banner');
     const reloadOutput    = $('reloadOutput');
     const toast           = $('toast');
-    const quotaBody       = $('quotaBody');
-    const quotaMeta       = $('quotaMeta');
-    const quotaRefreshBtn = $('quotaRefreshBtn');
     let autoRefreshTimer  = null;
-    let quotaCooldownTimer = null;
 
     // Restore from localStorage
     apiKeyInput.value = localStorage.getItem('apiKey') || '';
@@ -523,7 +462,6 @@
     refreshBtn.addEventListener('click', () => refresh());
     reloadBtn.addEventListener('click', () => hotReload());
     refreshTokenBtn.addEventListener('click', () => forceRefreshToken());
-    quotaRefreshBtn.addEventListener('click', () => refreshQuota());
 
     function setupAutoRefresh() {
       if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
@@ -787,190 +725,6 @@
       reloadOutput._t = setTimeout(() => reloadOutput.innerHTML = '', 30000);
     }
 
-    // ── 订阅配额 ──────────────────────────────────────────
-    const QUOTA_TIER_LABELS = {
-      five_hour:        '5 小时滚动窗口',
-      seven_day:        '7 天总配额',
-      seven_day_opus:   '7 天 · Opus',
-      seven_day_sonnet: '7 天 · Sonnet',
-    };
-
-    function fmtResetTime(iso) {
-      if (!iso) return '';
-      const dt = new Date(iso);
-      if (isNaN(dt)) return iso;
-      const now = new Date();
-      const diffSec = (dt - now) / 1000;
-      const abs = Math.abs(diffSec);
-      let rel;
-      if (abs < 60)         rel = Math.round(diffSec) + ' 秒';
-      else if (abs < 3600)  rel = Math.round(diffSec / 60) + ' 分钟';
-      else if (abs < 86400) rel = (diffSec / 3600).toFixed(1) + ' 小时';
-      else                  rel = (diffSec / 86400).toFixed(1) + ' 天';
-      const sign = diffSec >= 0 ? '后' : '前';
-      return rel + sign + '重置';
-    }
-
-    function tierClass(util) {
-      if (util >= 90) return 'danger';
-      if (util >= 70) return 'warn';
-      return '';
-    }
-
-    function renderQuotaTier(name, tier) {
-      if (!tier || tier.utilization == null) return '';
-      const util  = Number(tier.utilization);
-      const cls   = tierClass(util);
-      const label = QUOTA_TIER_LABELS[name] || name;
-      const reset = tier.resets_at
-        ? `<span class="reset">${escapeHtml(fmtResetTime(tier.resets_at))}</span>`
-        : '';
-      return `
-        <div class="quota-tier ${cls}">
-          <div class="tier-head">
-            <span class="tier-name">${escapeHtml(label)}</span>
-            ${reset}
-          </div>
-          <div class="bar"><div class="fill" style="width:${Math.min(100, util)}%"></div></div>
-          <div class="util">${util.toFixed(1)}% 已用</div>
-        </div>
-      `;
-    }
-
-    function renderQuota(state) {
-      const snap = state && state.snapshot;
-      const err  = state && state.last_error;
-
-      if (snap) {
-        const fetchedAt = new Date(snap.fetched_at_unix * 1000).toLocaleString('zh-CN');
-        let meta = `数据抓取于 ${fetchedAt}`;
-        if (err) {
-          const errAt = new Date(err.attempted_at_unix * 1000).toLocaleString('zh-CN');
-          meta += ` · 最近一次尝试（${errAt}）失败`;
-        }
-        quotaMeta.textContent = meta;
-      } else if (err) {
-        const errAt = new Date(err.attempted_at_unix * 1000).toLocaleString('zh-CN');
-        quotaMeta.textContent = `${errAt} 抓取失败，未有成功记录`;
-      } else {
-        quotaMeta.textContent = '未加载';
-      }
-
-      let errBanner = '';
-      if (err) {
-        const rateNote = err.is_rate_limited
-          ? `Anthropic 限速中，${err.retry_after_seconds ? Math.round(err.retry_after_seconds) + ' 秒后' : '稍候'}再试。`
-          : '';
-        errBanner = `<div class="quota-error"><div>${escapeHtml(rateNote)}${escapeHtml(err.error || '未知错误')}</div></div>`;
-      }
-
-      if (!snap) {
-        quotaBody.innerHTML = errBanner
-          || '<div class="quota-empty">点击右上「刷新配额」获取最新用量</div>';
-        return;
-      }
-
-      const tiers = [];
-      ['five_hour','seven_day','seven_day_opus','seven_day_sonnet'].forEach(k => {
-        const html = renderQuotaTier(k, snap[k]);
-        if (html) tiers.push(html);
-      });
-      if (snap.extra_tiers) {
-        Object.entries(snap.extra_tiers).forEach(([k, v]) => {
-          const html = renderQuotaTier(k, v);
-          if (html) tiers.push(html);
-        });
-      }
-
-      let extraUsageHtml = '';
-      const eu = snap.extra_usage;
-      if (eu && eu.is_enabled) {
-        const cur = eu.currency || 'USD';
-        const used = eu.used_credits != null ? eu.used_credits.toFixed(2) : '?';
-        const limit = eu.monthly_limit != null ? eu.monthly_limit.toFixed(2) : '?';
-        const util = eu.utilization != null ? Number(eu.utilization).toFixed(1) : '?';
-        extraUsageHtml = `
-          <div class="quota-tier extra-usage" style="grid-column: 1 / -1;">
-            <div class="tier-head">
-              <span class="tier-name">超额按量付费（extra usage）</span>
-              <span class="reset">${escapeHtml(util)}% 已用</span>
-            </div>
-            <div class="bar"><div class="fill" style="width:${Math.min(100, Number(util)||0)}%;"></div></div>
-            <div class="util">${escapeHtml(used)} / ${escapeHtml(limit)} ${escapeHtml(cur)}</div>
-          </div>
-        `;
-      }
-
-      const tiersHtml = tiers.length || extraUsageHtml
-        ? `<div class="quota-tiers">${tiers.join('')}${extraUsageHtml}</div>`
-        : '<div class="quota-empty">API 未返回任何配额窗口</div>';
-      quotaBody.innerHTML = errBanner + tiersHtml;
-    }
-
-    function startQuotaCooldown(seconds) {
-      if (quotaCooldownTimer) clearInterval(quotaCooldownTimer);
-      if (!(seconds > 0)) {
-        quotaRefreshBtn.disabled = false;
-        quotaRefreshBtn.textContent = '刷新配额';
-        return;
-      }
-      let remaining = Math.ceil(seconds);
-      quotaRefreshBtn.disabled = true;
-      const tick = () => {
-        if (remaining <= 0) {
-          clearInterval(quotaCooldownTimer); quotaCooldownTimer = null;
-          quotaRefreshBtn.disabled = false;
-          quotaRefreshBtn.textContent = '刷新配额';
-          return;
-        }
-        quotaRefreshBtn.textContent = `刷新配额（${remaining}s）`;
-        remaining -= 1;
-      };
-      tick();
-      quotaCooldownTimer = setInterval(tick, 1000);
-    }
-
-    async function loadQuotaCached() {
-      const auth = authHeader();
-      if (!auth) return;
-      try {
-        const resp = await fetch('/admin/quota', { headers: auth });
-        if (!resp.ok) return;
-        const data = await resp.json();
-        renderQuota(data);
-        startQuotaCooldown(data.seconds_until_next_refresh || 0);
-      } catch (e) { /* 静默 */ }
-    }
-
-    async function refreshQuota() {
-      const auth = authHeader();
-      if (!auth) { showBanner('请先填写 API Key'); return; }
-      quotaRefreshBtn.disabled = true;
-      const prevText = quotaRefreshBtn.textContent;
-      quotaRefreshBtn.textContent = '刷新中…';
-      try {
-        const resp = await fetch('/admin/quota/refresh', { method: 'POST', headers: auth });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          showToast(`刷新失败：${data.detail || resp.statusText}`, 'error');
-          quotaRefreshBtn.textContent = prevText;
-          quotaRefreshBtn.disabled = false;
-          return;
-        }
-        renderQuota(data);
-        if (data.rate_limited) {
-          showToast(`未刷新——服务端 ${data.rate_limit_seconds}s 频控保护中`, 'error');
-        } else {
-          showToast('订阅配额已刷新', 'success');
-        }
-        startQuotaCooldown(data.seconds_until_next_refresh || 0);
-      } catch (e) {
-        showToast('请求失败：' + e.message, 'error');
-        quotaRefreshBtn.textContent = prevText;
-        quotaRefreshBtn.disabled = false;
-      }
-    }
-
     async function forceRefreshToken() {
       const auth = authHeader();
       if (!auth) { showBanner('请先填写 API Key'); return; }
@@ -1040,7 +794,6 @@
     setupAutoRefresh();
     if (apiKeyInput.value) {
       refresh();
-      loadQuotaCached();
     }
   </script>
 </body>

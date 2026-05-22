@@ -49,7 +49,7 @@ class WorkerSession:
 
     def __init__(self, user_id: str, mitm_port: int,
                  home: Path, claude_binary: str, ca_cert: Path,
-                 mitm_intercept_timeout: float = 30.0,
+                 mitm_intercept_timeout: float = 90.0,
                  response_stall_timeout: float = 90.0) -> None:
         self.user_id = user_id
         self.mitm_port = mitm_port
@@ -102,9 +102,37 @@ class WorkerSession:
                 # channel.iter()` hangs forever, leaks the channel into
                 # the server's _channels dict, and the worker looks
                 # busy forever even though nothing is happening.
-                log.warning("user=%s mitm did not intercept within %.0fs; "
-                            "closing response and clearing pending slot",
-                            self.user_id, self.mitm_intercept_timeout)
+                #
+                # Dump the last ~4KB of TUI screen content so an operator
+                # can SEE what modal / prompt / error the TUI was showing
+                # when it ignored our keystroke. Without this we're
+                # blind: claude CLI process is alive, drain loop is
+                # consuming bytes, but we don't know what the user-
+                # facing screen says.
+                screen_tail = self.pty.dump_screen_tail()
+                matcher_view = self.pty.dump_recent_chunks_squeezed()
+                # Also tell the operator what the matcher anchors are
+                # vs what the matcher sees right now, so they can read
+                # the boolean themselves without re-running regex.
+                markers_present = []
+                if "Esctocancel" in matcher_view:
+                    markers_present.append("Esctocancel")
+                if "Tabtoamend" in matcher_view:
+                    markers_present.append("Tabtoamend")
+                log.warning(
+                    "user=%s mitm did not intercept within %.0fs; "
+                    "closing response and clearing pending slot.\n"
+                    "──── PTY screen tail (last 16KB, ANSI stripped) ────\n"
+                    "%s\n"
+                    "──── end PTY screen tail ────\n"
+                    "──── matcher view (recent_chunks 4KB, squeezed) ────\n"
+                    "%s\n"
+                    "──── end matcher view ────\n"
+                    "matcher anchors present in view: %s",
+                    self.user_id, self.mitm_intercept_timeout,
+                    screen_tail or "(empty — TUI produced no recent output)",
+                    matcher_view or "(empty)",
+                    markers_present or "NONE")
                 self.pending = None
                 await self.response.put(None)
             return self.response
@@ -158,7 +186,7 @@ async def amain() -> None:
     parser.add_argument("--claude-binary", default="claude")
     parser.add_argument("--ca-cert", required=True)
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--mitm-intercept-timeout", type=float, default=30.0,
+    parser.add_argument("--mitm-intercept-timeout", type=float, default=90.0,
                         help="seconds to wait for mitm to hijack TUI's "
                              "outbound /v1/messages before failing the call")
     parser.add_argument("--response-stall-timeout", type=float, default=90.0,

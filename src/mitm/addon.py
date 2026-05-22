@@ -282,6 +282,22 @@ class HijackAddon:
             merged["output_config"] = oc
             log.info("user=%s normalized output_config.effort xhigh→high "
                      "(upstream rejects xhigh)", self.session.user_id)
+
+        # Anthropic rejects `thinking` when `tool_choice` forces a tool call.
+        # Exact error: "Thinking may not be enabled when tool_choice forces
+        # tool use." This combo shows up routinely in Claude Code's sub-agent
+        # / Task delegation paths (forced `{"type":"tool","name":"Task"}`)
+        # because the CLI side enables thinking by default on Opus 4.x.
+        # Drop thinking — the request is delegation-style where the model
+        # picks a tool to run, reasoning offers little vs. the cost of a 400.
+        tc = merged.get("tool_choice")
+        if (isinstance(tc, dict)
+                and tc.get("type") in ("tool", "any")
+                and "thinking" in merged):
+            dropped = merged.pop("thinking")
+            log.info("user=%s dropped thinking=%s (tool_choice.type=%r forces "
+                     "tool use, upstream rejects the combo)",
+                     self.session.user_id, json.dumps(dropped), tc.get("type"))
         return merged
 
     @staticmethod

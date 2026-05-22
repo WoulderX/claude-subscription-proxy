@@ -12,7 +12,6 @@ import uvicorn
 from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse
 
-from .account_quota import AccountQuotaService
 from .api.admin import build_router as build_admin_router
 from .api.anthropic import build_router as build_anthropic_router
 from .api.openai import build_router as build_openai_router
@@ -52,7 +51,6 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
     log.info("claude code CLI version: %s", claude_version)
 
     credentials_path = Path(os.path.expanduser("~")) / ".claude" / ".credentials.json"
-    quota_service = AccountQuotaService(credentials_path=credentials_path)
 
     # Refresher + its task are owned by lifespan but admin/reload also
     # needs to swap them (when oauth_refresh.enabled toggles). Holding
@@ -101,7 +99,6 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         manager=manager, config=config, config_path=config_path,
         auth_dep=auth_dep, refresher_state=refresher_state,
         credentials_path=credentials_path,
-        quota_service=quota_service,
     ))
 
     @app.get("/healthz")
