@@ -5,7 +5,7 @@ listen_host: 0.0.0.0
 listen_port: 8787
 
 mitm:
-  # Per-user mitm listener: first user gets 18000, next 18001, etc.
+  # Per-worker mitm listener: first worker gets 18000, next 18001, etc.
   port_base: 18000
   # mitmproxy auto-generates this on first run; the directory is a named
   # volume in compose so the CA survives restarts. Must match HOME=/home/coder.
@@ -13,14 +13,15 @@ mitm:
 
 claude:
   binary: claude
-  # Each API user gets an isolated HOME under /data/users/<user_id>/.
-  # _seed_home copies operator's .claude.json + symlinks .claude/ here.
+  # Each worker gets an isolated HOME under /data/users/<user_id>/.
+  # _seed_home copies the operator's .claude.json once and symlinks
+  # .claude/ to the worker's assigned account directory.
   home_template: /data/users/{user_id}
   # Must stay under the OAuth token lifetime (~8h). The main process
-  # OAuthRefresher keeps .credentials.json on disk fresh, but workers
-  # cache the token in memory at startup — restarting them within the
-  # token lifetime guarantees they never need to self-refresh and race
-  # with the centralised refresher.
+  # OAuthRefresher keeps each account's .credentials.json fresh on
+  # disk, but workers cache the token in memory at startup — restarting
+  # them within the token lifetime guarantees they never need to
+  # self-refresh and race with the centralised refresher.
   restart_interval_seconds: 14400        # 4h
 
   # Operational tuning knobs. All optional; defaults match what was
@@ -36,22 +37,100 @@ claude:
     restart_check_interval_seconds: 60   # how often the restarter loop polls workers for age-based recycling
 
 # Centralised proactive OAuth token refresh. Eliminates the per-worker
-# refresh_token rotation race. Disable only for debugging — with this
-# off, workers self-refresh and the multi-worker race can re-emerge.
+# refresh_token rotation race — works per-account in multi-account
+# mode (iterates every account's .credentials.json each tick). Disable
+# only for debugging.
 oauth_refresh:
   enabled: true
   check_interval_seconds: 300                  # how often to check expiry
   refresh_when_expires_within_seconds: 3600    # refresh if token expires within this window
 
-# Bearer/api-key → user_id (scalar) or pool (list). A list-form token
-# is round-robined across the listed workers, so a single LiteLLM key
-# can drive N parallel claude PTYs in this proxy. Generate keys with:
-#     echo "sk-internal-$(openssl rand -hex 24)"
+# ── Token-usage accounting ────────────────────────────────────────
+# One sqlite row per completed /v1/messages call. Powers /admin/usage
+# and the "用量统计" panel on /ui. Disable to skip the write overhead.
+# Mount /data/usage.db (or wherever you set db_path) as a host volume
+# to keep history across container rebuilds.
+usage:
+  enabled: true
+  # /data/proxy is bind-mounted from the host's ./data via docker-compose.yml;
+  # parent /data is NOT mounted as a single tree, so any path directly
+  # under /data lives in the container's RW layer and is lost on rebuild.
+  db_path: /data/proxy/usage.db
+
+# ── Multi-account mode ─────────────────────────────────────────────
+# Each entry maps an account name to a host-side .claude/ content
+# directory (mounted in via docker-compose) and a worker replica count.
+# Worker user_ids are auto-generated as `<account>-0`, `<account>-1`,
+# ..., `<account>-(workers-1)`.
 #
-# Examples:
+# Per-account files expected on the host:
+#   <dir>/.credentials.json   — required, from `claude /login`
+#   <dir>/.claude.json        — recommended (the `~/.claude.json` from
+#                               the SAME login machine). Contains the
+#                               oauthAccount block (email, accountUuid)
+#                               that claude CLI gates "logged in" state
+#                               on. Without it the worker boots but TUI
+#                               reports "Not logged in" and prewarm
+#                               fails. Place it INSIDE the account dir
+#                               (claude CLI reads it from per-worker
+#                               HOME, never writes back here, so the
+#                               file stays a clean read-only seed).
+#
+# Recommended host layout — one self-contained dir per account:
+#   /data/shared-auth/claude-1/
+#       .credentials.json
+#       .claude.json
+#       projects/  sessions/  ...
+#   /data/shared-auth/claude-2/
+#       .credentials.json
+#       .claude.json
+#       ...
+#
+# Bind-mount each <dir> into the container at the same path
+# (docker-compose.yml has one volume line per account). Adding an
+# account = `cp -a` a logged-in .claude/, drop in .claude.json, add a
+# compose line, add an `accounts:` entry, rebuild + restart.
+#
+# Legacy split layout (sibling file at <dir>.json) is still supported
+# as a fallback for existing deployments.
+#
+# All workers belonging to the same account share that .claude/ via
+# symlink, so the main-process OAuth refresher remains the sole writer
+# of each account's .credentials.json (no multi-worker refresh_token
+# rotation race). At startup, prewarm runs in PARALLEL across accounts
+# but SERIALLY within an account, so the per-OAuth bootstrap burst
+# doesn't trip Anthropic's rate limiter.
+accounts:
+  claude-1:
+    dir: /data/shared-auth/claude-1
+    workers: 5
+  claude-2:
+    dir: /data/shared-auth/claude-2
+    workers: 5
+
+# Single front-door key — pools all auto-generated workers from every
+# account behind one Bearer token. SessionManager.pick load-balances
+# requests across the full set (idle-first, then fewest in-flight + RR).
+# Generate with:  echo "sk-internal-$(openssl rand -hex 24)"
+api_key: sk-internal-master
+
+# `users:` is OPTIONAL when `accounts:` + `api_key:` are set — the
+# validator auto-populates it. Set it explicitly only for finer-grained
+# routing (multiple keys, mixed pools, dedicated workers per tenant).
+# Every referenced user_id must match an auto-generated one:
+#
+# users:
+#   sk-key-a: [claude-1-0, claude-1-1, claude-1-2, claude-1-3, claude-1-4]
+#   sk-key-b: [claude-2-0, claude-2-1, claude-2-2, claude-2-3, claude-2-4]
+
+# ── Legacy single-account mode ─────────────────────────────────────
+# Omit `accounts:` and `api_key:`, set `users:` directly. Every worker
+# symlinks to the operator's ~/.claude (the path bound into the
+# container as before). Example:
+#
+# users:
 #   sk-internal-1bf94b...e3: alice          # single worker, requests serialised
 #   sk-internal-7c93af...91:                # pool: 3 parallel workers behind one key
 #     - litellm-0
 #     - litellm-1
 #     - litellm-2
-users: {}

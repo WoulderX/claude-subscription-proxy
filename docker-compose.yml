@@ -1,31 +1,45 @@
 # Run a Claude Code subscription proxy on this host.
 #
 # Before `docker compose up`:
-#   1. Have a logged-in claude CLI somewhere on this host, then mirror
-#      its ~/.claude/ into the shared auth directory:
+#   1. Prepare one or more logged-in claude credential directories on
+#      the host. Each directory holds the full content of one account's
+#      ~/.claude/ (with .credentials.json inside it).
 #
+#      Single-account (legacy):
 #          mkdir -p /data/shared-auth
-#          # If claude is logged in as the same user running compose:
 #          cp -r ~/.claude /data/shared-auth/claude
-#          # Otherwise copy from wherever the logged-in HOME is.
 #
-#      Verify /data/shared-auth/claude/.credentials.json exists.
+#      Multi-account (recommended for >1 subscription):
+#          mkdir -p /data/shared-auth
+#          # Log in once per account via a host-side claude CLI, then
+#          # copy that account's ~/.claude/ into a numbered slot:
+#          cp -r ~/.claude /data/shared-auth/claude-1
+#          # repeat the login for the next account, then:
+#          cp -r ~/.claude /data/shared-auth/claude-2
+#          # etc.
 #
-#   2. Copy the example config and add your API keys:
+#      Each /data/shared-auth/claude-N MUST contain a .credentials.json.
+#
+#   2. Copy the example config and edit:
 #          cp docker/config.example.yaml config.yaml
-#          # edit `users:` — generate keys with:
-#          #     echo "sk-internal-$(openssl rand -hex 24)"
+#          # set `accounts:` to match your /data/shared-auth/claude-*
+#          # set `api_key:` (generate with: echo "sk-internal-$(openssl rand -hex 24)")
 #
 #   3. docker compose up --build -d
 #
 # Volumes:
-#   /data/shared-auth/claude   → /home/coder/.claude  (RO bind)
-#       Whole .claude/ directory from the host's logged-in claude install.
-#       Must contain .credentials.json. The host can keep refreshing it.
-#   mitm-ca (named)           → /home/coder/.mitmproxy
+#   /data/shared-auth          → /data/shared-auth  (RW bind)
+#       Whole shared-auth tree — contains one subdirectory per account
+#       (claude-1, claude-2, …). Each worker symlinks its ~/.claude to
+#       the assigned subdirectory; the main process refreshes each
+#       account's .credentials.json in place. RW (not :ro): OAuth
+#       refresh persists rotated tokens back to these files. A :ro
+#       mount still works (workers read live tokens on each restart)
+#       but disables proactive refresh.
+#   mitm-ca (named)            → /home/coder/.mitmproxy
 #       mitm CA, generated on first run, persisted across restarts.
-#   ./users                   → /data/users
-#       Per-API-user transcripts / isolated $HOME directories.
+#   ./users                    → /data/users
+#       Per-worker transcripts / isolated $HOME directories.
 #
 services:
   proxy:
@@ -46,23 +60,37 @@ services:
     volumes:
       # config (RO)
       - ./config.yaml:/data/config.yaml:ro
-      # operator's whole claude state dir — bind from a shared host path.
-      # RW (not :ro): every per-API-user worker symlinks .credentials.json
-      # back to THIS file, so a claude-CLI OAuth token refresh writes the
-      # new token straight here — one shared, always-fresh credential for
-      # all users. A :ro mount still works (workers read the live token on
-      # each start) but then refreshes can't be persisted.
-      - /data/shared-auth/claude:/home/coder/.claude
+      # Per-account bind mounts. Each account is one self-contained
+      # directory holding .credentials.json, .claude.json, projects/,
+      # etc. Workers symlink their ~/.claude to the matching dir, so a
+      # claude-CLI atomic token refresh (write tmp + rename) lands
+      # directly on the shared file and the rotated token is visible to
+      # every sibling worker. Add one line per account in `accounts:`
+      # of config.yaml — paths must match exactly.
+      - /data/shared-auth/claude-1:/data/shared-auth/claude-1
+      - /data/shared-auth/claude-2:/data/shared-auth/claude-2
+      - /data/shared-auth/claude-3:/data/shared-auth/claude-3
       # mitm CA — named volume so the auto-generated CA persists across
       # `docker compose down` / restart. Wipe with `docker compose down -v`.
       - mitm-ca:/home/coder/.mitmproxy
       # per-API-user state (transcripts, isolated $HOME for each user)
       - ./users:/data/users
+      # Token-usage sqlite db. Path inside the container must match
+      # `usage.db_path` in config.yaml. Survives image rebuilds via the
+      # host bind; delete the file to reset history.
+      - ./data:/data/proxy
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=2).status==200 else 1)"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      # Prewarm dominates startup: ~15s per worker, account chains run
+      # in parallel + within-account serial. With 2 accounts × 5 workers
+      # total prewarm is ~75–120s. start_period swallows that — failures
+      # during this window don't count toward retries, so the container
+      # stays "starting" (not "unhealthy") until /healthz comes online.
+      # Bump if you scale accounts/workers further: roughly
+      # ~max(workers_per_account) × 15s + 30s buffer.
+      start_period: 180s
       retries: 3
 
 volumes:

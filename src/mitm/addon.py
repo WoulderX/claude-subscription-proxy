@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from mitmproxy import http
@@ -58,6 +59,131 @@ PRESERVED_HEADER_PREFIXES = (
 STRIP_BETA_PREFIX = "context-1m"
 
 
+class _UsageScanner:
+    """Streaming SSE parser that pulls token usage out of an Anthropic
+    `/v1/messages?stream=true` response without buffering the whole body.
+
+    Two events carry the numbers we want:
+
+      event: message_start
+      data: {"type":"message_start","message":{
+               "model":"claude-opus-4-5-20260101",
+               "usage":{"input_tokens":15,"cache_creation_input_tokens":0,
+                        "cache_read_input_tokens":12000,"output_tokens":1}}}
+
+      event: message_delta
+      data: {"type":"message_delta","delta":{...},
+             "usage":{"output_tokens":284}}
+
+    `message_start` is the only place we see `input_tokens` and the
+    cache counters; we snapshot them once. `message_delta` carries the
+    CURRENT cumulative output_tokens (NOT a delta despite the event
+    name) — keep updating to the latest value, the final one wins.
+
+    We accumulate raw bytes into a small buffer and split on the SSE
+    record separator (\\n\\n). Per-event parsing is cheap (one JSON
+    decode of ≤1 KB) and gives us a robust event boundary even when
+    a chunk lands mid-event."""
+
+    # Cap buffer so a pathological upstream that NEVER emits \n\n can't
+    # exhaust worker memory. 64 KB is far more than any real Anthropic
+    # SSE event (typical event JSON is ~200–800 B); past that we drop
+    # the head and let the scanner re-sync at the next \n\n.
+    _MAX_BUF = 64 * 1024
+
+    # Quick prefilter — avoids JSON-parsing every event when the SSE
+    # stream is full of text deltas (95%+ of bytes). We only care about
+    # events whose data line contains `"usage"`.
+    _USAGE_HINT = re.compile(rb'"usage"\s*:')
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self.model: str | None = None
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_creation_tokens = 0
+        self.cache_read_tokens = 0
+        self.saw_any_usage = False
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buf.extend(chunk)
+        while True:
+            sep = self._buf.find(b"\n\n")
+            if sep < 0:
+                break
+            event = bytes(self._buf[:sep])
+            del self._buf[: sep + 2]
+            self._parse_event(event)
+        # Resync defense: if the buffer grew past the cap without ever
+        # finding a record separator, drop everything except the last
+        # _MAX_BUF/2 bytes so the next chunk can still complete an event.
+        if len(self._buf) > self._MAX_BUF:
+            del self._buf[: len(self._buf) - self._MAX_BUF // 2]
+
+    def _parse_event(self, event: bytes) -> None:
+        if not self._USAGE_HINT.search(event):
+            return
+        data_payload = bytearray()
+        for line in event.split(b"\n"):
+            if line.startswith(b"data:"):
+                data_payload.extend(line[5:].lstrip())
+                data_payload.extend(b"\n")
+        if not data_payload:
+            return
+        try:
+            data = json.loads(data_payload.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict):
+            return
+        etype = data.get("type")
+        if etype == "message_start":
+            msg = data.get("message") or {}
+            if isinstance(msg, dict):
+                if isinstance(msg.get("model"), str):
+                    self.model = msg["model"]
+                usage = msg.get("usage")
+                if isinstance(usage, dict):
+                    self._merge_usage(usage)
+        elif etype == "message_delta":
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                # message_delta carries CUMULATIVE output_tokens (latest
+                # wins); other fields shouldn't appear here but we
+                # tolerate them defensively.
+                self._merge_usage(usage)
+
+    def _merge_usage(self, usage: dict) -> None:
+        def _take(key: str, current: int) -> int:
+            v = usage.get(key)
+            if not isinstance(v, (int, float)):
+                return current
+            return int(v)
+
+        self.input_tokens          = _take("input_tokens",                self.input_tokens)
+        self.output_tokens         = _take("output_tokens",               self.output_tokens)
+        self.cache_creation_tokens = _take("cache_creation_input_tokens", self.cache_creation_tokens)
+        self.cache_read_tokens     = _take("cache_read_input_tokens",     self.cache_read_tokens)
+        self.saw_any_usage = True
+
+    def snapshot(self) -> dict | None:
+        """Return the final accumulated usage as a plain dict, or None
+        if we never saw a usage event (e.g. upstream error before
+        message_start). The dict matches the IPC `usage` event shape:
+        keys are the wire-stable identifiers expected by UsageStore."""
+        if not self.saw_any_usage:
+            return None
+        return {
+            "model": self.model,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+        }
+
+
 class _FlowState:
     """Per-hijacked-flow state shared between the request hook (which
     arms the stall watchdog the moment hijack completes), the
@@ -80,6 +206,11 @@ class _FlowState:
         self.loop = asyncio.get_running_loop()
         self.watchdog: asyncio.TimerHandle | None = None
         self.closed = False
+        # Token-usage scanner — owns a small buffer of unsplit SSE bytes
+        # and snapshots model + token counts as message_start / message_delta
+        # events fly past. snapshot() is dumped onto channel.usage at
+        # end-of-stream so worker._handle can emit a usage IPC.
+        self.usage_scanner = _UsageScanner()
 
     def arm(self) -> None:
         if self.watchdog is not None:
@@ -110,8 +241,16 @@ class _FlowState:
         # forever (a stuck request that never sees responseheaders
         # would otherwise sit in the dict for the worker's whole life).
         self.addon._flow_states.pop(self.flow_id, None)
-        log.info("user=%s response stream %s flow=%s",
-                 self.user, reason, self.flow_id_short)
+        # "complete" fires once per request — DEBUG. Force-close /
+        # upstream-error reasons stay at INFO so an unhealthy worker
+        # produces a visible audit trail without normal traffic
+        # drowning out the signal.
+        if reason == "complete":
+            log.debug("user=%s response stream complete flow=%s",
+                      self.user, self.flow_id_short)
+        else:
+            log.info("user=%s response stream %s flow=%s",
+                     self.user, reason, self.flow_id_short)
 
 
 class HijackAddon:
@@ -134,9 +273,13 @@ class HijackAddon:
     def request(self, flow: http.HTTPFlow) -> None:
         if flow.request.host not in ANTHROPIC_HOSTS:
             return
-        log.info("user=%s saw outbound %s %s",
-                 self.session.user_id,
-                 flow.request.method, flow.request.path)
+        # DEBUG: claude CLI makes 6+ sibling calls per request (eval,
+        # grove, mcp-registry, etc.) — at INFO this was the loudest
+        # source of per-request noise in docker logs. The hijack line
+        # below carries the one fact an operator actually needs.
+        log.debug("user=%s saw outbound %s %s",
+                  self.session.user_id,
+                  flow.request.method, flow.request.path)
         # flow.request.path looks like "/v1/messages?beta=true" — strip
         # the query before matching, then accept any sub-resource that
         # starts with /v1/messages (count_tokens, etc., never see hijack
@@ -179,8 +322,10 @@ class HijackAddon:
             new_beta = ",".join(kept)
             if new_beta != beta:
                 flow.request.headers["anthropic-beta"] = new_beta
-                log.info("user=%s stripped %s* from anthropic-beta",
-                         self.session.user_id, STRIP_BETA_PREFIX)
+                # DEBUG: fires every request; the strip is invariant
+                # behavior, an operator never needs to watch it.
+                log.debug("user=%s stripped %s* from anthropic-beta",
+                          self.session.user_id, STRIP_BETA_PREFIX)
         # mitmproxy will recompute content-length. We deliberately do NOT
         # mutate other identity-bearing headers — claude's User-Agent /
         # x-app / x-stainless-* must reach Anthropic verbatim for the call
@@ -201,8 +346,7 @@ class HijackAddon:
         # stalled=215s, because Anthropic's TCP connection was open
         # but no HTTP response had ever come back, so responseheaders
         # never fired, so the watchdog never armed.
-        stall_timeout = getattr(
-            self.session, "response_stall_timeout", 90.0)
+        stall_timeout = self.session.response_stall_timeout
         state = _FlowState(
             addon=self,
             flow_id=flow.id,
@@ -212,8 +356,11 @@ class HijackAddon:
         state.arm()
         self._flow_states[flow.id] = state
 
-        log.info("user=%s hijacked outbound /v1/messages flow=%s model=%s",
-                 self.session.user_id, flow.id[:8], merged.get("model"))
+        # DEBUG: per-request. The hijack itself is invariant — what an
+        # operator cares about (failures, force-closes, rate-limits) is
+        # logged at WARNING by the watchdog / 429 paths.
+        log.debug("user=%s hijacked outbound /v1/messages flow=%s model=%s",
+                  self.session.user_id, flow.id[:8], merged.get("model"))
 
     def _merge_body(self, original_text: str, user_body: dict) -> dict:
         """Whitelist-merge: start from claude's original body (keeps tools,
@@ -263,9 +410,9 @@ class HijackAddon:
             for k in ("output_config", "thinking", "context_management"):
                 if k in merged and k not in user_body:
                     dropped = merged.pop(k)
-                    log.info("user=%s dropped CLI %s=%s (model %s != CLI %s)",
-                             self.session.user_id, k, json.dumps(dropped),
-                             merged.get("model"), base.get("model"))
+                    log.debug("user=%s dropped CLI %s=%s (model %s != CLI %s)",
+                              self.session.user_id, k, json.dumps(dropped),
+                              merged.get("model"), base.get("model"))
 
         # Coerce legacy effort tier. Anthropic's current API rejects
         # output_config.effort="xhigh" with:
@@ -280,8 +427,8 @@ class HijackAddon:
             oc = dict(oc)
             oc["effort"] = "high"
             merged["output_config"] = oc
-            log.info("user=%s normalized output_config.effort xhigh→high "
-                     "(upstream rejects xhigh)", self.session.user_id)
+            log.debug("user=%s normalized output_config.effort xhigh→high "
+                      "(upstream rejects xhigh)", self.session.user_id)
 
         # Anthropic rejects `thinking` when `tool_choice` forces a tool call.
         # Exact error: "Thinking may not be enabled when tool_choice forces
@@ -295,9 +442,9 @@ class HijackAddon:
                 and tc.get("type") in ("tool", "any")
                 and "thinking" in merged):
             dropped = merged.pop("thinking")
-            log.info("user=%s dropped thinking=%s (tool_choice.type=%r forces "
-                     "tool use, upstream rejects the combo)",
-                     self.session.user_id, json.dumps(dropped), tc.get("type"))
+            log.debug("user=%s dropped thinking=%s (tool_choice.type=%r forces "
+                      "tool use, upstream rejects the combo)",
+                      self.session.user_id, json.dumps(dropped), tc.get("type"))
         return merged
 
     @staticmethod
@@ -363,6 +510,16 @@ class HijackAddon:
             # Pass-through with no tapping.
             return
 
+        # 429 is where Anthropic puts the precise rate-limit reset info,
+        # and it's usually in HEADERS, not the body. If we wait for the
+        # body scan we get a generic "rate_limit_error" but lose the
+        # exact `anthropic-ratelimit-*-reset` / `retry-after` numeric
+        # value. Snapshot it here while we still have the response
+        # object, dispatch as a session-wide event so the main process
+        # can mark the account with the precise epoch.
+        if flow.response.status_code == 429:
+            self._emit_429_event(flow)
+
         def _tap(data: bytes) -> bytes:
             if data:
                 if state.channel is not None and not state.closed:
@@ -370,13 +527,114 @@ class HijackAddon:
                         state.channel.queue.put_nowait(bytes(data))
                     except Exception:
                         log.exception("user=%s failed pushing chunk", state.user)
+                # Side-tap into the usage scanner. Cheap pre-filter
+                # inside the scanner skips JSON-parsing the common case
+                # (text_delta chunks have no `"usage"` substring).
+                try:
+                    state.usage_scanner.feed(data)
+                except Exception:
+                    log.exception("user=%s usage scan failed", state.user)
                 state.arm()  # reset stall watchdog on each chunk
                 return data
-            # data == b"" → end-of-stream marker from mitm
+            # data == b"" → end-of-stream marker from mitm. Snapshot
+            # usage onto the channel BEFORE closing so worker._handle
+            # picks it up while iterating; the channel itself is the
+            # rendezvous between mitm (writer) and worker (reader).
+            if state.channel is not None:
+                snap = state.usage_scanner.snapshot()
+                if snap is not None:
+                    state.channel.usage = snap
             state.close("complete")
             return b""
 
         flow.response.stream = _tap
+
+    def _emit_429_event(self, flow: http.HTTPFlow) -> None:
+        """Extract the rate-limit reset moment from a 429 response and
+        push a `rate_limit` event onto session.events. The body scan
+        path (session._maybe_detect_rate_limit) is a fallback for when
+        the headers don't carry timing info; in our experience
+        Anthropic's headers always do, and they're more precise than
+        the body text."""
+        import time as _time
+        headers = flow.response.headers
+        until_epoch: float | None = None
+        reason = "rate_limit"
+
+        # Anthropic's unified rate-limit headers (as of CLI 2.1.x):
+        #   anthropic-ratelimit-unified-5h-reset
+        #   anthropic-ratelimit-unified-weekly-reset
+        #   anthropic-ratelimit-requests-reset (RFC 3339 timestamp)
+        #   anthropic-ratelimit-tokens-reset   (RFC 3339 timestamp)
+        # Collect every reset header that looks plausible — we'll pick
+        # the LATEST timestamp (account is blocked until ALL limits
+        # clear) and classify the reason from the WINDOW SIZE rather
+        # than the header name. The latter is unreliable: a "5h-reset"
+        # header can carry a 4-day value when the operator has hit the
+        # weekly limit and the 5h header is just echoing the longer
+        # blocker.
+        candidates: list[tuple[str, float]] = []
+        for hname, hval in list(headers.items()):
+            ln = hname.lower()
+            if not ln.startswith("anthropic-ratelimit-") and ln != "retry-after":
+                continue
+            if not ln.endswith("reset") and ln != "retry-after":
+                continue
+            v = hval.strip()
+            ts: float | None = None
+            # Try integer (epoch seconds, or relative for retry-after)
+            try:
+                n = int(v)
+                if n >= 1_500_000_000:
+                    ts = float(n)                          # absolute epoch
+                elif ln == "retry-after":
+                    ts = _time.time() + float(n)           # relative
+                else:
+                    ts = _time.time() + float(n)
+            except ValueError:
+                # Not an integer — try ISO 8601
+                try:
+                    import datetime as _dt
+                    raw = v[:-1] if v.endswith("Z") else v
+                    parsed = _dt.datetime.fromisoformat(raw)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+                    ts = parsed.timestamp()
+                except ValueError:
+                    continue
+            if ts is None:
+                continue
+            candidates.append((ln, ts))
+
+        if candidates:
+            until_epoch = max(ts for _, ts in candidates)
+            from ..rate_limit import classify_rate_limit_reason
+            reason = classify_rate_limit_reason(until_epoch - _time.time())
+            # DEBUG: the resulting account mark is logged at WARNING
+            # by SessionManager._mark_account_issue ("account=X
+            # rate_limit (weekly_limit); routing will skip..."), which
+            # is what operators actually need. Keep the per-header
+            # details available for `LOG_LEVEL=DEBUG` triage.
+            log.debug("user=%s 429 with headers: %s; using until_epoch=%d "
+                      "reason=%s", self.session.user_id,
+                      [(n, int(ts)) for n, ts in candidates],
+                      int(until_epoch), reason)
+        else:
+            log.warning("user=%s 429 but no recognisable reset header; "
+                        "body-scan fallback will mark with default window",
+                        self.session.user_id)
+            return
+
+        # Push the event for worker.amain's relay to pipe up as IPC.
+        try:
+            self.session.events.put_nowait({
+                "type": "rate_limit",
+                "until_epoch": float(until_epoch),
+                "reason": reason,
+                "source": "http_429_headers",
+            })
+        except Exception:
+            log.exception("failed to push 429 event")
 
     def error(self, flow: http.HTTPFlow) -> None:
         """Mitm hit a flow-level error — typically upstream connection

@@ -36,6 +36,20 @@ class ResponseChannel:
     # can see what a stuck worker was trying to do without expanding
     # the full request body.
     body_summary: dict[str, Any] = field(default_factory=dict)
+    # Rate-limit scan state. Anthropic emits `rate_limit_error` in the
+    # very first SSE event (or as the HTTP 429 body), so a 4 KB head
+    # buffer is more than enough to spot it deterministically — we
+    # don't need to look at the rest of the stream. Once we either
+    # detect the marker or pass the head threshold, scanning stops and
+    # the buffer is freed.
+    _rl_head: bytearray = field(default_factory=bytearray)
+    _rl_scanned: bool = False
+    # Token usage extracted from the response stream by the mitm addon
+    # (parsed off message_start + message_delta SSE events). Populated on
+    # end-of-stream; consumed by worker._handle to emit a "usage" IPC
+    # message tagged with this request's id. None = no usage observed
+    # (typical for upstream errors / aborted streams).
+    usage: dict[str, Any] | None = None
 
     async def put(self, chunk: bytes | None) -> None:
         await self.queue.put(chunk)

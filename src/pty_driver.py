@@ -61,6 +61,15 @@ class ClaudePtyDriver:
         # dialog is gone.
         self._recent_chunks: bytearray = bytearray()
         self._recent_chunks_limit: int = 4096
+        # Rate-limit modal capture. claude TUI may briefly show
+        # "You've hit your limit · resets MMM DD, hham UTC" on startup
+        # and then redraw over it within seconds — by the time mitm-
+        # intercept times out (90s) the rolling screen-tail buffer has
+        # long lost it. So we scan EVERY chunk for "resets" and save a
+        # KB-sized snippet around the first match for the worker to
+        # query later. Saved once and frozen — we don't want a later
+        # screen redraw clobbering our captured evidence.
+        self._rate_limit_snippet: bytes = b""
 
     async def start(self) -> None:
         env = os.environ.copy()
@@ -143,8 +152,11 @@ class ClaudePtyDriver:
         # did successfully.
         data = (placeholder + "\r").encode()
         self.proc.write(data)
-        log.info("pty trigger wrote %d bytes via ptyprocess: %r",
-                 len(data), data)
+        # DEBUG: per-request. trigger never fails silently — the
+        # caller observes mitm-intercept-timeout if claude TUI
+        # swallowed the keystroke, and that path logs at WARNING.
+        log.debug("pty trigger wrote %d bytes via ptyprocess: %r",
+                  len(data), data)
 
     # Footer text that's unique to claude CLI's tool-permission dialog.
     # After ANSI strip + whitespace squeeze it shows up exactly as
@@ -216,6 +228,49 @@ class ClaudePtyDriver:
             except Exception:
                 log.exception("failed to write Esc for dialog dismiss")
 
+    # Anchor that appears in claude TUI's rate-limit modal. We require
+    # both "resets" AND a month name (Jan-Dec) within a small window
+    # so we don't fire on unrelated occurrences like "reset settings"
+    # or "rest" hyphenated across a line break.
+    _RL_SCAN = re.compile(
+        rb"resets?\s*(?:at\s*)?"
+        rb"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        rb"[a-z]{0,8}\s*\d{1,2}",
+        re.IGNORECASE,
+    )
+
+    def _capture_rate_limit_text(self, chunk: bytes) -> None:
+        """Cheap per-chunk scan for the rate-limit modal text. Once
+        captured the snippet is FROZEN — a later screen redraw won't
+        clobber it. Uses `_recent_chunks` as the search window so
+        markers split across multiple os.read() calls still match
+        (same trick as _dismiss_if_dialog)."""
+        if self._rate_limit_snippet:
+            return
+        m = self._RL_SCAN.search(self._recent_chunks)
+        if m is None:
+            return
+        # Save ±512 bytes of context around the match. parse_reset_time
+        # only needs the immediate vicinity, but extra context helps
+        # diagnostics ("what was on screen when we tagged the account?").
+        lo = max(0, m.start() - 512)
+        hi = min(len(self._recent_chunks), m.end() + 512)
+        self._rate_limit_snippet = bytes(self._recent_chunks[lo:hi])
+        log.info("captured rate-limit modal snippet (%d bytes) for later parse",
+                 len(self._rate_limit_snippet))
+
+    def dump_rate_limit_snippet(self) -> str:
+        """Return the captured rate-limit text after the same ANSI-strip
+        pipeline screen_tail uses. Empty string if we never saw a
+        plausible marker."""
+        if not self._rate_limit_snippet:
+            return ""
+        text = self._rate_limit_snippet.decode("utf-8", "replace")
+        s = re.sub(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]", "", text)
+        s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", s)
+        s = re.sub(r"\x1b[@-Z\\-_]", "", s)
+        return s
+
     def dump_recent_chunks_squeezed(self) -> str:
         """Return _recent_chunks after the exact same ANSI-strip +
         whitespace-squeeze pipeline that _dismiss_if_dialog uses for
@@ -284,6 +339,11 @@ class ClaudePtyDriver:
                     # our PTY trigger keystrokes (see _dismiss_if_dialog
                     # for rationale).
                     self._dismiss_if_dialog(data)
+                    # And piggy-back: scan for the rate-limit modal so
+                    # we can surface the official reset time on /ui
+                    # even when the modal flashes briefly and is then
+                    # redrawn out of the rolling buffer.
+                    self._capture_rate_limit_text(data)
                     r, _, _ = select.select([fd], [], [], 0)
             except asyncio.CancelledError:
                 return

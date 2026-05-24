@@ -36,6 +36,7 @@ from typing import Any
 # old in-process design. They just run inside this subprocess now.
 from .mitm.runner import MitmRunner
 from .pty_driver import ClaudePtyDriver
+from .rate_limit import classify_rate_limit_reason, parse_reset_time
 from .session.state import PendingRequest, ResponseChannel
 
 
@@ -62,6 +63,11 @@ class WorkerSession:
 
         self.pending: PendingRequest | None = None
         self.response: ResponseChannel | None = None
+        # Side-channel for addon → main-process events that aren't tied
+        # to a specific in-flight request id (e.g. HTTP 429 details
+        # parsed from response headers). worker.amain drains this and
+        # ships entries up via stdout JSON.
+        self.events: asyncio.Queue[dict] = asyncio.Queue()
 
         self.mitm = MitmRunner(port=mitm_port, session=self)
         self.pty = ClaudePtyDriver(
@@ -133,6 +139,46 @@ class WorkerSession:
                     screen_tail or "(empty — TUI produced no recent output)",
                     matcher_view or "(empty)",
                     markers_present or "NONE")
+                # Try to recover Anthropic's official reset timestamp
+                # from the TUI modal ("You've hit your limit · resets
+                # May 27, 12am (UTC)"). When found, emit a structured
+                # IPC so the main process records the exact account-
+                # unblock moment instead of guessing a window.
+                #
+                # Three places to look (in order):
+                #   1. The PTY's "rate_limit_snippet" — a frozen ±512B
+                #      window around the first "resets MMM DD" we ever
+                #      saw on this PTY. Survives later redraws, so it
+                #      catches modals that flash briefly at startup.
+                #   2. The 16KB ANSI-stripped screen tail (preserves
+                #      spaces; matches the typical regex).
+                #   3. The 4KB whitespace-squeezed matcher view (last
+                #      resort if the modal lost its spaces to TUI
+                #      redraw artifacts).
+                rl_snippet = self.pty.dump_rate_limit_snippet()
+                reset_epoch = (parse_reset_time(rl_snippet)
+                               or parse_reset_time(screen_tail)
+                               or parse_reset_time(matcher_view))
+                if rl_snippet:
+                    log.info(
+                        "rate-limit snippet captured (%d chars): %r",
+                        len(rl_snippet), rl_snippet[:300])
+                if reset_epoch is not None:
+                    import time as _time
+                    reason = classify_rate_limit_reason(
+                        float(reset_epoch) - _time.time())
+                    log.info("user=%s parsed official reset time epoch=%d "
+                             "reason=%s", self.user_id,
+                             int(reset_epoch), reason)
+                    try:
+                        await _send({
+                            "type": "rate_limit",
+                            "until_epoch": float(reset_epoch),
+                            "reason": reason,
+                            "source": "tui_modal",
+                        })
+                    except Exception:
+                        log.exception("failed to emit rate_limit event")
                 self.pending = None
                 await self.response.put(None)
             return self.response
@@ -163,6 +209,17 @@ async def _handle(session: WorkerSession, req_id: int, body: dict[str, Any]) -> 
         log.exception("user=%s stream relay failed", session.user_id)
         await _send({"type": "error", "id": req_id, "msg": str(e)})
         return
+    # Usage event (token counts parsed off SSE by the mitm addon) goes
+    # out BEFORE the end marker so the main process can correlate it
+    # with this req_id's still-registered channel — once `end` lands
+    # on the main side the channel is popped from session._channels.
+    if channel.usage is not None:
+        try:
+            payload = {"type": "usage", "id": req_id}
+            payload.update(channel.usage)
+            await _send(payload)
+        except Exception:
+            log.exception("user=%s failed sending usage event", session.user_id)
     await _send({"type": "end", "id": req_id})
 
 
@@ -213,6 +270,19 @@ async def amain() -> None:
     await session.start()
     await _send({"type": "ready"})
 
+    # Drain session.events into IPC — addons push to this queue when
+    # they spot something useful out of band (e.g. HTTP 429 headers
+    # parsed at response-time, before any body bytes arrive).
+    async def _events_relay():
+        while True:
+            ev = await session.events.get()
+            try:
+                await _send(ev)
+            except Exception:
+                log.exception("failed to send event: %s", ev)
+
+    events_task = asyncio.create_task(_events_relay(), name="events-relay")
+
     reader = await _stdin_lines()
     tasks: set[asyncio.Task] = set()
     try:
@@ -233,6 +303,7 @@ async def amain() -> None:
             tasks.add(t)
             t.add_done_callback(tasks.discard)
     finally:
+        events_task.cancel()
         for t in tasks:
             t.cancel()
         await session.stop()

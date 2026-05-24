@@ -155,6 +155,7 @@
     .stat-card.alive::before  { background: #10b981; }
     .stat-card.busy::before   { background: #3b82f6; }
     .stat-card.stuck::before  { background: #ef4444; }
+    .stat-card.limited::before{ background: #f59e0b; }
     .stat-card.version::before { background: #a855f7; }
     .stat-label {
       font-size: 11px; font-weight: 600;
@@ -167,23 +168,14 @@
       font-variant-numeric: tabular-nums;
     }
     .stat-value .sub { font-size: 15px; color: #6b7280; font-weight: 400; margin-left: 4px; }
-    .stat-card.alive .stat-value   { color: #34d399; }
-    .stat-card.busy  .stat-value   { color: #60a5fa; }
-    .stat-card.stuck .stat-value   { color: #f87171; }
+    .stat-card.alive   .stat-value { color: #34d399; }
+    .stat-card.busy    .stat-value { color: #60a5fa; }
+    .stat-card.stuck   .stat-value { color: #f87171; }
+    .stat-card.limited .stat-value { color: #fbbf24; }
     .stat-card.version .stat-value {
       font-size: 15px; font-weight: 500;
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       color: #d1d5db;
-    }
-
-    /* ── Pool chips ─────────────────────────────────────────── */
-    .pool-list { display: flex; flex-wrap: wrap; gap: 8px; }
-    .pool-chip {
-      background: rgba(59,130,246,0.1); color: #93c5fd;
-      border: 1px solid rgba(59,130,246,0.25);
-      padding: 4px 12px; border-radius: 999px;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 12px;
     }
 
     /* ── Worker table ───────────────────────────────────────── */
@@ -231,6 +223,26 @@
     .badge.stuck::before   { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.6); }
     .badge.dead    { background: rgba(156,163,175,0.1); color: #9ca3af; }
     .badge.dead::before    { background: #6b7280; }
+    .badge.limited { background: rgba(245,158,11,0.12); color: #fbbf24; }
+    .badge.limited::before { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.6); }
+    .badge.degraded { background: rgba(239,68,68,0.12); color: #f87171; }
+    .badge.degraded::before { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.6); }
+
+    /* ── Account card row ───────────────────────────────────── */
+    .account-row {
+      display: flex; align-items: center; gap: 14px;
+      padding: 10px 12px;
+      border: 1px solid #1f2433; border-radius: 9px;
+      background: #131722;
+    }
+    .account-row + .account-row { margin-top: 8px; }
+    .account-row.limited  { border-color: rgba(245,158,11,0.4); }
+    .account-row.degraded { border-color: rgba(239,68,68,0.45); }
+    .account-name {
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 13px; color: #f3f4f6; font-weight: 500; min-width: 140px;
+    }
+    .account-meta { font-size: 12px; color: #9ca3af; flex: 1; }
 
     /* ── Restart button (in table) ──────────────────────────── */
     .btn-restart {
@@ -330,6 +342,64 @@
       color: #4b5563; font-size: 13px;
     }
 
+    /* ── Usage panel ────────────────────────────────────────── */
+    .pill-group {
+      display: inline-flex; gap: 0;
+      border: 1px solid #2a3142; border-radius: 8px;
+      overflow: hidden; background: #131722;
+    }
+    .pill-group button {
+      background: transparent; color: #9ca3af;
+      border: none; padding: 6px 14px;
+      font-size: 12px; font-weight: 500;
+      border-right: 1px solid #2a3142;
+    }
+    .pill-group button:last-child { border-right: none; }
+    .pill-group button:hover { background: #1a1f2e; color: #e5e7eb; }
+    .pill-group button.active {
+      background: #3b82f6; color: #fff;
+    }
+    table.usage { width: 100%; border-collapse: collapse; }
+    table.usage th {
+      text-align: left;
+      font-size: 11px; font-weight: 600;
+      letter-spacing: 0.6px; text-transform: uppercase;
+      color: #6b7280;
+      padding: 12px 18px;
+      background: #0f1219;
+      border-bottom: 1px solid #1f2433;
+      white-space: nowrap;
+    }
+    table.usage th.num { text-align: right; }
+    table.usage td {
+      padding: 12px 18px;
+      font-size: 13px; color: #e5e7eb;
+      border-bottom: 1px solid #1a1f2e;
+      font-variant-numeric: tabular-nums;
+    }
+    table.usage td.num { text-align: right; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+    table.usage tr:last-child td { border-bottom: none; }
+    table.usage tr.totals td {
+      background: #0f1219;
+      font-weight: 600; color: #f3f4f6;
+      border-top: 1px solid #2a3142;
+    }
+    table.usage tr.expandable td:first-child {
+      cursor: pointer; user-select: none;
+    }
+    table.usage tr.expandable td:first-child::before {
+      content: '▸'; display: inline-block; width: 1em;
+      color: #6b7280; transition: transform 0.15s;
+    }
+    table.usage tr.expandable.open td:first-child::before { transform: rotate(90deg); }
+    table.usage tr.model-row td {
+      background: #0d1118; color: #9ca3af; font-size: 12px;
+      padding: 8px 18px 8px 36px;
+    }
+    table.usage tr.model-row td.num { color: #d1d5db; }
+    .usd-cell { color: #34d399; }
+    .usd-cell.dim { color: #6b7280; }
+
     /* ── Scrollbar dark ─────────────────────────────────────── */
     ::-webkit-scrollbar { width: 10px; height: 10px; }
     ::-webkit-scrollbar-track { background: #0a0c12; }
@@ -373,14 +443,55 @@
       </div>
     </div>
 
-    <!-- ── 用户池拓扑（隐藏空状态） ────────────────────────── -->
-    <div class="section" id="poolsSection" style="display:none;">
+    <!-- ── 账号配额状态（仅多账号模式） ─────────────────────── -->
+    <div class="section" id="accountsSection" style="display:none;">
       <div class="section-head">
-        <span class="section-title">用户池拓扑</span>
-        <span class="section-meta">按 token 分组，同组共享并发负载</span>
+        <span class="section-title">账号配额状态</span>
+        <span class="section-meta">达到限额的账号会被路由跳过；窗口到期自动恢复</span>
       </div>
       <div class="card">
-        <div class="pool-list" id="poolList"></div>
+        <div id="accountList"></div>
+      </div>
+    </div>
+
+    <!-- ── 用量统计 ─────────────────────────────────────────── -->
+    <div class="section" id="usageSection">
+      <div class="section-head">
+        <span class="section-title">用量统计</span>
+        <span class="section-meta">USD 仅为按 Anthropic API 价目表估算的等价成本；订阅账号实际按月计费</span>
+        <span class="spacer"></span>
+        <div class="section-controls">
+          <div class="pill-group" id="usageRangePills">
+            <button data-range="lifecycle">当前生命周期</button>
+            <button data-range="today" class="active">今天 (UTC)</button>
+            <button data-range="7d">最近 7 天</button>
+          </div>
+          <div class="pill-group" id="usageGroupPills">
+            <button data-group="account" class="active">按账号</button>
+            <button data-group="worker">按 worker</button>
+            <button data-group="litellm_user">按 LiteLLM 用户</button>
+          </div>
+        </div>
+      </div>
+      <div class="table-card">
+        <table class="usage">
+          <thead>
+            <tr>
+              <th id="usageKeyHeader">账号</th>
+              <th class="num">输入 tokens</th>
+              <th class="num">输出 tokens</th>
+              <th class="num">缓存写</th>
+              <th class="num">缓存读</th>
+              <th class="num">请求数</th>
+              <th class="num">估算 USD</th>
+            </tr>
+          </thead>
+          <tbody id="usageBody">
+            <tr><td colspan="7" class="empty-state">
+              加载 worker 数据后会自动拉取用量
+            </td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
@@ -407,6 +518,7 @@
           <thead>
             <tr>
               <th>用户 ID</th>
+              <th>账号</th>
               <th>状态</th>
               <th>模型</th>
               <th>LiteLLM 用户</th>
@@ -419,7 +531,7 @@
             </tr>
           </thead>
           <tbody id="workerBody">
-            <tr><td colspan="10" class="empty-state">
+            <tr><td colspan="11" class="empty-state">
               在右上角填写 API Key 后点击「立即刷新」加载数据
             </td></tr>
           </tbody>
@@ -438,8 +550,6 @@
     const refreshTokenBtn = $('refreshTokenBtn');
     const autoRefreshSel  = $('autoRefresh');
     const statsDiv        = $('stats');
-    const poolsSection    = $('poolsSection');
-    const poolList        = $('poolList');
     const workerBody      = $('workerBody');
     const lastUpdate      = $('lastUpdate');
     const banner          = $('banner');
@@ -490,6 +600,14 @@
 
     function classifyWorker(w) {
       if (!w.alive)           return { label: '已停止', cls: 'dead'    };
+      // Block account-issue workers ahead of in_flight: a worker whose
+      // account is rate-limited / degraded shouldn't show as "活跃"
+      // even if a stale in_flight count lingers. issue_kind tells us
+      // WHICH kind so the badge labels match the account row.
+      if (w.issue_kind === 'rate_limit')
+                              return { label: '已限流', cls: 'limited' };
+      if (w.issue_kind === 'degraded')
+                              return { label: '不可用', cls: 'degraded' };
       if (w.in_flight === 0)  return { label: '空闲',   cls: 'idle'    };
       if (w.stuck)            return { label: '异常',   cls: 'stuck'   };
       return                       { label: '处理中', cls: 'working' };
@@ -532,6 +650,10 @@
         render(data);
         clearBanner();
         lastUpdate.textContent = '最近更新于 ' + new Date().toLocaleTimeString('zh-CN');
+        // Usage panel is independent of /status — refresh it on the
+        // same cadence as the worker view so the numbers don't drift
+        // by a whole auto-refresh interval.
+        refreshUsage(true);
       } catch (e) {
         showBanner('请求失败：' + e.message);
       } finally {
@@ -542,6 +664,8 @@
     function render(data) {
       // stat grid
       const activeCount = (data.busy_count || 0) - (data.stuck_count || 0);
+      const rateLimitedAccts = data.rate_limited_account_count || 0;
+      const hasAccounts = (data.accounts || []).length > 0;
       statsDiv.innerHTML = `
         <div class="stat-card version">
           <div class="stat-label">CLI 版本</div>
@@ -559,22 +683,31 @@
           <div class="stat-label">异常</div>
           <div class="stat-value">${data.stuck_count}</div>
         </div>
+        ${hasAccounts ? `
+        <div class="stat-card limited">
+          <div class="stat-label">已限流账号</div>
+          <div class="stat-value">${rateLimitedAccts}<span class="sub">/ ${data.accounts.length}</span></div>
+        </div>
+        <div class="stat-card stuck">
+          <div class="stat-label">不可用账号</div>
+          <div class="stat-value">${data.degraded_account_count || 0}<span class="sub">/ ${data.accounts.length}</span></div>
+        </div>
+        ` : ''}
       `;
 
-      // pools
-      if (data.pools && data.pools.length > 0) {
-        poolsSection.style.display = '';
-        poolList.innerHTML = data.pools.map(p =>
-          `<span class="pool-chip">${p.map(escapeHtml).join(' · ')}</span>`
-        ).join('');
-      } else {
-        poolsSection.style.display = 'none';
-        poolList.innerHTML = '';
-      }
+      // account quota status (multi-account mode only)
+      renderAccounts(data.accounts || []);
 
-      // worker table
+      // worker table — hide the account column entirely in legacy
+      // single-account mode (every row reports account=null), so the
+      // UI stays identical to the pre-multi-account build for those
+      // deployments.
+      const showAccount = (data.workers || []).some(w => w.account);
+      const accountHeader = document.querySelector('table.workers th:nth-child(2)');
+      if (accountHeader) accountHeader.style.display = showAccount ? '' : 'none';
+
       if (!data.workers || data.workers.length === 0) {
-        workerBody.innerHTML = '<tr><td colspan="10" class="empty-state">暂无 worker</td></tr>';
+        workerBody.innerHTML = `<tr><td colspan="${showAccount ? 11 : 10}" class="empty-state">暂无 worker</td></tr>`;
         return;
       }
       workerBody.innerHTML = data.workers.map(w => {
@@ -633,9 +766,13 @@
             ${queueLine}
           `;
         }
+        const accountCell = showAccount
+          ? `<td class="mono">${w.account ? escapeHtml(w.account) : '<span class="text-muted">—</span>'}</td>`
+          : '<td style="display:none;"></td>';
         return `
           <tr>
             <td><strong>${escapeHtml(w.user_id)}</strong></td>
+            ${accountCell}
             <td><span class="badge ${status.cls}">${status.label}</span></td>
             <td>${modelCell}</td>
             <td>${litellmCell}</td>
@@ -652,6 +789,76 @@
       workerBody.querySelectorAll('.btn-restart').forEach(btn => {
         btn.addEventListener('click', () => restartWorker(btn.dataset.uid));
       });
+    }
+
+    const accountsSection = $('accountsSection');
+    const accountList     = $('accountList');
+
+    function fmtResetTime(epoch) {
+      // Show both the absolute moment (so the operator can sanity-check
+      // it against Anthropic's modal) and a "in X" delta.
+      if (!epoch) return '';
+      const d = new Date(epoch * 1000);
+      const abs = d.toLocaleString('zh-CN', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+      });
+      const utc = d.toLocaleString('en-US', {
+        timeZone: 'UTC',
+        month: 'short', day: 'numeric',
+        hour: 'numeric', minute: '2-digit', hour12: true,
+      });
+      return `${abs}（${utc} UTC）`;
+    }
+
+    function renderAccounts(accounts) {
+      if (!accounts || accounts.length === 0) {
+        accountsSection.style.display = 'none';
+        accountList.innerHTML = '';
+        return;
+      }
+      accountsSection.style.display = '';
+      // Map machine-readable reasons to short Chinese labels so the
+      // badge says "7天限额" / "5小时限额" instead of "weekly_limit" /
+      // "5hour_limit". Unknown values fall through to the raw token.
+      const REASON_LABEL = {
+        weekly_limit:  '7天限额',
+        '5hour_limit': '5小时限额',
+        rate_limit:    '限流',
+        manual:        '手动设置',
+        'prewarm-failed': 'prewarm 失败',
+      };
+      const labelFor = r => REASON_LABEL[r] || (r || '未知');
+
+      accountList.innerHTML = accounts.map(a => {
+        const kind = a.issue_kind;             // "rate_limit" | "degraded" | null
+        let cls = 'account-row';
+        let status;
+        let meta;
+        if (kind === 'rate_limit') {
+          cls += ' limited';
+          // Real rate-limit: badge orange, show reset moment.
+          status = `<span class="badge limited">${escapeHtml(labelFor(a.rate_limit_reason))}</span>`;
+          const reset = fmtResetTime(a.rate_limited_until);
+          meta = `${a.worker_count} worker 已限流 · 恢复于 ${reset} · 还剩 ${fmtSeconds(a.rate_limited_seconds_remaining)}`;
+        } else if (kind === 'degraded') {
+          cls += ' degraded';
+          // Unknown failure: badge red, prompt the operator to look at logs.
+          status = `<span class="badge degraded">不可用 (${escapeHtml(labelFor(a.rate_limit_reason))})</span>`;
+          meta = `${a.worker_count} worker 不可用 · ${fmtSeconds(a.rate_limited_seconds_remaining)}后自动重试 · 检查 docker logs 找根因（perms、token、CLI 状态）`;
+        } else {
+          status = `<span class="badge idle">正常</span>`;
+          meta = `${a.worker_count} worker 可用`;
+        }
+        return `
+          <div class="${cls}">
+            <span class="account-name">${escapeHtml(a.name)}</span>
+            ${status}
+            <span class="account-meta">${meta}</span>
+          </div>
+        `;
+      }).join('');
     }
 
     async function restartWorker(userId) {
@@ -741,13 +948,172 @@
           not_needed: 'OAuth 凭据仍在有效期内，无需刷新',
           failed: '刷新失败（详见服务端日志）',
         };
-        showToast(map[data.result] || ('刷新结果：' + data.result),
+        // Multi-account: append a per-account breakdown when there's
+        // more than one account, so the operator can tell at a glance
+        // which one was stale vs. which one failed.
+        let suffix = '';
+        if (data.details && Object.keys(data.details).length > 1) {
+          const counts = {};
+          Object.values(data.details).forEach(s => {
+            counts[s] = (counts[s] || 0) + 1;
+          });
+          suffix = ' · ' + Object.entries(counts)
+            .map(([s, n]) => `${s}: ${n}`).join(', ');
+        }
+        showToast((map[data.result] || ('刷新结果：' + data.result)) + suffix,
                   data.result === 'failed' ? 'error' : 'success');
       } catch (e) {
         showToast('请求失败：' + e.message, 'error');
       } finally {
         refreshTokenBtn.disabled = false;
       }
+    }
+
+    // ── Usage panel ───────────────────────────────────────────
+    const usageBody = $('usageBody');
+    const usageKeyHeader = $('usageKeyHeader');
+    const usageRangePills = $('usageRangePills');
+    const usageGroupPills = $('usageGroupPills');
+
+    let usageRange = localStorage.getItem('usageRange') || 'today';
+    let usageGroup = localStorage.getItem('usageGroup') || 'account';
+    const openRows = new Set();   // keys whose expanded breakdown is shown
+
+    function syncUsagePills() {
+      usageRangePills.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', b.dataset.range === usageRange);
+      });
+      usageGroupPills.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', b.dataset.group === usageGroup);
+      });
+      usageKeyHeader.textContent = {
+        account: '账号', worker: 'Worker', litellm_user: 'LiteLLM 用户'
+      }[usageGroup] || '键';
+    }
+    syncUsagePills();
+
+    usageRangePills.addEventListener('click', e => {
+      const b = e.target.closest('button[data-range]');
+      if (!b) return;
+      usageRange = b.dataset.range;
+      localStorage.setItem('usageRange', usageRange);
+      openRows.clear();
+      syncUsagePills();
+      refreshUsage();
+    });
+    usageGroupPills.addEventListener('click', e => {
+      const b = e.target.closest('button[data-group]');
+      if (!b) return;
+      usageGroup = b.dataset.group;
+      localStorage.setItem('usageGroup', usageGroup);
+      openRows.clear();
+      syncUsagePills();
+      refreshUsage();
+    });
+
+    function fmtTokens(n) {
+      if (n == null) return '0';
+      if (n < 1000) return String(n);
+      if (n < 1000000) return (n / 1000).toFixed(1) + 'K';
+      return (n / 1000000).toFixed(2) + 'M';
+    }
+    function fmtUsd(v) {
+      if (v == null) return '<span class="usd-cell dim">—</span>';
+      if (v < 0.01)  return '<span class="usd-cell">&lt;$0.01</span>';
+      return '<span class="usd-cell">$' + v.toFixed(2) + '</span>';
+    }
+
+    async function refreshUsage(silent = false) {
+      const auth = authHeader();
+      if (!auth) return;
+      try {
+        const url = `/admin/usage?range=${encodeURIComponent(usageRange)}` +
+                    `&group_by=${encodeURIComponent(usageGroup)}`;
+        const resp = await fetch(url, { headers: auth });
+        if (resp.status === 503) {
+          // Server includes the actual reason in `detail` — surface it
+          // verbatim so a sqlite init failure (perms, missing dir) shows
+          // up directly instead of being mistaken for a config toggle issue.
+          let reason = '用量统计未启用';
+          try {
+            const j = await resp.json();
+            if (j && j.detail) reason = j.detail;
+          } catch {}
+          usageBody.innerHTML = `<tr><td colspan="7" class="empty-state">
+            ${escapeHtml(reason)}
+          </td></tr>`;
+          return;
+        }
+        if (!resp.ok) {
+          if (!silent) showToast(`用量加载失败：HTTP ${resp.status}`, 'error');
+          return;
+        }
+        renderUsage(await resp.json());
+      } catch (e) {
+        if (!silent) showToast('用量加载失败：' + e.message, 'error');
+      }
+    }
+
+    function renderUsage(data) {
+      const rows = data.rows || [];
+      if (rows.length === 0) {
+        usageBody.innerHTML = `<tr><td colspan="7" class="empty-state">
+          所选范围内暂无用量数据
+        </td></tr>`;
+        return;
+      }
+      const out = [];
+      rows.forEach(r => {
+        const isOpen = openRows.has(r.key);
+        out.push(`
+          <tr class="expandable ${isOpen ? 'open' : ''}" data-key="${escapeHtml(r.key)}">
+            <td><strong>${escapeHtml(r.key)}</strong></td>
+            <td class="num">${fmtTokens(r.input_tokens)}</td>
+            <td class="num">${fmtTokens(r.output_tokens)}</td>
+            <td class="num">${fmtTokens(r.cache_creation_tokens)}</td>
+            <td class="num">${fmtTokens(r.cache_read_tokens)}</td>
+            <td class="num">${r.request_count}</td>
+            <td class="num">${fmtUsd(r.estimated_usd)}</td>
+          </tr>
+        `);
+        if (isOpen && r.by_model && r.by_model.length > 0) {
+          r.by_model.forEach(m => {
+            out.push(`
+              <tr class="model-row">
+                <td>${escapeHtml(m.model)}</td>
+                <td class="num">${fmtTokens(m.input_tokens)}</td>
+                <td class="num">${fmtTokens(m.output_tokens)}</td>
+                <td class="num">${fmtTokens(m.cache_creation_tokens)}</td>
+                <td class="num">${fmtTokens(m.cache_read_tokens)}</td>
+                <td class="num">${m.request_count}</td>
+                <td class="num">${fmtUsd(m.estimated_usd)}</td>
+              </tr>
+            `);
+          });
+        }
+      });
+      const tot = data.totals || {};
+      out.push(`
+        <tr class="totals">
+          <td>合计</td>
+          <td class="num">${fmtTokens(tot.input_tokens)}</td>
+          <td class="num">${fmtTokens(tot.output_tokens)}</td>
+          <td class="num">${fmtTokens(tot.cache_creation_tokens)}</td>
+          <td class="num">${fmtTokens(tot.cache_read_tokens)}</td>
+          <td class="num">${tot.request_count || 0}</td>
+          <td class="num">${fmtUsd(tot.estimated_usd)}</td>
+        </tr>
+      `);
+      usageBody.innerHTML = out.join('');
+
+      usageBody.querySelectorAll('tr.expandable').forEach(tr => {
+        tr.querySelector('td:first-child').addEventListener('click', () => {
+          const key = tr.dataset.key;
+          if (openRows.has(key)) openRows.delete(key);
+          else                   openRows.add(key);
+          renderUsage(data);   // re-render in place (data is still valid)
+        });
+      });
     }
 
     // ── Hover tooltip for truncated user-message preview ──────

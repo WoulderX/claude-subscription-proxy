@@ -2,12 +2,12 @@ listen_host: 0.0.0.0
 listen_port: 8787
 
 mitm:
-  port_base: 18000          # each user session takes one port starting here
+  port_base: 18000          # each worker takes one port starting here
   ca_cert: /home/coder/.mitmproxy/mitmproxy-ca-cert.pem
 
 claude:
   binary: claude            # path to claude code CLI
-  home_template: /data/users/{user_id}   # per-user HOME (so each user has own ~/.claude/)
+  home_template: /data/users/{user_id}   # per-worker HOME (so each has own ~/.claude/)
   restart_interval_seconds: 14400        # 4h — must stay under OAuth token lifetime (~8h) so workers always restart before their in-memory token expires; main process handles refresh on disk
 
   # Operational tuning knobs. All optional; defaults match what was
@@ -23,20 +23,53 @@ claude:
     restart_check_interval_seconds: 60   # how often the restarter loop polls workers for age-based recycling
 
 # Centralised proactive OAuth token refresh. Eliminates the per-worker
-# refresh_token rotation race. Disable only for debugging — with this
-# off, workers self-refresh and the multi-worker race can re-emerge.
+# refresh_token rotation race — works per-account in multi-account mode.
 oauth_refresh:
   enabled: true
   check_interval_seconds: 300                  # how often to check expiry
   refresh_when_expires_within_seconds: 3600    # refresh if token expires within this window
 
-# bearer token -> user_id (scalar) OR list of user_ids (pool).
-# A list-form token round-robins requests across the listed workers,
-# so a single key in LiteLLM can drive N parallel claude PTYs.
-users:
-  sk-internal-alice: alice
-  sk-internal-bob: bob
-  sk-internal-litellm:
-    - litellm-0
-    - litellm-1
-    - litellm-2
+# Token-usage accounting (powers /admin/usage and the 用量统计 panel
+# on /ui). Each completed /v1/messages request appends one row to the
+# sqlite db with per-account / per-worker / per-LiteLLM-user token counts.
+usage:
+  enabled: true
+  db_path: ./data/usage.db                     # mount a volume here to keep history across rebuilds
+
+# Multi-account mode. Each entry maps an account name to a host-side
+# .claude/ content directory (mounted in via docker-compose) and a
+# worker replica count. Worker user_ids are auto-generated as
+# `<account>-0`, `<account>-1`, ... up to `<account>-(workers-1)`.
+#
+# All workers belonging to the same account share that .claude/ via
+# symlink, so the main-process OAuth refresher remains the sole writer
+# of each account's .credentials.json (no multi-worker refresh_token
+# rotation race). At startup, prewarm runs in parallel across accounts
+# but serially within an account (so the per-OAuth bootstrap burst
+# doesn't trip Anthropic's rate limiter).
+accounts:
+  claude-1:
+    dir: /data/shared-auth/claude-1
+    workers: 5
+  claude-2:
+    dir: /data/shared-auth/claude-2
+    workers: 5
+
+# Single front-door key — pools all auto-generated workers from every
+# account behind one Bearer token. SessionManager.pick load-balances
+# requests across the full set (idle-first, then fewest in-flight + RR).
+# Generate with:  echo "sk-internal-$(openssl rand -hex 24)"
+api_key: sk-internal-master
+
+# `users:` is OPTIONAL when `accounts:` + `api_key:` are set — it's
+# auto-populated. Set it explicitly only if you need finer-grained
+# routing (e.g. multiple keys, mixed pools, dedicated workers per
+# tenant). Every referenced user_id must match an auto-generated one:
+#
+# users:
+#   sk-key-a: [claude-1-0, claude-1-1, claude-1-2, claude-1-3, claude-1-4]
+#   sk-key-b: [claude-2-0, claude-2-1, claude-2-2, claude-2-3, claude-2-4]
+#
+# Legacy single-account mode (no `accounts:` block) takes users:
+# directly with arbitrary names; every worker symlinks to the operator's
+# ~/.claude.

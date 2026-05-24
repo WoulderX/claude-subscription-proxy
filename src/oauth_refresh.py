@@ -19,7 +19,12 @@ Workers never refresh on their own because the manager's scheduled
 restart interval is kept comfortably shorter than the original token
 lifetime — workers always get recycled (and re-read the shared
 .credentials.json from disk) before their in-memory AT would expire.
-"""
+
+Multi-account mode: each account has its own .credentials.json living
+under its own /data/shared-auth/<account>/ directory. The refresher
+walks every configured path each tick; rotations are independent per
+account, but the single-writer invariant still holds because no other
+process in the deployment writes any of those files."""
 from __future__ import annotations
 
 import asyncio
@@ -48,28 +53,45 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 
 class OAuthRefresher:
-    """Watches a credentials.json file and refreshes the OAuth token
-    before it expires. Designed to be the only place in the deployment
-    that talks to /v1/oauth/token — keeps refresh_token rotation
-    single-writer."""
+    """Watches one or more credentials.json files and refreshes each
+    account's OAuth token before it expires. Designed to be the only
+    place in the deployment that talks to /v1/oauth/token — keeps
+    refresh_token rotation single-writer per account.
+
+    Each account is treated independently: a slow / failed refresh on
+    one does not block the loop for the others. Per-account refresh
+    happens serially within a tick (we do not parallelize the HTTP POST
+    across accounts) because that codepath is rare (every ~check_interval
+    AND token-expiring-within-window) and serial is simpler to reason
+    about — there's no contention to win by parallelizing."""
 
     def __init__(
         self,
-        credentials_path: Path,
+        credentials_paths: list[Path],
         check_interval_seconds: float = 300.0,
         refresh_when_expires_within_seconds: float = 3600.0,
     ) -> None:
-        self.credentials_path = credentials_path
+        if not credentials_paths:
+            raise ValueError("OAuthRefresher needs at least one credentials path")
+        self.credentials_paths = list(credentials_paths)
         self.check_interval = check_interval_seconds
         self.refresh_window = refresh_when_expires_within_seconds
 
-    async def refresh_now(self) -> str:
-        """Force one immediate check + refresh, bypassing the periodic
-        loop's sleep. Returns a short status string for admin tooling:
-        "refreshed" (we hit /v1/oauth/token and got a new token),
-        "not_needed" (token has more life than refresh_window), or
-        "failed" (any error). Used by POST /admin/refresh-now."""
-        creds = self._read_credentials()
+    async def refresh_now(self) -> dict[str, str]:
+        """Force one immediate refresh attempt across all accounts,
+        bypassing the periodic loop's sleep. Returns a {path: status}
+        map where status is one of:
+          "refreshed"  — hit /v1/oauth/token and got a new token
+          "not_needed" — token has more life than refresh_window
+          "failed"     — any error (logged; refresh loop will retry)
+        Used by POST /admin/refresh-now."""
+        out: dict[str, str] = {}
+        for path in self.credentials_paths:
+            out[str(path)] = await self._refresh_path_now(path)
+        return out
+
+    async def _refresh_path_now(self, path: Path) -> str:
+        creds = self._read_credentials(path)
         if creds is None:
             return "failed"
         oauth = creds.get("claudeAiOauth")
@@ -87,17 +109,18 @@ class OAuthRefresher:
             return "failed"
         oauth.update(new_fields)
         creds["claudeAiOauth"] = oauth
-        self._atomic_write(creds)
-        log.info("forced refresh: token had %.0fs left; new expiresAt=%d",
-                 remaining, oauth["expiresAt"])
+        self._atomic_write(path, creds)
+        log.info("[%s] forced refresh: token had %.0fs left; new expiresAt=%d",
+                 path, remaining, oauth["expiresAt"])
         return "refreshed"
 
     async def initial_refresh(self) -> None:
-        """One-shot pre-startup check. Call before spawning any worker so
-        that workers' first read of .credentials.json picks up a fresh
-        token if the deployment had been sitting on a stale one. Errors
-        are logged but never raised — the periodic loop will retry, and
-        we don't want a refresh hiccup to block service startup."""
+        """One-shot pre-startup check across all accounts. Call before
+        spawning any worker so that workers' first read of
+        .credentials.json picks up a fresh token if the deployment had
+        been sitting on a stale one. Errors are logged but never raised
+        — the periodic loop will retry, and we don't want a refresh
+        hiccup to block service startup."""
         try:
             await self._tick()
         except Exception:
@@ -108,9 +131,9 @@ class OAuthRefresher:
         """Periodic check loop. Designed to run as a background asyncio
         task for the lifetime of the FastAPI app. Catches and logs all
         per-tick errors so the loop never dies."""
-        log.info("oauth refresher started credentials=%s "
+        log.info("oauth refresher started accounts=%d "
                  "check_interval=%.0fs refresh_when_expires_within=%.0fs",
-                 self.credentials_path, self.check_interval,
+                 len(self.credentials_paths), self.check_interval,
                  self.refresh_window)
         while True:
             try:
@@ -124,27 +147,38 @@ class OAuthRefresher:
                               "will retry next interval")
 
     async def _tick(self) -> None:
-        creds = self._read_credentials()
+        for path in self.credentials_paths:
+            try:
+                await self._tick_path(path)
+            except Exception:
+                log.exception("oauth refresher tick failed for %s; "
+                              "other accounts continue", path)
+
+    async def _tick_path(self, path: Path) -> None:
+        creds = self._read_credentials(path)
         if creds is None:
             return
         oauth = creds.get("claudeAiOauth")
         if not isinstance(oauth, dict):
-            log.warning("credentials file missing claudeAiOauth block; skip")
+            log.warning("[%s] credentials file missing claudeAiOauth block; skip",
+                        path)
             return
         expires_at_ms = oauth.get("expiresAt")
         if not isinstance(expires_at_ms, (int, float)):
-            log.warning("credentials file missing/invalid expiresAt; skip")
+            log.warning("[%s] credentials file missing/invalid expiresAt; skip",
+                        path)
             return
         remaining = expires_at_ms / 1000.0 - time.time()
         if remaining > self.refresh_window:
             return  # plenty of life left
         rt = oauth.get("refreshToken")
         if not isinstance(rt, str) or not rt:
-            log.warning("credentials file missing refreshToken; cannot refresh")
+            log.warning("[%s] credentials file missing refreshToken; "
+                        "cannot refresh", path)
             return
 
-        log.info("token expires in %.0fs (<%.0fs threshold); refreshing",
-                 remaining, self.refresh_window)
+        log.info("[%s] token expires in %.0fs (<%.0fs threshold); refreshing",
+                 path, remaining, self.refresh_window)
         new_fields = await self._refresh(rt)
         if new_fields is None:
             return  # error already logged; loop will retry next tick
@@ -154,22 +188,42 @@ class OAuthRefresher:
         # refreshes of the same RT chain).
         oauth.update(new_fields)
         creds["claudeAiOauth"] = oauth
-        self._atomic_write(creds)
+        self._atomic_write(path, creds)
         new_remaining = oauth["expiresAt"] / 1000.0 - time.time()
-        log.info("token refreshed; new expiresAt=%d (in %.0fs)",
-                 oauth["expiresAt"], new_remaining)
+        log.info("[%s] token refreshed; new expiresAt=%d (in %.0fs)",
+                 path, oauth["expiresAt"], new_remaining)
 
-    def _read_credentials(self) -> dict[str, Any] | None:
+    def _read_credentials(self, path: Path) -> dict[str, Any] | None:
         try:
-            return json.loads(self.credentials_path.read_text())
+            return json.loads(path.read_text())
         except FileNotFoundError:
-            log.warning("credentials file not found at %s", self.credentials_path)
+            log.warning("credentials file not found at %s", path)
             return None
         except json.JSONDecodeError:
-            log.warning("credentials file is not valid JSON; skip")
+            log.warning("[%s] credentials file is not valid JSON; skip", path)
+            return None
+        except PermissionError as e:
+            # Loud about this one because the silent failure mode is
+            # particularly nasty: workers boot, claude CLI reads them
+            # as "Not logged in", prewarm times out, account gets
+            # marked rate-limited — operator chases a phantom quota
+            # issue instead of running one chown.
+            try:
+                st = path.stat()
+                owner_uid = st.st_uid
+                file_mode = oct(st.st_mode & 0o777)
+            except OSError:
+                owner_uid = "?"
+                file_mode = "?"
+            log.error(
+                "[%s] CANNOT READ credentials file (uid=%s mode=%s): %s. "
+                "Container runs as uid 1000 — host file must be readable "
+                "by that uid. Fix on the host:\n"
+                "    sudo chown -R 1000:1000 /data/shared-auth",
+                path, owner_uid, file_mode, e)
             return None
         except OSError as e:
-            log.warning("credentials file read error: %s", e)
+            log.warning("[%s] credentials file read error: %s", path, e)
             return None
 
     async def _refresh(self, refresh_token: str) -> dict[str, Any] | None:
@@ -209,13 +263,13 @@ class OAuthRefresher:
             "expiresAt": int((time.time() + expires_in) * 1000),
         }
 
-    def _atomic_write(self, creds: dict[str, Any]) -> None:
+    def _atomic_write(self, path: Path, creds: dict[str, Any]) -> None:
         """Mirror claude CLI's own write pattern (write tmp + rename) so
         a worker reading .credentials.json mid-refresh sees either the
         old or the new file, never a partial. Tempfile lives in the
         same directory so the rename is on the same filesystem (cross-
         device rename would error)."""
-        d = self.credentials_path.parent
+        d = path.parent
         fd, tmp = tempfile.mkstemp(prefix=".credentials.", suffix=".tmp",
                                    dir=str(d))
         try:
@@ -223,7 +277,7 @@ class OAuthRefresher:
                 json.dump(creds, f)
             # Match the 0600 perms on the original .credentials.json.
             os.chmod(tmp, 0o600)
-            os.replace(tmp, self.credentials_path)
+            os.replace(tmp, path)
         except Exception:
             try:
                 os.unlink(tmp)

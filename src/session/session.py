@@ -7,13 +7,19 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..config import Config
+from ..rate_limit import (
+    classify_rate_limit_reason,
+    extract_reset_from_response,
+    parse_reset_time,
+)
 from .state import ResponseChannel
 
 log = logging.getLogger(__name__)
@@ -72,19 +78,37 @@ class ClaudeSession:
     a per-session asyncio lock — one outbound /v1/messages per claude
     process at a time."""
 
-    def __init__(self, user_id: str, mitm_port: int, config: Config) -> None:
+    def __init__(self, user_id: str, mitm_port: int, config: Config,
+                 on_rate_limit: Callable[[str, str, float], None] | None = None,
+                 on_usage: Callable[[str, dict], None] | None = None) -> None:
         self.user_id = user_id
         self.mitm_port = mitm_port
         self.config = config
         self.lock = asyncio.Lock()  # one in-flight request per user
         self.last_used = time.monotonic()
         self.started_at = time.monotonic()
+        # Wall-clock variant of started_at. Used to scope the /admin/usage
+        # "current worker lifecycle" range: we filter the sqlite event
+        # log by ts >= started_at_wall. Refreshed by restart().
+        self.started_at_wall = time.time()
 
         self.proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._next_req_id = 0
         self._channels: dict[int, ResponseChannel] = {}
         self._closed = False
+        # Called when we spot `rate_limit_error` in the head of an SSE
+        # response: signature (user_id, reason, window_seconds). The
+        # manager wires this up to its per-account rate-limit table so
+        # subsequent routing skips this worker's account until the
+        # window expires.
+        self._on_rate_limit = on_rate_limit
+        # Called when a request completes with parsed token usage:
+        # signature (user_id, usage_payload). Manager wires this to its
+        # UsageStore; the payload includes the litellm user id from
+        # the channel's body_summary so the store row gets correctly
+        # tagged. None disables accounting (usage:enabled=false).
+        self._on_usage = on_usage
 
     async def start(self) -> None:
         home = self.config.user_home(self.user_id).resolve()
@@ -149,32 +173,89 @@ class ClaudeSession:
 
     def _seed_home(self, home: Path) -> None:
         """Populate the user's isolated HOME so claude code skips its
-        first-run onboarding and shares the operator's OAuth credentials.
+        first-run onboarding and shares this worker's assigned account
+        credentials.
 
           - $HOME/.claude.json  -> copied once. claude CLI mutates this
             heavily per session, so each user keeps a private copy to
             avoid concurrent-write races between workers.
           - $HOME/.claude/      -> SYMLINKED (entire directory) to the
-            operator's ~/.claude/. Sharing at the directory level means a
-            claude-CLI atomic token refresh (write tmp + rename) happens
-            *inside* the shared directory — the new file lands directly
-            at the operator's source path. All other workers transparently
-            read the rotated token on their next call; no copy-back or
-            propagation logic is needed. Per-user transcript isolation
-            still works because claude stores sessions under cwd-encoded
-            subdirs (.claude/projects/<encoded-cwd>/sessions/), and each
-            worker's cwd is its own HOME."""
-        op_home = Path(os.path.expanduser("~")).resolve()
+            assigned account's directory. Sharing at the directory level
+            means a claude-CLI atomic token refresh (write tmp + rename)
+            happens *inside* the shared directory — the new file lands
+            directly at the source path. All other workers on the same
+            account transparently read the rotated token on their next
+            call; no copy-back or propagation logic is needed. Per-user
+            transcript isolation still works because claude stores
+            sessions under cwd-encoded subdirs
+            (.claude/projects/<encoded-cwd>/sessions/), and each worker's
+            cwd is its own HOME.
+
+        Source-of-truth resolution for the .claude/ symlink target:
+          - Multi-account mode: config.account_for_user(user_id).dir
+            — the configured `dir:` IS the .claude/ content directory
+            (e.g. /data/shared-auth/claude-1 holds .credentials.json
+            directly), matching the legacy bind-mount convention where
+            /data/shared-auth/claude was mounted to /home/coder/.claude.
+          - Legacy single-account mode: operator's ~/.claude.
+        Multiple workers belonging to the SAME account safely share the
+        directory — same invariant as the original single-account design,
+        just scoped per-account: main-process OAuth refresher is the
+        sole writer of .credentials.json per account.
+
+        The .claude.json marker (sibling of .claude/, not inside) holds
+        the per-account user identity — `oauthAccount` block with email,
+        accountUuid, organizationUuid etc., written by `claude /login`.
+        claude code 2.1.139+ gates the TUI input prompt on this block:
+        without it, even with a valid .credentials.json the status bar
+        reports "Not logged in" and a triggered keystroke won't fire a
+        /v1/messages call (prewarm then mitm-times-out).
+
+        Source-of-truth resolution for .claude.json (multi-account):
+          1. `<account.dir>/.claude.json` — recommended. Lives inside
+             the account dir alongside .credentials.json, so a single
+             bind mount per account covers everything. claude CLI never
+             writes to this path (it writes to per-worker
+             `<HOME>/.claude.json`, sibling of `<HOME>/.claude/` — not
+             inside it), so the seed file is safely read-only here.
+          2. `<account.dir>.json` (sibling file) — legacy split layout.
+          3. Operator ~/.claude.json — last-resort fallback (typically
+             just the hasCompletedOnboarding stub from entrypoint).
+        Legacy single-account mode always uses #3."""
+        account = self.config.account_for_user(self.user_id)
+        if account is not None:
+            src_claude = Path(os.path.expanduser(account.dir)).resolve()
+            inside = src_claude / ".claude.json"
+            sibling = src_claude.parent / f"{src_claude.name}.json"
+            if inside.is_file():
+                src_marker = inside
+            elif sibling.is_file():
+                src_marker = sibling
+            else:
+                src_marker = Path(os.path.expanduser("~")) / ".claude.json"
+        else:
+            src_claude = (Path(os.path.expanduser("~")) / ".claude").resolve()
+            src_marker = Path(os.path.expanduser("~")) / ".claude.json"
+
         marker = home / ".claude.json"
-        src_marker = op_home / ".claude.json"
         if src_marker.is_file() and not marker.exists():
             shutil.copy2(src_marker, marker)
-            log.info("seeded %s/.claude.json", home)
+            log.info("seeded %s/.claude.json from %s", home, src_marker)
+        elif not src_marker.is_file() and not marker.exists():
+            log.warning(
+                "no .claude.json source for user=%s (looked at %s); "
+                "claude CLI may show 'Not logged in' and prewarm may fail. "
+                "Place the file from your login machine's ~/.claude.json "
+                "at the expected path.",
+                self.user_id, src_marker)
 
         claude_dir = home / ".claude"
-        src_claude = op_home / ".claude"
         if not src_claude.is_dir():
-            log.warning("operator .claude/ missing at %s", src_claude)
+            log.warning(
+                "account .claude/ missing at %s (user=%s account=%s); "
+                "worker will start in a not-yet-logged-in state",
+                src_claude, self.user_id,
+                account.dir if account is not None else "<legacy>")
             return
 
         # Idempotent: leave a correct symlink alone, otherwise rebuild it.
@@ -267,7 +348,10 @@ class ClaudeSession:
                            "body": body}) + "\n"
         self.proc.stdin.write(line.encode())
         await self.proc.stdin.drain()
-        log.info("user=%s submitted req id=%d", self.user_id, req_id)
+        # DEBUG: per-request and largely redundant with the mitm
+        # hijack line. Keep the failure path (worker not running)
+        # visible via the exception above.
+        log.debug("user=%s submitted req id=%d", self.user_id, req_id)
         return channel
 
     async def _read_loop(self) -> None:
@@ -283,10 +367,29 @@ class ClaudeSession:
                 except json.JSONDecodeError:
                     log.warning("malformed worker stdout: %r", line[:200])
                     continue
-                req_id = msg.get("id")
                 t = msg.get("type")
+                # Session-wide events (no req_id) come first; these
+                # don't correlate to a specific in-flight channel.
+                if t == "rate_limit":
+                    # Worker emitted a parsed reset-time event (TUI
+                    # modal said e.g. "resets May 27, 12am UTC"). The
+                    # absolute epoch lets us mark the account precisely
+                    # without falling back to a heuristic window.
+                    self._handle_worker_rate_limit_event(msg)
+                    continue
+                req_id = msg.get("id")
                 channel = self._channels.get(req_id)
                 if channel is None:
+                    continue
+                if t == "usage":
+                    # Token-usage event emitted by worker AFTER the
+                    # channel has been drained but BEFORE the end
+                    # marker, so the channel is still in _channels and
+                    # its body_summary (carrying the original litellm
+                    # user id) is still accessible. We hand off to the
+                    # manager callback synchronously — sqlite insert
+                    # is fast, no need to spawn a task.
+                    self._handle_worker_usage_event(channel, msg)
                     continue
                 if t == "chunk":
                     try:
@@ -297,6 +400,7 @@ class ClaudeSession:
                         channel.queue.put_nowait(data)
                         channel.last_chunk_at = time.monotonic()
                         channel.bytes_received += len(data)
+                        self._maybe_detect_rate_limit(channel, data)
                 elif t == "end":
                     channel.queue.put_nowait(None)
                     self._channels.pop(req_id, None)
@@ -314,6 +418,143 @@ class ClaudeSession:
             for ch in list(self._channels.values()):
                 ch.queue.put_nowait(None)
             self._channels.clear()
+
+    # Roughly 4 KB head buffer is plenty to spot `rate_limit_error`:
+    # Anthropic emits the error event as the very first SSE chunk on a
+    # rate-limited request, well within this window. Sniffing further
+    # is wasted work — once we either detect or pass this threshold we
+    # stop scanning.
+    _RL_HEAD_LIMIT = 4096
+    _RL_MARKER = b"rate_limit_error"
+    # Heuristic regex for the human-readable hint in the error message.
+    # claude.ai surfaces "weekly", "5-hour" / "5 hour" wording when the
+    # respective limit trips. Anything else falls back to a default
+    # window that lets the next real request act as the recheck probe.
+    _RL_WEEKLY_HINT = re.compile(rb"weekly\s+limit", re.IGNORECASE)
+    _RL_5H_HINT = re.compile(rb"(5[\s-]?hour|five[\s-]?hour)\s+limit", re.IGNORECASE)
+
+    def _maybe_detect_rate_limit(self, channel: ResponseChannel,
+                                 data: bytes) -> None:
+        """If a chunk shows `rate_limit_error`, signal the manager so it
+        marks this worker's whole account as rate-limited and routes
+        around it until the window expires. Scanning bound: at most
+        `_RL_HEAD_LIMIT` bytes per channel, then we give up."""
+        if channel._rl_scanned or self._on_rate_limit is None:
+            return
+        channel._rl_head.extend(data)
+        found = self._RL_MARKER in channel._rl_head
+        if not found and len(channel._rl_head) < self._RL_HEAD_LIMIT:
+            return
+        # One-shot: either detected or past the head — release memory.
+        channel._rl_scanned = True
+        head_bytes = bytes(channel._rl_head)
+        channel._rl_head = bytearray()
+        if not found:
+            return
+        # Pick a window from the message text. We err on the SHORT side
+        # because pick() will simply skip this account until expiry —
+        # marking too long would needlessly black-hole an account that
+        # has already recovered. The next real request after expiry
+        # serves as a recheck probe, and if still limited gets re-marked.
+        # Try every reset-extraction path we know — Anthropic returns
+        # reset info in various shapes ("resets MMM DD" text, ISO key,
+        # retry-after integer, etc.) and we want the precise time
+        # whenever possible.
+        try:
+            head_text = head_bytes.decode("utf-8", "replace")
+        except Exception:
+            head_text = ""
+        reset_epoch = extract_reset_from_response(head_text)
+
+        if reset_epoch is not None:
+            # Time delta is the authoritative classifier — a body that
+            # SAYS "5-hour limit" but RESETS 4 days out is actually the
+            # weekly window. Body-text hints (_RL_WEEKLY_HINT / _5H_HINT)
+            # are unreliable; size of the window isn't.
+            window = max(60.0, reset_epoch - time.time())
+            reason = classify_rate_limit_reason(window)
+        else:
+            # No parseable reset time — fall back to body text hints
+            # and a conservative default window. Log the head excerpt
+            # so a future failure mode (a wording variant we don't
+            # recognise yet) is diagnosable.
+            if self._RL_WEEKLY_HINT.search(head_bytes):
+                reason, window = "weekly_limit", 3600.0
+            elif self._RL_5H_HINT.search(head_bytes):
+                reason, window = "5hour_limit", 1800.0
+            else:
+                reason, window = "rate_limit", 600.0
+            excerpt = head_text[:600].replace("\n", " ").replace("\r", " ")
+            log.warning(
+                "user=%s rate_limit_error detected but no reset time "
+                "parsed; using %.0fs default + %s. Body head excerpt: %r",
+                self.user_id, window, reason, excerpt)
+        try:
+            self._on_rate_limit(self.user_id, reason, window)
+        except Exception:
+            log.exception("rate-limit callback failed user=%s", self.user_id)
+
+    def _handle_worker_usage_event(self, channel: ResponseChannel,
+                                   msg: dict) -> None:
+        """Take the parsed token counts off a worker `usage` IPC line
+        and ship them to the manager's UsageStore. The IPC payload
+        already has the model + token fields; we add the litellm user
+        identifier (from the channel's body_summary) and the worker
+        user_id so the store row can be filtered and grouped by all
+        three axes without a join.
+
+        The "litellm user" identifier follows what the /ui Worker table
+        shows: `user_api_key_alias` first (the virtual-key alias an
+        operator configures in LiteLLM and recognises), falling back to
+        `user_id` (often a hash or empty) and finally the masked key
+        hash. Mismatch with the Worker view confuses operators — same
+        request should be labeled the same in both panels."""
+        if self._on_usage is None:
+            return
+        litellm_user = None
+        litellm = channel.body_summary.get("litellm") if isinstance(
+            channel.body_summary, dict) else None
+        if isinstance(litellm, dict):
+            for k in ("user_api_key_alias", "user_id", "user_api_key_hash"):
+                v = litellm.get(k)
+                if isinstance(v, str) and v:
+                    litellm_user = v
+                    break
+        payload = {
+            "model": msg.get("model"),
+            "input_tokens": int(msg.get("input_tokens") or 0),
+            "output_tokens": int(msg.get("output_tokens") or 0),
+            "cache_creation_tokens": int(msg.get("cache_creation_tokens") or 0),
+            "cache_read_tokens": int(msg.get("cache_read_tokens") or 0),
+            "litellm_user": litellm_user,
+        }
+        try:
+            self._on_usage(self.user_id, payload)
+        except Exception:
+            log.exception("usage event callback failed user=%s",
+                          self.user_id)
+
+    def _handle_worker_rate_limit_event(self, msg: dict) -> None:
+        """Translate the worker's IPC rate_limit event into a callback
+        to the manager. Worker side parses the TUI modal's reset hint
+        (precise epoch); we just bound the window defensively and
+        invoke the manager's account-level marker."""
+        if self._on_rate_limit is None:
+            return
+        until_epoch = msg.get("until_epoch")
+        if not isinstance(until_epoch, (int, float)):
+            return
+        reason = msg.get("reason") or "rate_limit"
+        # Floor at 60s (don't ever mark for less — defends against a
+        # parse that yields a stale-past timestamp); cap at 14 days so
+        # a buggy parse can't lock out an account indefinitely.
+        window = max(60.0, min(float(until_epoch) - time.time(),
+                               14 * 86400))
+        try:
+            self._on_rate_limit(self.user_id, reason, window)
+        except Exception:
+            log.exception("rate-limit event callback failed user=%s",
+                          self.user_id)
 
     def idle_seconds(self) -> float:
         return time.monotonic() - self.last_used
@@ -334,5 +575,6 @@ class ClaudeSession:
         self._next_req_id = 0
         self._channels = {}
         self.started_at = time.monotonic()
+        self.started_at_wall = time.time()
         self.last_used = time.monotonic()
         await self.start()

@@ -22,11 +22,13 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..config import Config
 from ..oauth_refresh import OAuthRefresher
+from ..rate_limit import parse_reset_time
 from ..session.manager import SessionManager
+from ..usage import UsageStore, estimate_usd
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +67,9 @@ def build_router(
     config_path: str | None,
     auth_dep,
     refresher_state: SimpleNamespace,
-    credentials_path,
+    credentials_paths,
+    usage_store: UsageStore | None = None,
+    usage_disabled_reason: str | None = None,
 ) -> APIRouter:
     """Build the admin router.
 
@@ -123,7 +127,7 @@ def build_router(
 
         # --- oauth_refresh.* ---
         await _apply_oauth_refresh(
-            config, new_config, refresher_state, credentials_path,
+            config, new_config, refresher_state, credentials_paths,
             changes, warnings)
 
         # --- users (add / remove) ---
@@ -169,21 +173,268 @@ def build_router(
             "forced": forced,
         }
 
+    @router.post("/accounts/{account_name}/set-rate-limit")
+    async def set_account_rate_limit(
+        account_name: str,
+        body: dict = Body(...),
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Manually set an account's rate-limit reset time. The operator's
+        input is authoritative — useful when claude TUI doesn't surface
+        the modal on the worker's PTY (so automatic detection can't find
+        it) but the operator has seen the reset time in their own claude
+        CLI session and wants to inform the proxy.
+
+        Body accepts either form:
+          {"reset_at": "2026-05-27T00:00:00Z"}           # ISO 8601
+          {"reset_at": "May 27, 12am UTC"}               # claude TUI wording
+          {"reset_at_epoch": 1779840000, "reason": "weekly_limit"}  # explicit
+
+        `reason` defaults to "weekly_limit" (matches the common case)."""
+        if account_name not in config.accounts:
+            raise HTTPException(404,
+                f"unknown account {account_name!r}; configured: "
+                f"{sorted(config.accounts.keys())}")
+        reason = (body.get("reason") or "weekly_limit").strip() or "weekly_limit"
+
+        epoch = body.get("reset_at_epoch")
+        if epoch is None:
+            text = body.get("reset_at")
+            if not isinstance(text, str) or not text.strip():
+                raise HTTPException(400,
+                    "body must include either `reset_at` (string, "
+                    "ISO 8601 or claude TUI wording) or `reset_at_epoch` "
+                    "(number, Unix seconds)")
+            epoch = parse_reset_time(text)
+            if epoch is None:
+                raise HTTPException(400,
+                    f"could not parse reset time from {text!r}; "
+                    "use ISO 8601 (e.g. \"2026-05-27T00:00:00Z\") or the "
+                    "TUI wording (e.g. \"resets May 27, 12am UTC\")")
+
+        try:
+            epoch_f = float(epoch)
+        except (TypeError, ValueError):
+            raise HTTPException(400,
+                f"reset_at_epoch must be a number, got {epoch!r}")
+
+        manager.mark_account_rate_limited_until(
+            account_name, reason, epoch_f)
+        log.info("/admin/accounts/%s/set-rate-limit reason=%s until=%s",
+                 account_name, reason,
+                 time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                               time.gmtime(epoch_f)))
+        return {
+            "ok": True,
+            "account": account_name,
+            "reason": reason,
+            "until_epoch": epoch_f,
+        }
+
+    @router.post("/accounts/{account_name}/clear-rate-limit")
+    async def clear_account_rate_limit(
+        account_name: str,
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Manually drop an account's rate-limit marker. Useful when the
+        operator knows the limit has cleared (e.g. weekly window reset
+        on their watch) and doesn't want to wait for the automatic
+        expiry. Next routed request will go through and confirm.
+
+        Returns {"cleared": true} if a marker was removed,
+        {"cleared": false} if none was set. 404 if the account name is
+        not configured."""
+        if account_name not in config.accounts:
+            raise HTTPException(404,
+                f"unknown account {account_name!r}; configured: "
+                f"{sorted(config.accounts.keys())}")
+        cleared = manager.clear_account_rate_limit(account_name)
+        log.info("/admin/accounts/%s/clear-rate-limit cleared=%s",
+                 account_name, cleared)
+        return {"ok": True, "account": account_name, "cleared": cleared}
+
     @router.post("/refresh-now")
     async def refresh_now(_pool: list[str] = Depends(auth_dep)) -> dict[str, Any]:
-        """Force an immediate OAuth refresh, bypassing the periodic
-        loop's sleep. Useful when you suspect the on-disk token is
-        stale (e.g., you just hit 401s) and don't want to wait for
-        the next check_interval tick."""
+        """Force an immediate OAuth refresh across every configured
+        account, bypassing the periodic loop's sleep. Useful when you
+        suspect on-disk tokens are stale (e.g., you just hit 401s) and
+        don't want to wait for the next check_interval tick.
+
+        Returns:
+          - `result`:  aggregated status — "refreshed" if any account
+            actually refreshed, otherwise "not_needed", "failed" if any
+            failed. Useful for UIs that want a one-glance verdict.
+          - `details`: full {path: status} map from the refresher."""
         if refresher_state.refresher is None:
             raise HTTPException(503,
                 "oauth_refresh is disabled (oauth_refresh.enabled=false)")
         try:
-            result = await refresher_state.refresher.refresh_now()
+            details = await refresher_state.refresher.refresh_now()
         except Exception as e:
             log.exception("/admin/refresh-now failed")
             raise HTTPException(500, f"refresh failed: {e}")
-        return {"ok": True, "result": result}
+        statuses = set(details.values())
+        if "failed" in statuses:
+            aggregate = "failed"
+        elif "refreshed" in statuses:
+            aggregate = "refreshed"
+        else:
+            aggregate = "not_needed"
+        return {"ok": True, "result": aggregate, "details": details}
+
+    @router.get("/usage")
+    async def get_usage(
+        range: str = "today",
+        group_by: str = "account",
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Token-usage aggregates.
+
+        Query params:
+          range:    lifecycle | today | 7d
+                    - "lifecycle" filters by ts >= the earliest live
+                      worker's started_at (per group bucket).
+                    - "today" filters by ts >= local-day-midnight UTC.
+                    - "7d" filters by ts >= now - 7 days.
+          group_by: account | worker | litellm_user
+
+        Returns one row per bucket with summed token counters and the
+        published-API USD equivalent (subscription accounts don't pay
+        per token — the figure is a workload sizing reference, not
+        actual spend). Each row also carries `by_model[]` so the UI
+        can expand a row to see which models contributed.
+        """
+        if usage_store is None:
+            # Surface the actual reason so the UI doesn't make the
+            # operator dig through docker logs to learn "your config
+            # said enabled=true but sqlite couldn't open the file"
+            # vs. "you literally turned it off".
+            raise HTTPException(503,
+                usage_disabled_reason or
+                "usage accounting disabled (no reason recorded)")
+        if group_by not in ("account", "worker", "litellm_user"):
+            raise HTTPException(400,
+                "group_by must be account | worker | litellm_user")
+        if range not in ("lifecycle", "today", "7d"):
+            raise HTTPException(400,
+                "range must be lifecycle | today | 7d")
+
+        now = time.time()
+        if range == "today":
+            # UTC midnight — keeps the cutoff deterministic regardless
+            # of host timezone, and matches Anthropic's reset semantics
+            # (their daily/weekly windows are UTC-anchored too).
+            today = time.gmtime(now)
+            since = time.mktime(time.struct_time(
+                (today.tm_year, today.tm_mon, today.tm_mday,
+                 0, 0, 0, 0, 0, 0)))
+            # mktime returns local-epoch; convert to UTC-epoch by
+            # subtracting timezone offset.
+            since -= time.timezone
+            until: float | None = None
+        elif range == "7d":
+            since = now - 7 * 86400
+            until = None
+        else:
+            # Lifecycle: server resolves a per-bucket lower bound after
+            # we know which buckets exist. Use 0.0 here for the bulk
+            # query (returns everything), then filter rows below.
+            since = 0.0
+            until = None
+
+        rows = usage_store.query(
+            since=since, until=until, group_by=group_by)
+
+        if range == "lifecycle":
+            filtered = []
+            for r in rows:
+                bucket_since = manager.lifecycle_since(group_by, r["key"])
+                # Re-query just this bucket's slice. Cheap — sqlite hits
+                # the (group, ts) index. Avoids materialising the full
+                # event log into Python just to filter.
+                slice_rows = usage_store.query(
+                    since=bucket_since, until=until, group_by=group_by)
+                for sr in slice_rows:
+                    if sr["key"] == r["key"]:
+                        sr["lifecycle_since"] = bucket_since
+                        filtered.append(sr)
+                        break
+            rows = filtered
+
+        # Cost estimate per row requires the per-model breakdown — pricing
+        # differs by model so the totals row can't just multiply once.
+        out: list[dict[str, Any]] = []
+        total = {"input_tokens": 0, "output_tokens": 0,
+                 "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                 "request_count": 0, "estimated_usd": 0.0,
+                 "usd_known": False}
+        for r in rows:
+            models = usage_store.query_by_model(
+                since=since if range != "lifecycle"
+                else r.get("lifecycle_since", since),
+                until=until, group_by=group_by, key=r["key"])
+            row_usd: float | None = 0.0
+            any_known = False
+            by_model_out = []
+            for m in models:
+                m_usd = estimate_usd(
+                    m["model"],
+                    input_tokens=m["input_tokens"] or 0,
+                    output_tokens=m["output_tokens"] or 0,
+                    cache_creation_tokens=m["cache_creation_tokens"] or 0,
+                    cache_read_tokens=m["cache_read_tokens"] or 0,
+                )
+                if m_usd is not None:
+                    row_usd = (row_usd or 0.0) + m_usd
+                    any_known = True
+                by_model_out.append({
+                    "model": m["model"] or "(unknown)",
+                    "input_tokens": m["input_tokens"] or 0,
+                    "output_tokens": m["output_tokens"] or 0,
+                    "cache_creation_tokens": m["cache_creation_tokens"] or 0,
+                    "cache_read_tokens": m["cache_read_tokens"] or 0,
+                    "request_count": m["request_count"] or 0,
+                    "estimated_usd": round(m_usd, 4) if m_usd is not None else None,
+                })
+            out.append({
+                "key": r["key"] or "(none)",
+                "input_tokens": r["input_tokens"] or 0,
+                "output_tokens": r["output_tokens"] or 0,
+                "cache_creation_tokens": r["cache_creation_tokens"] or 0,
+                "cache_read_tokens": r["cache_read_tokens"] or 0,
+                "request_count": r["request_count"] or 0,
+                # row_usd is null only when NOTHING under this row had
+                # a known model — surface that to the UI so it can show
+                # a dash instead of "$0.00" (zero would be wrong).
+                "estimated_usd": round(row_usd, 4) if any_known else None,
+                "lifecycle_since": r.get("lifecycle_since"),
+                "by_model": by_model_out,
+            })
+            for k in ("input_tokens", "output_tokens",
+                     "cache_creation_tokens", "cache_read_tokens",
+                     "request_count"):
+                total[k] += r[k] or 0
+            if any_known:
+                total["estimated_usd"] += row_usd or 0.0
+                total["usd_known"] = True
+
+        return {
+            "ok": True,
+            "range": range,
+            "group_by": group_by,
+            "since_epoch": None if range == "lifecycle" else since,
+            "until_epoch": until,
+            "now_epoch": now,
+            "rows": out,
+            "totals": {
+                **{k: total[k] for k in ("input_tokens", "output_tokens",
+                                         "cache_creation_tokens",
+                                         "cache_read_tokens",
+                                         "request_count")},
+                "estimated_usd": (round(total["estimated_usd"], 4)
+                                  if total["usd_known"] else None),
+            },
+        }
 
     return router
 
@@ -201,7 +452,7 @@ async def _apply_oauth_refresh(
     config: Config,
     new_config: Config,
     state: SimpleNamespace,
-    credentials_path,
+    credentials_paths,
     changes: list[str],
     warnings: list[str],
 ) -> None:
@@ -231,7 +482,7 @@ async def _apply_oauth_refresh(
     elif not old_enabled and new_enabled:
         # enable: spawn a fresh refresher
         r = OAuthRefresher(
-            credentials_path=credentials_path,
+            credentials_paths=credentials_paths,
             check_interval_seconds=new_check,
             refresh_when_expires_within_seconds=new_window,
         )

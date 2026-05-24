@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class MitmConfig(BaseModel):
@@ -63,6 +63,20 @@ class TimeoutConfig(BaseModel):
     restart_check_interval_seconds: float = 60.0
 
 
+class UsageConfig(BaseModel):
+    """Token-usage accounting (the sqlite store behind /admin/usage).
+    Disabled by default — set `enabled: true` to start recording. Cost
+    of a single event is ~1 sqlite insert, but the db file grows with
+    request volume so a deployment that doesn't want the persistence
+    overhead can leave it off."""
+    enabled: bool = True
+    # File path for the sqlite db. Relative paths resolve against the
+    # process CWD. In containers this is typically /home/coder/claude-
+    # subscription-proxy; mount a host volume here if you want the
+    # history to survive image rebuilds. Parent dirs are auto-created.
+    db_path: str = "./data/usage.db"
+
+
 class OAuthRefreshConfig(BaseModel):
     """Centralised proactive OAuth token refresh. With this enabled, the
     main process is the sole writer of /v1/oauth/token requests, which
@@ -96,17 +110,49 @@ class ClaudeConfig(BaseModel):
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
 
 
+class AccountConfig(BaseModel):
+    """One Claude subscription account. `dir` is the host-side directory
+    that holds this account's ~/.claude/ contents (.credentials.json,
+    .claude.json, projects/, etc.) — mounted into the container and
+    symlinked by every worker assigned to this account. `workers` is the
+    number of PTYs that will share this account's credentials.
+
+    Worker user_ids are auto-generated as `{account_name}-{0..workers-1}`,
+    e.g. account `claude-1` with workers=5 → claude-1-0 .. claude-1-4.
+    All workers on the same account share the directory via symlink,
+    just like the legacy single-account setup did — the proxy's
+    main-process OAuth refresher is the only writer of .credentials.json,
+    so the per-account refresh_token rotation stays single-writer."""
+    dir: str
+    workers: int = Field(ge=1)
+
+
 class Config(BaseModel):
     listen_host: str = "0.0.0.0"
     listen_port: int = 8787
     mitm: MitmConfig = Field(default_factory=MitmConfig)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     oauth_refresh: OAuthRefreshConfig = Field(default_factory=OAuthRefreshConfig)
+    usage: UsageConfig = Field(default_factory=UsageConfig)
+
+    # Multi-account block. When set, each account spawns `workers` PTYs
+    # that share that account's .claude/ directory. When absent, the
+    # deployment runs in legacy single-account mode where every worker
+    # symlinks to the operator's ~/.claude (one global credential).
+    accounts: dict[str, AccountConfig] = Field(default_factory=dict)
+
+    # Single front-door key for the multi-account setup. If both
+    # `accounts:` and `api_key:` are present, all auto-generated worker
+    # user_ids are pooled under this single key. For finer-grained
+    # routing (per-tenant keys, mixed pools) use `users:` directly.
+    api_key: str | None = None
+
     # token -> [user_id, ...]. A scalar in YAML (`sk-...: litellm`) is
     # normalised to a single-element list so the rest of the codebase
     # treats every token as a pool. A list (`sk-...: [a, b, c]`) is the
     # pool form — incoming requests for that token are load-balanced
-    # across the listed workers.
+    # across the listed workers. Can be left empty if `accounts:` +
+    # `api_key:` are set; the validator auto-fills it from those.
     users: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("users", mode="before")
@@ -127,6 +173,53 @@ class Config(BaseModel):
                     f"users[{tok}] must be str or list of str, got {type(val).__name__}")
         return out
 
+    @model_validator(mode="after")
+    def _wire_accounts(self) -> "Config":
+        """Cross-field validation + auto-expansion of accounts ↔ users.
+
+        Rules:
+          - If `accounts:` is set, auto-generate the canonical worker
+            user_id set: {account-0, account-1, ..., account-(N-1)}.
+          - If `api_key:` is also set, populate users[api_key] with the
+            full auto-generated list (unless the operator already set
+            users[api_key] explicitly).
+          - If users[] is set explicitly alongside accounts[], every
+            referenced user_id must exist in the auto-generated set —
+            otherwise the worker would have no account to symlink to
+            at runtime.
+          - With no `accounts:` block, behavior is legacy single-account:
+            users[] is taken at face value and all workers share
+            operator ~/.claude."""
+        if self.accounts:
+            valid_ids: set[str] = set()
+            for acc_name, acc in self.accounts.items():
+                for i in range(acc.workers):
+                    valid_ids.add(f"{acc_name}-{i}")
+
+            # Auto-fill users[] when api_key is set and the operator
+            # didn't override users[] for that key explicitly.
+            if self.api_key and self.api_key not in self.users:
+                self.users[self.api_key] = sorted(valid_ids)
+
+            # Validate every referenced user_id resolves to an account
+            referenced: set[str] = set()
+            for pool in self.users.values():
+                referenced.update(pool)
+            unknown = referenced - valid_ids
+            if unknown:
+                raise ValueError(
+                    f"users[] references unknown user_ids {sorted(unknown)}; "
+                    f"with `accounts:` set, every user_id must be of the form "
+                    f"`<account>-<index>` where <account> is in "
+                    f"{sorted(self.accounts.keys())} and <index> < "
+                    f"accounts[<account>].workers")
+
+        if not self.users:
+            raise ValueError(
+                "no users configured — set either `accounts:` + `api_key:`, "
+                "or `users:` directly")
+        return self
+
     @classmethod
     def load(cls, path: str | Path) -> "Config":
         data: dict[str, Any] = yaml.safe_load(Path(path).read_text())
@@ -137,3 +230,38 @@ class Config(BaseModel):
 
     def ca_cert_path(self) -> Path:
         return Path(os.path.expanduser(self.mitm.ca_cert))
+
+    def account_for_user(self, user_id: str) -> AccountConfig | None:
+        """Resolve a worker user_id back to its AccountConfig. Returns
+        None in legacy mode (no `accounts:` block) — callers fall back
+        to operator ~/.claude in that case.
+
+        Lookup is by exact-prefix match against configured account names
+        rather than naive string-split, because account names themselves
+        may contain hyphens (e.g. `team-a-prod` with workers ≥ 1 gives
+        `team-a-prod-0`; we need to peel exactly one trailing `-N` off
+        the end, NOT split on first `-`)."""
+        if not self.accounts:
+            return None
+        # Tail must be `-<digits>`; everything before is the account name.
+        sep = user_id.rfind("-")
+        if sep <= 0:
+            return None
+        head, tail = user_id[:sep], user_id[sep + 1:]
+        if not tail.isdigit():
+            return None
+        return self.accounts.get(head)
+
+    def account_dir(self, account_name: str) -> Path:
+        """Resolved on-disk path of an account's .claude/ contents dir."""
+        return Path(os.path.expanduser(self.accounts[account_name].dir))
+
+    def credentials_paths(self) -> list[Path]:
+        """Every account's .credentials.json, in account-name order. In
+        legacy mode this is the single operator credentials path."""
+        if not self.accounts:
+            return [Path(os.path.expanduser("~")) / ".claude" / ".credentials.json"]
+        return [
+            self.account_dir(name) / ".credentials.json"
+            for name in sorted(self.accounts.keys())
+        ]

@@ -25,18 +25,72 @@ fi
 
 echo "[entrypoint] HOME=$HOME CONFIG=$CONFIG uid=$(id -u) gid=$(id -g)"
 
-# 1. Operator OAuth tokens come from a bind-mounted directory at
-#    $HOME/.claude/ (default source: /data/share-auth/claude on host).
-if [ ! -f "$HOME/.claude/.credentials.json" ]; then
+# 1. Operator OAuth tokens. Two layouts:
+#    - Multi-account: config has an `accounts:` block mapping each
+#      account name to a `dir:` (e.g. /data/shared-auth/claude-1).
+#      Each dir must contain .credentials.json.
+#    - Legacy single-account: $HOME/.claude/ is bind-mounted from the
+#      host (default: /data/shared-auth/claude) and must contain
+#      .credentials.json.
+#    Dispatch via cheap grep; no YAML parser inside the entrypoint.
+if grep -qE '^accounts:[[:space:]]*$' "$CONFIG"; then
+    missing=
+    unreadable=
+    # Extract `dir:` lines that sit under the accounts: block. The awk
+    # range starts at `accounts:` and ends at the next top-level key
+    # (a line with non-whitespace as its first character).
+    # shellcheck disable=SC2013
+    for dir in $(awk '
+        /^accounts:[[:space:]]*$/ { in_block = 1; next }
+        /^[^[:space:]]/           { in_block = 0 }
+        in_block && $1 == "dir:"  { gsub(/"|'\''/, "", $2); print $2 }
+    ' "$CONFIG"); do
+        f="$dir/.credentials.json"
+        if [ ! -e "$f" ]; then
+            missing="$missing\n  $f"
+        elif [ ! -r "$f" ]; then
+            # Exists but uid 1000 can't read it (typical: file is
+            # root-owned 0600 because operator ran claude /login as
+            # root or sudo cp dropped root ownership). This is the
+            # mode that historically caused phantom "rate limit"
+            # behaviour — credentials silently unread, claude CLI
+            # boots into "Not logged in" state.
+            unreadable="$unreadable\n  $f"
+        fi
+    done
+    if [ -n "$missing" ] || [ -n "$unreadable" ]; then
+        echo "[entrypoint] ERROR: per-account credentials check failed."
+        if [ -n "$missing" ]; then
+            echo "[entrypoint] Missing inside the container:"
+            printf "[entrypoint]%b\n" "$missing"
+            echo "[entrypoint]"
+            echo "[entrypoint] Most likely cause: account was added to"
+            echo "[entrypoint] config.yaml without a matching bind mount"
+            echo "[entrypoint] in docker-compose.yml. Each account in"
+            echo "[entrypoint] config.yaml's accounts: block needs one"
+            echo "[entrypoint] line under volumes::"
+            echo "[entrypoint]   - /data/shared-auth/<name>:/data/shared-auth/<name>"
+            echo "[entrypoint] Then: docker compose up -d --force-recreate"
+        fi
+        if [ -n "$unreadable" ]; then
+            echo "[entrypoint] Unreadable by uid $(id -u):"
+            printf "[entrypoint]%b\n" "$unreadable"
+            echo "[entrypoint] Fix on the host:"
+            echo "[entrypoint]   sudo chown -R 1000:1000 /data/shared-auth"
+        fi
+        echo "[entrypoint]"
+        echo "[entrypoint] Each accounts[<name>].dir must contain a"
+        echo "[entrypoint] .credentials.json readable by uid 1000."
+        exit 1
+    fi
+elif [ ! -r "$HOME/.claude/.credentials.json" ]; then
     echo "[entrypoint] ERROR: missing $HOME/.claude/.credentials.json"
     echo "[entrypoint]"
-    echo "[entrypoint] docker-compose.yml expects host directory"
-    echo "[entrypoint]   /data/share-auth/claude/  (contains .credentials.json"
-    echo "[entrypoint]                               and the rest of \$HOME/.claude/)"
+    echo "[entrypoint] Single-account legacy layout expects"
+    echo "[entrypoint]   /data/shared-auth/claude/  (contains .credentials.json)"
     echo "[entrypoint] bind-mounted into the container at /home/coder/.claude."
-    echo "[entrypoint]"
-    echo "[entrypoint] On the host, run \`claude /login\` first, then mirror"
-    echo "[entrypoint] ~/.claude/ into /data/share-auth/claude/."
+    echo "[entrypoint] For multi-account, set \`accounts:\` in $CONFIG"
+    echo "[entrypoint] (see docker/config.example.yaml)."
     exit 1
 fi
 

@@ -19,6 +19,7 @@ from .auth import make_auth_dep
 from .config import Config
 from .oauth_refresh import OAuthRefresher
 from .session.manager import SessionManager
+from .usage import UsageStore
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +46,31 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
     config_path is used by /admin/reload to re-read config.yaml from
     disk; if None (e.g. config was loaded from somewhere other than a
     file), /admin/reload returns 503."""
-    manager = SessionManager(config)
+    usage_store: UsageStore | None = None
+    usage_disabled_reason: str | None = None
+    if not config.usage.enabled:
+        usage_disabled_reason = (
+            "config.usage.enabled=false — set it to true and restart")
+    else:
+        try:
+            usage_store = UsageStore(config.usage.db_path)
+        except Exception as e:
+            log.exception("usage store init failed (db_path=%r); "
+                          "continuing without usage accounting",
+                          config.usage.db_path)
+            usage_disabled_reason = (
+                f"usage store init failed for db_path={config.usage.db_path!r}: "
+                f"{type(e).__name__}: {e}")
+    manager = SessionManager(config, usage_store=usage_store)
     auth_dep = make_auth_dep(config)
     claude_version = _detect_claude_version(config.claude.binary)
     log.info("claude code CLI version: %s", claude_version)
 
-    credentials_path = Path(os.path.expanduser("~")) / ".claude" / ".credentials.json"
+    # In multi-account mode this returns one .credentials.json per
+    # account (under /data/shared-auth/<acc>/.credentials.json); in
+    # legacy mode it's the single operator path. The refresher iterates
+    # them each tick and refreshes any that's within its expiry window.
+    credentials_paths = config.credentials_paths()
 
     # Refresher + its task are owned by lifespan but admin/reload also
     # needs to swap them (when oauth_refresh.enabled toggles). Holding
@@ -61,7 +81,7 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
 
     if config.oauth_refresh.enabled:
         refresher_state.refresher = OAuthRefresher(
-            credentials_path=credentials_path,
+            credentials_paths=credentials_paths,
             check_interval_seconds=config.oauth_refresh.check_interval_seconds,
             refresh_when_expires_within_seconds=
                 config.oauth_refresh.refresh_when_expires_within_seconds,
@@ -98,7 +118,9 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
     app.include_router(build_admin_router(
         manager=manager, config=config, config_path=config_path,
         auth_dep=auth_dep, refresher_state=refresher_state,
-        credentials_path=credentials_path,
+        credentials_paths=credentials_paths,
+        usage_store=usage_store,
+        usage_disabled_reason=usage_disabled_reason,
     ))
 
     @app.get("/healthz")
@@ -146,6 +168,19 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         # genuinely long initial latency.
         STALL_THRESHOLD = config.claude.timeouts.status_stall_seconds
 
+        # Snapshot current per-account issue state once so the per-worker
+        # loop can flag each row without re-querying the manager each
+        # iteration (also expires stale entries lazily via the manager's
+        # accessor). Value is the kind ("rate_limit" / "degraded"); the
+        # UI uses it to pick the right badge colour + label per worker
+        # ("已限流" vs "不可用").
+        account_issue_kind: dict[str, str] = {}
+        if config.accounts:
+            for _name in config.accounts.keys():
+                _state = manager.account_rate_limit(_name)
+                if _state is not None:
+                    account_issue_kind[_name] = _state.kind
+
         workers = []
         # Snapshot the dict so a concurrent restart can't mutate under us.
         for user_id, sess in list(manager.sessions.items()):
@@ -184,8 +219,32 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
             stuck = any(d["stalled_seconds"] > STALL_THRESHOLD
                         for d in in_flight_detail)
 
+            # Account this worker belongs to (multi-account mode). null
+            # in legacy single-account mode; the UI uses this to drive
+            # an account column for operator triage ("which account is
+            # being rate-limited?").
+            acc = config.account_for_user(user_id)
+            account_name = None
+            if acc is not None:
+                for n, a in config.accounts.items():
+                    if a is acc:
+                        account_name = n
+                        break
+
+            _wkind = account_issue_kind.get(account_name)
             workers.append({
                 "user_id": user_id,
+                "account": account_name,
+                # True iff this worker's account currently has ANY
+                # routing-block (rate_limit OR degraded). UI prefers
+                # this over idle/working/stuck — a worker on a blocked
+                # account shouldn't show as "活跃" regardless of any
+                # residual in_flight count.
+                "rate_limited": _wkind is not None,
+                # Specific kind, so the UI can label the badge
+                # differently: "已限流" for rate_limit, "不可用" for
+                # degraded. None when the account is healthy.
+                "issue_kind": _wkind,
                 "mitm_port": sess.mitm_port,
                 "pid": pid,
                 "alive": alive,
@@ -200,10 +259,46 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
             })
         workers.sort(key=lambda w: w["user_id"])
 
-        # Pool topology — show which user_ids share a token, without
-        # leaking the tokens themselves.
-        pools = [list(members) for members in config.users.values()
-                 if len(members) > 1]
+        # Account-level rate-limit state. Lazy-expire on read so the UI
+        # never shows a stale "limited" badge after the window closes.
+        # Emit one entry per configured account (multi-account mode
+        # only) — UI uses this to render a per-account badge + a stat
+        # card counting how many accounts are currently limited.
+        import time as _time
+        wall_now = _time.time()
+        accounts_out = []
+        if config.accounts:
+            for name in sorted(config.accounts.keys()):
+                state = manager.account_rate_limit(name)
+                accounts_out.append({
+                    "name": name,
+                    # `kind` distinguishes positive rate-limit signals
+                    # ("rate_limit") from unknown-cause failures
+                    # ("degraded"). Both block routing; UI shows them
+                    # differently so the operator's response can
+                    # match ("wait for reset" vs. "investigate").
+                    "issue_kind": state.kind if state else None,
+                    "rate_limited": (
+                        state.kind == "rate_limit" if state else False),
+                    "degraded": (
+                        state.kind == "degraded" if state else False),
+                    "rate_limit_reason": state.reason if state else None,
+                    "rate_limited_since": (
+                        round(state.set_at) if state else None),
+                    "rate_limited_until": (
+                        round(state.until) if state else None),
+                    "rate_limited_seconds_remaining": (
+                        round(state.until - wall_now) if state else 0),
+                    # Worker count belonging to this account — handy in
+                    # the UI to surface "5/5 workers are unusable".
+                    "worker_count": sum(
+                        1 for w in workers if w.get("account") == name),
+                })
+
+        rate_limited_account_count = sum(
+            1 for a in accounts_out if a["rate_limited"])
+        degraded_account_count = sum(
+            1 for a in accounts_out if a["degraded"])
 
         return {
             "ok": True,
@@ -212,8 +307,10 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
             "alive_count": sum(1 for w in workers if w["alive"]),
             "busy_count": sum(1 for w in workers if w["in_flight"] > 0),
             "stuck_count": sum(1 for w in workers if w["stuck"]),
+            "rate_limited_account_count": rate_limited_account_count,
+            "degraded_account_count": degraded_account_count,
             "workers": workers,
-            "pools": pools,
+            "accounts": accounts_out,
         }
 
     return app
