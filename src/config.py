@@ -147,6 +147,14 @@ class Config(BaseModel):
     # routing (per-tenant keys, mixed pools) use `users:` directly.
     api_key: str | None = None
 
+    # Optional separate token gating /admin/* endpoints (account
+    # add/delete, force-refresh, set rate-limit, /admin/usage, etc.).
+    # When unset, /admin/* falls back to the tenant key (legacy
+    # behavior — any sk- in `users:` works). Set this whenever the
+    # tenant key is shared with downstream callers (LiteLLM, OpenAI
+    # clients, etc.) so a leaked tenant key can't wipe accounts.
+    admin_api_key: str | None = None
+
     # token -> [user_id, ...]. A scalar in YAML (`sk-...: litellm`) is
     # normalised to a single-element list so the rest of the codebase
     # treats every token as a pool. A list (`sk-...: [a, b, c]`) is the

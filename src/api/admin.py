@@ -367,9 +367,13 @@ def build_router(
         try:
             url = await login_registry.begin(
                 name, dest_dir, claude_binary=config.claude.binary)
-        except Exception as e:
-            log.exception("OAuth login begin failed")
-            raise HTTPException(500, f"login begin failed: {e}")
+        except Exception:
+            # Detail is server-side only; PTY output may include
+            # operator-pasted secrets and must not propagate via 500
+            # body. See oauth_login.py.
+            log.exception("OAuth login begin failed for account=%s", name)
+            raise HTTPException(500,
+                "login begin failed; check container logs for details")
         return {
             "ok": True,
             "account": name,
@@ -402,9 +406,13 @@ def build_router(
             raise HTTPException(404,
                 f"no in-progress login flow for account {name!r}; "
                 "did POST /admin/accounts/new run first?")
-        except Exception as e:
-            log.exception("OAuth login finish failed")
-            raise HTTPException(500, f"login finish failed: {e}")
+        except Exception:
+            # Detail is server-side only; finish() PTY tail contains the
+            # operator-typed auth code which must not flow into HTTP
+            # response bodies. See oauth_login.py.
+            log.exception("OAuth login finish failed for account=%s", name)
+            raise HTTPException(500,
+                "login finish failed; check container logs for details")
 
         # Wire the new account into config + spawn workers. The
         # AccountConfig type is imported at module-level; reuse it.

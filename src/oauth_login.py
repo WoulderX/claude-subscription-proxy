@@ -141,12 +141,17 @@ class LoginSession:
                 log.warning("oauth_login[%s]: prompt visible but URL "
                             "not parsed; PTY tail: %r",
                             self.account_name, tail)
-        # Timed out
+        # Timed out. Log the PTY tail (server-only) and surface a
+        # generic message — the tail can contain operator-pasted
+        # secrets if the timeout races code submission, and the error
+        # message propagates to HTTP responses.
         tail = bytes(self._buf[-1500:]).decode("utf-8", "replace")
+        log.warning("oauth_login[%s]: begin() timeout; PTY tail: %r",
+                    self.account_name, tail)
         self._cleanup()
         raise RuntimeError(
             f"claude auth login did not print authorize URL within "
-            f"{BEGIN_URL_TIMEOUT_SECONDS:.0f}s. PTY tail:\n{tail}")
+            f"{BEGIN_URL_TIMEOUT_SECONDS:.0f}s (check container logs)")
 
     def _read_chunk(self, timeout: float) -> bytes:
         """Blocking read of up to 8 KiB from the PTY, with a select-style
@@ -192,25 +197,35 @@ class LoginSession:
             chunk = await loop.run_in_executor(None, self._read_chunk, 0.5)
             if chunk:
                 self._buf.extend(chunk)
+        # NOTE on PTY tail handling below: the buffer holds the
+        # operator's just-typed authorization code (echoed by the CLI).
+        # We must NOT include the tail in any RuntimeError message,
+        # because admin.py turns RuntimeError into an HTTP 500 response
+        # body that flows through nginx logs and the operator's browser.
+        # All tail dumps go to the server log only.
         if self.proc.isalive():
             try:
                 self.proc.terminate(force=True)
             except Exception:
                 pass
             tail = bytes(self._buf[-2000:]).decode("utf-8", "replace")
+            log.warning("oauth_login[%s]: finish() timeout; PTY tail: %r",
+                        self.account_name, tail)
             self._cleanup()
             raise RuntimeError(
                 f"claude auth login did not exit within "
-                f"{FINISH_TIMEOUT_SECONDS:.0f}s after code submission. "
-                f"PTY tail:\n{tail}")
+                f"{FINISH_TIMEOUT_SECONDS:.0f}s after code submission "
+                f"(check container logs)")
 
         exit_status = self.proc.exitstatus
         if exit_status not in (0, None):
             tail = bytes(self._buf[-2000:]).decode("utf-8", "replace")
+            log.warning("oauth_login[%s]: finish() exit=%d; PTY tail: %r",
+                        self.account_name, exit_status, tail)
             self._cleanup()
             raise RuntimeError(
-                f"claude auth login exited with status {exit_status}. "
-                f"PTY tail:\n{tail}")
+                f"claude auth login exited with status {exit_status} "
+                f"(check container logs)")
 
         # Verify on-disk artifacts exist before moving — gives a clearer
         # error than copying an empty .claude/ would.
@@ -218,10 +233,13 @@ class LoginSession:
         marker_src = self.tmp_home / ".claude.json"
         if not cred_src.is_file():
             tail = bytes(self._buf[-2000:]).decode("utf-8", "replace")
+            log.warning("oauth_login[%s]: .credentials.json missing after "
+                        "login (expected at %s); PTY tail: %r",
+                        self.account_name, cred_src, tail)
             self._cleanup()
             raise RuntimeError(
-                f".credentials.json missing after login (expected at "
-                f"{cred_src}). PTY tail:\n{tail}")
+                ".credentials.json missing after login "
+                "(check container logs)")
 
         # Move into the destination dir. Workers symlink ~/.claude →
         # dest_dir, so the structure must be:

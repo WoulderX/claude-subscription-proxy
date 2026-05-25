@@ -239,13 +239,23 @@ class OAuthRefresher:
             log.warning("refresh network error: %s; will retry", e)
             return None
         if r.status_code != 200:
-            log.error("refresh failed status=%d body=%s",
-                      r.status_code, r.text[:300])
+            # Body may contain raw tokens or error details that echo the
+            # refresh_token; don't write any of it to log. Status + a
+            # hint of the error type from JSON (if parseable) is enough
+            # to debug refresh failures.
+            err_type = None
+            try:
+                err_type = (r.json() or {}).get("error")
+            except ValueError:
+                pass
+            log.error("refresh failed status=%d error=%s",
+                      r.status_code, err_type)
             return None
         try:
             data = r.json()
         except ValueError:
-            log.error("refresh response not JSON: %s", r.text[:300])
+            log.error("refresh response not JSON (status=%d, content_type=%s)",
+                      r.status_code, r.headers.get("content-type"))
             return None
 
         new_at = data.get("access_token")
@@ -254,8 +264,10 @@ class OAuthRefresher:
         new_rt = data.get("refresh_token") or refresh_token
         expires_in = data.get("expires_in")
         if not isinstance(new_at, str) or not isinstance(expires_in, (int, float)):
-            log.error("refresh response missing access_token or expires_in: %s",
-                      str(data)[:300])
+            # Log which fields are present (not their values) so we can
+            # still diagnose schema mismatches without writing a token.
+            log.error("refresh response missing access_token or expires_in "
+                      "(keys=%s)", sorted(data.keys()) if isinstance(data, dict) else type(data).__name__)
             return None
         return {
             "accessToken": new_at,

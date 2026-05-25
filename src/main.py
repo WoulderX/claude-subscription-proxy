@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from .api.admin import build_router as build_admin_router
 from .api.anthropic import build_router as build_anthropic_router
 from .api.openai import build_router as build_openai_router
-from .auth import make_auth_dep
+from .auth import make_admin_auth_dep, make_auth_dep
 from .config import Config
 from .oauth_refresh import OAuthRefresher
 from .oauth_login import LoginRegistry
@@ -65,6 +65,14 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
                 f"{type(e).__name__}: {e}")
     manager = SessionManager(config, usage_store=usage_store)
     auth_dep = make_auth_dep(config)
+    admin_auth_dep = make_admin_auth_dep(config, auth_dep)
+    if config.admin_api_key:
+        log.info("admin auth: dedicated admin_api_key in use "
+                 "(tenant keys cannot access /admin/*)")
+    else:
+        log.warning("admin auth: NO dedicated admin_api_key set — "
+                    "any tenant key can call /admin/*. Set "
+                    "`admin_api_key:` in config.yaml to harden.")
     claude_version = _detect_claude_version(config.claude.binary)
     log.info("claude code CLI version: %s", claude_version)
 
@@ -183,7 +191,7 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
     app.include_router(build_openai_router(manager, auth_dep))
     app.include_router(build_admin_router(
         manager=manager, config=config, config_path=config_path,
-        auth_dep=auth_dep, refresher_state=refresher_state,
+        auth_dep=admin_auth_dep, refresher_state=refresher_state,
         credentials_paths=credentials_paths,
         usage_store=usage_store,
         usage_disabled_reason=usage_disabled_reason,
@@ -193,11 +201,12 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
-        return {
-            "ok": True,
-            "sessions": list(manager.sessions.keys()),
-            "claude_version": claude_version,
-        }
+        # Liveness probe — must stay unauthenticated for k8s / docker
+        # healthcheck access. Keep the response surface minimal so it
+        # doesn't reveal worker topology (account names, replica counts)
+        # to unauthenticated callers on the listen interface; richer
+        # state lives behind admin_auth_dep on /status.
+        return {"ok": True, "claude_version": claude_version}
 
     # Static admin/monitoring page. Unauthenticated by design — the HTML
     # itself doesn't expose any state, only loads if the user fills in
@@ -213,18 +222,19 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         return FileResponse(_admin_html, media_type="text/html")
 
     @app.get("/status")
-    async def status(_pool: list[str] = Depends(auth_dep)):
+    async def status(_pool: list[str] = Depends(admin_auth_dep)):
         """Per-worker runtime state. Distinguishes healthy in-flight
         requests (bytes flowing) from stalled ones (no bytes received
         recently, likely a leaked channel from a missed mitm intercept
         or an upstream that froze mid-stream).
 
-        Auth: any configured API key (Bearer or x-api-key). /status
-        leaks request metadata (model, n_messages, last_user_preview
-        of in-flight prompts), so it must not be world-readable. We
-        reuse the tenant key space rather than introduce a separate
-        admin token because every legitimate caller already has one;
-        /healthz stays open for container liveness probes."""
+        Auth: admin_api_key when set in config, else falls back to any
+        configured tenant key (legacy behavior). /status leaks request
+        metadata (model, n_messages, last_user_preview of in-flight
+        prompts) across ALL tenants, so once a deployment shares its
+        tenant key with downstream clients (LiteLLM, OpenAI SDKs, …)
+        the admin_api_key split is the only thing keeping that data
+        scoped to the operator. /healthz stays open for liveness."""
         import time as _time
         now = _time.monotonic()
         # A request that's been alive for > this many seconds without

@@ -114,6 +114,14 @@ accounts:
 # Generate with:  echo "sk-internal-$(openssl rand -hex 24)"
 api_key: sk-internal-master
 
+# OPTIONAL separate token gating /admin/* and /status. When set, only
+# this key can DELETE accounts, force token refresh, read all tenants'
+# in-flight prompts or usage history. Tenant key (api_key above) still
+# works for /v1/messages. Strongly recommended whenever api_key is
+# shared with downstream callers.
+# Generate with:  echo "sk-admin-$(openssl rand -hex 24)"
+# admin_api_key: sk-admin-CHANGE_ME
+
 # `users:` is OPTIONAL when `accounts:` + `api_key:` are set — the
 # validator auto-populates it. Set it explicitly only for finer-grained
 # routing (multiple keys, mixed pools, dedicated workers per tenant).

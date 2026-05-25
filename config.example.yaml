@@ -61,6 +61,18 @@ accounts:
 # Generate with:  echo "sk-internal-$(openssl rand -hex 24)"
 api_key: sk-internal-master
 
+# OPTIONAL separate token gating /admin/* and /status.
+#
+# Why: api_key above is for tenant traffic — you'll hand it to LiteLLM,
+# OpenAI clients, teammates, etc. If you leave admin_api_key unset, ANY
+# of those callers can DELETE accounts, force token refresh, see all
+# in-flight prompts of every other tenant, and read usage history. When
+# this field is set, /admin/* + /status require admin_api_key
+# specifically (the tenant key still works for /v1/messages).
+#
+# Generate with:  echo "sk-admin-$(openssl rand -hex 24)"
+# admin_api_key: sk-admin-CHANGE_ME
+
 # `users:` is OPTIONAL when `accounts:` + `api_key:` are set — it's
 # auto-populated. Set it explicitly only if you need finer-grained
 # routing (e.g. multiple keys, mixed pools, dedicated workers per
