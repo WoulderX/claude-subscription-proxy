@@ -331,8 +331,8 @@
     }
     .quota-card-head .meta.stale { color: var(--yellow); }
     .quota-tier {
-      display: grid; grid-template-columns: 110px 1fr 52px;
-      gap: 12px; align-items: center;
+      display: grid; grid-template-columns: 96px 1fr 48px 72px;
+      gap: 10px; align-items: center;
       padding: 6px 0;
       font-size: 12px;
     }
@@ -352,6 +352,12 @@
       text-align: right; color: var(--text);
     }
     .quota-tier .pct.dim { color: var(--text-faint); }
+    .quota-tier .reset {
+      font-variant-numeric: tabular-nums;
+      text-align: right; font-size: 11px;
+      color: var(--text-faint);
+    }
+    .quota-tier .reset.dim { color: var(--text-faint); opacity: 0.5; }
     .quota-card .err {
       font-size: 11px; color: #fca5a5; margin-top: 8px;
       white-space: pre-wrap; word-break: break-word;
@@ -1346,6 +1352,23 @@
       if (h > 0) return `${h}小时${m}分钟后重置`;
       return `${m}分钟后重置`;
     }
+    // Compact countdown for the inline cell next to each bar.
+    // Mirrors ccswitch's "1h40m" / "5d3h" / "23m" style. Two segments
+    // max so the column stays narrow.
+    function quotaFmtResetShort(iso) {
+      if (!iso) return '';
+      const dt = new Date(iso);
+      if (isNaN(dt)) return '';
+      const ms = dt - new Date();
+      if (ms <= 0) return '即将刷新';
+      const totalMin = Math.floor(ms / 60000);
+      const d = Math.floor(totalMin / 1440);
+      const h = Math.floor((totalMin % 1440) / 60);
+      const m = totalMin % 60;
+      if (d > 0) return `${d}d${h}h后`;
+      if (h > 0) return `${h}h${m}m后`;
+      return `${m}m后`;
+    }
     async function loadQuotas(silent = false) {
       const auth = authHeader();
       if (!auth) return;
@@ -1362,11 +1385,12 @@
         if (!silent) showToast('配额加载失败：' + e.message, 'error');
       }
     }
+    // Only 5h and 7d total — the per-model 7d breakdowns (opus/sonnet)
+    // and the dynamic extra_tiers payload don't carry information
+    // operators look at day-to-day. Keep the panel scannable.
     const QUOTA_TIERS = [
-      { key: 'five_hour',         label: '5 小时窗口'   },
-      { key: 'seven_day',         label: '7 天总额度'   },
-      { key: 'seven_day_opus',    label: '7 天 Opus'    },
-      { key: 'seven_day_sonnet',  label: '7 天 Sonnet'  },
+      { key: 'five_hour', label: '5 小时窗口' },
+      { key: 'seven_day', label: '7 天总额度' },
     ];
     function renderQuotaTier(label, tier) {
       const u = tier ? (tier.utilization ?? tier.utilizationPercent) : null;
@@ -1375,11 +1399,14 @@
       const pctText = quotaFmtPct(u);
       const norm = (u == null) ? 0 : (u > 1 ? u / 100 : u);
       const cls = quotaBarCls(u);
+      const resetShort = quotaFmtResetShort(reset);
+      const resetTitle = reset ? quotaFmtResetIso(reset) : '';
       return `
-        <div class="quota-tier" ${reset ? `title="${escapeHtml(quotaFmtResetIso(reset))}"` : ''}>
+        <div class="quota-tier" ${resetTitle ? `title="${escapeHtml(resetTitle)}"` : ''}>
           <div class="label">${escapeHtml(label)}</div>
           <div class="bar"><div class="bar-fill ${cls}" style="width:${Math.min(100, norm * 100).toFixed(1)}%"></div></div>
           <div class="pct ${u == null ? 'dim' : ''}">${pctText}</div>
+          <div class="reset ${resetShort ? '' : 'dim'}">${escapeHtml(resetShort || '—')}</div>
         </div>
       `;
     }
@@ -1413,15 +1440,8 @@
         }
         let tiersHtml;
         if (snap) {
-          const all = [...QUOTA_TIERS];
-          const extra = snap.extra_tiers || {};
-          for (const k of Object.keys(extra)) {
-            all.push({ key: k, label: k, _extra: true });
-          }
-          tiersHtml = all.map(t => {
-            const tier = t._extra ? extra[t.key] : snap[t.key];
-            return renderQuotaTier(t.label, tier);
-          }).join('');
+          tiersHtml = QUOTA_TIERS.map(t =>
+            renderQuotaTier(t.label, snap[t.key])).join('');
         } else {
           tiersHtml = `<div class="empty-state" style="padding:14px 0;">
             ${err ? '探针失败，等待下一次刷新' : '尚未取到数据，请稍候'}
