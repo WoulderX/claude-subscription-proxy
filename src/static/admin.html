@@ -362,6 +362,16 @@
       font-size: 11px; color: #fca5a5; margin-top: 8px;
       white-space: pre-wrap; word-break: break-word;
     }
+    /* Cooldown notice — same slot as .err, but yellow because it's an
+       expected wait, not an unexpected failure. Promoted to red only
+       after the consecutive-429 streak hits the persistent-throttle
+       threshold (see .err.warn-strong below). */
+    .quota-card .err.cooldown {
+      color: #fcd34d;
+    }
+    .quota-card .err.warn-strong {
+      color: #f87171; font-weight: 600;
+    }
 
     /* ── Account routing rows ───────────────────────────────── */
     .account-list .account-row {
@@ -1443,13 +1453,41 @@
           tiersHtml = QUOTA_TIERS.map(t =>
             renderQuotaTier(t.label, snap[t.key])).join('');
         } else {
+          // Same slot as before but with the cooldown case spelled out
+          // (used to lump into "探针失败" which made an expected wait
+          // look like a fault).
+          let emptyText;
+          if (cdRem > 0) {
+            emptyText = `Anthropic 429 冷却中，${Math.ceil(cdRem/60)} 分钟后才会重试`;
+          } else if (err) {
+            emptyText = '探针失败，等待下一次刷新';
+          } else {
+            emptyText = '尚未取到数据，请稍候';
+          }
           tiersHtml = `<div class="empty-state" style="padding:14px 0;">
-            ${err ? '探针失败，等待下一次刷新' : '尚未取到数据，请稍候'}
+            ${escapeHtml(emptyText)}
           </div>`;
         }
-        const errHtml = err
-          ? `<div class="err">最近一次失败：${escapeHtml(err.error || '')}</div>`
-          : '';
+        // Three classes of footer notice, in priority order:
+        //   1. Sustained-throttle warning (≥3 consecutive 429s) — red,
+        //      because the operator should probably investigate the
+        //      account rather than wait it out.
+        //   2. Active cooldown — yellow, just informational ("we're
+        //      waiting, no probes going out, sit tight").
+        //   3. Real failure (no cooldown_until_unix) — red, current
+        //      behavior.
+        const cd = err && err.cooldown_until_unix;
+        const streak = (err && err.consecutive_429s) || 0;
+        let errHtml = '';
+        if (err && cd && streak >= 3) {
+          const mins = Math.ceil(cdRem / 60);
+          errHtml = `<div class="err warn-strong">⚠ 连续 ${streak} 次被 Anthropic 限速，已退避至 ${mins} 分钟后再试（建议检查该账号是否被官方惩罚）</div>`;
+        } else if (err && cd) {
+          const mins = Math.ceil(cdRem / 60);
+          errHtml = `<div class="err cooldown">上游 429 冷却中，${mins} 分钟后才会重试${streak > 1 ? `（连续第 ${streak} 次）` : ''}</div>`;
+        } else if (err) {
+          errHtml = `<div class="err">最近一次失败：${escapeHtml(err.error || '')}</div>`;
+        }
         return `
           <div class="quota-card">
             <div class="quota-card-head">

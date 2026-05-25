@@ -53,6 +53,12 @@ MIN_REFRESH_INTERVAL_SECONDS = 60.0
 # keep the default conservative so a probe that has no header info
 # doesn't immediately re-burn an account's allowance.
 DEFAULT_429_BACKOFF_SECONDS = 3600.0
+# Ceiling for the compounded cooldown. Anthropic's retry_after is
+# typically 3600s; with the 2^(n-1) multiplier this caps at 6 cycles
+# (1h → 2h → 4h → 8h → 16h → 32h clamped to 24h). After that we just
+# stay at 24h between attempts — long enough to be courteous, short
+# enough that a cleared penalty surfaces within a day.
+MAX_429_BACKOFF_SECONDS = 86400.0  # 24h
 
 
 @dataclass
@@ -82,6 +88,11 @@ class QuotaAttemptError:
     # available, parse error). UI shows a "下一次刷新: HH:MM" badge
     # when this is populated.
     cooldown_until_unix: float | None = None
+    # Consecutive-429 streak length when this error was recorded. 0 for
+    # non-429 errors. Surfaced to the dashboard so the operator can see
+    # "this account has been 429'd 5 times in a row, give up" without
+    # having to read logs.
+    consecutive_429s: int = 0
 
 
 class QuotaProbeService:
@@ -118,6 +129,14 @@ class QuotaProbeService:
         # (UI display) so a clock jump doesn't free a cooldown early.
         self._cooldown_until_mono: dict[str, float] = {}
         self._cooldown_until_wall: dict[str, float] = {}
+        # Consecutive-429 counter, used to compound the cooldown when
+        # Anthropic keeps returning 429 across multiple cycles. Each 429
+        # increments; first successful record() resets to 0. Bounded
+        # implicitly by MAX_429_BACKOFF_SECONDS — once we cap there,
+        # the counter can keep climbing without making the cooldown
+        # any longer, but it's surfaced via state_dict so the operator
+        # sees "this account is being persistently throttled".
+        self._consecutive_429s: dict[str, int] = {}
         # Wall-clock twin of `_last_success_mono`. Populated by record()
         # on every successful probe; persisted to the cooldown file so
         # a rebuild within `tick_seconds` of the last success soft-
@@ -172,11 +191,22 @@ class QuotaProbeService:
                 self._cooldown_until_wall[name] = float(until_wall)
                 self._cooldown_until_mono[name] = now_mono + remaining
                 self._last_attempt_mono[name] = now_mono
+                # Restore the consecutive-429 counter so a rebuild
+                # mid-streak doesn't reset the multiplier. Missing /
+                # malformed entries default to 1 — we know there's at
+                # least one 429 in the chain because until_unix was set.
+                streak = entry.get("consecutive_429s")
+                if isinstance(streak, int) and streak >= 1:
+                    self._consecutive_429s[name] = streak
+                else:
+                    self._consecutive_429s[name] = 1
                 self._errors[name] = QuotaAttemptError(
                     attempted_at_unix=now_wall,
-                    error=(f"已持久化的 429 冷却，仍剩 {int(remaining)}s "
-                           f"— 下一次成功探测会清除"),
+                    error=(f"已持久化的 429 冷却（连续第 "
+                           f"{self._consecutive_429s[name]} 次），仍剩 "
+                           f"{int(remaining)}s — 下一次成功探测会清除"),
                     cooldown_until_unix=float(until_wall),
+                    consecutive_429s=self._consecutive_429s[name],
                 )
                 restored_hard += 1
             elif isinstance(last_success_wall, (int, float)):
@@ -210,10 +240,17 @@ class QuotaProbeService:
         now_wall = time.time()
         out: dict[str, dict[str, float]] = {}
         # Hard 429 cooldowns first — they dominate per record_429's
-        # contract (which also pops last_success_wall).
+        # contract (which also pops last_success_wall). Also persist the
+        # consecutive-429 counter so a docker rebuild can't "amnesty"
+        # an account out of the compounded backoff by losing the
+        # multiplier state.
         for name, until in self._cooldown_until_wall.items():
             if until > now_wall:
-                out[name] = {"until_unix": float(until)}
+                entry: dict[str, float] = {"until_unix": float(until)}
+                n = self._consecutive_429s.get(name, 0)
+                if n:
+                    entry["consecutive_429s"] = int(n)
+                out[name] = entry
         # Soft success windows. Skip accounts already captured by a
         # 429 entry; skip success records older than tick_seconds (the
         # tick would no longer block them, persisting is just noise).
@@ -272,6 +309,10 @@ class QuotaProbeService:
         # instead of re-probing.
         self._cooldown_until_mono.pop(account_name, None)
         self._cooldown_until_wall.pop(account_name, None)
+        # First success clears the consecutive-429 streak so the next
+        # 429 (if any) starts from base retry_after again rather than
+        # immediately landing at the prior compounded backoff.
+        self._consecutive_429s.pop(account_name, None)
         self._save_cooldown_state()
         log.info("quota recorded account=%s 5h=%s%% 7d=%s%%",
                  account_name,
@@ -344,29 +385,44 @@ class QuotaProbeService:
                     retry_after_seconds: float | None,
                     fetched_at_unix: float) -> None:
         """Called when a probe hit upstream HTTP 429. Sets a cooldown
-        per retry-after (or DEFAULT_429_BACKOFF_SECONDS when absent) so
-        subsequent ticks skip this account until the window clears.
-        Does NOT overwrite the prior snapshot."""
-        backoff = (float(retry_after_seconds)
-                   if retry_after_seconds is not None and retry_after_seconds > 0
-                   else DEFAULT_429_BACKOFF_SECONDS)
+        per retry-after (or DEFAULT_429_BACKOFF_SECONDS when absent),
+        then multiplies by 2^(n-1) for each consecutive 429 cycle, so a
+        persistently-throttled account exponentially backs off toward
+        MAX_429_BACKOFF_SECONDS (24h) instead of pinging Anthropic once
+        an hour forever. The counter resets on the first successful
+        record()."""
+        base = (float(retry_after_seconds)
+                if retry_after_seconds is not None and retry_after_seconds > 0
+                else DEFAULT_429_BACKOFF_SECONDS)
+        # n=1 first occurrence after a (re)set → ×1 (just retry-after).
+        # n=2 → ×2, n=3 → ×4, n=4 → ×8, ... capped at MAX.
+        self._consecutive_429s[account_name] = (
+            self._consecutive_429s.get(account_name, 0) + 1)
+        n = self._consecutive_429s[account_name]
+        # Bit-shift caps the multiplier well before float overflow; we
+        # also clamp the product itself so retry_after spikes (some
+        # upstreams send 86400 directly) don't escape the ceiling.
+        multiplier = 1 << min(n - 1, 16)
+        backoff = min(base * multiplier, MAX_429_BACKOFF_SECONDS)
         self._cooldown_until_mono[account_name] = time.monotonic() + backoff
         self._cooldown_until_wall[account_name] = fetched_at_unix + backoff
         self._errors[account_name] = QuotaAttemptError(
             attempted_at_unix=fetched_at_unix,
-            error=(f"Anthropic 限速 HTTP 429 — 已 backoff "
-                   f"{int(backoff)} 秒（"
-                   f"{'按 retry-after' if retry_after_seconds else '默认'}"
-                   f"）"),
+            error=(f"Anthropic 限速 HTTP 429（连续第 {n} 次） — 已 backoff "
+                   f"{int(backoff)} 秒（基线 {int(base)} 秒 × {multiplier}，"
+                   f"上限 {int(MAX_429_BACKOFF_SECONDS)} 秒）"),
             cooldown_until_unix=fetched_at_unix + backoff,
+            consecutive_429s=n,
         )
         self._last_attempt_mono[account_name] = time.monotonic()
         # 429 dominates any prior soft-cooldown from a past success —
         # the upstream just told us to back off harder, the success
         # window is no longer relevant.
         self._last_success_wall.pop(account_name, None)
-        log.warning("quota 429 account=%s backoff=%ss (retry_after=%s)",
-                    account_name, int(backoff), retry_after_seconds)
+        log.warning("quota 429 account=%s consecutive=%d "
+                    "backoff=%ss (base=%ss × %d, retry_after=%s)",
+                    account_name, n, int(backoff), int(base),
+                    multiplier, retry_after_seconds)
         # Persist so a docker compose restart doesn't reset our memory
         # of the cooldown — without this, every rebuild fires a fresh
         # initial_probe burst that immediately re-429s and the
@@ -405,6 +461,11 @@ class QuotaProbeService:
                 # show a "下一次刷新: HH:MM:SS" badge instead of "5 min".
                 "cooldown_seconds_remaining": cooldown_remaining,
                 "cooldown_until_unix": cd_wall if cd_wall and cooldown_remaining > 0 else None,
+                # How many 429s in a row this account has eaten. Lets
+                # the UI promote a sustained-throttle warning (e.g. ≥3
+                # → "Anthropic 多次拒绝，建议手动检查") instead of
+                # treating every cycle the same.
+                "consecutive_429s": self._consecutive_429s.get(name, 0),
             }
         return {
             "accounts": out,
