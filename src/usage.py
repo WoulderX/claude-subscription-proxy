@@ -50,8 +50,8 @@ log = logging.getLogger(__name__)
 PRICING: dict[str, dict[str, float]] = {
     # Opus 4.x
     "claude-opus-4": {
-        "input": 15.00, "output": 75.00,
-        "cache_write": 18.75, "cache_read": 1.50,
+        "input": 5.00, "output": 25.00,
+        "cache_write": 6.25, "cache_read": 0.50,
     },
     # Sonnet 4.x
     "claude-sonnet-4": {
@@ -60,8 +60,8 @@ PRICING: dict[str, dict[str, float]] = {
     },
     # Haiku 4.x
     "claude-haiku-4": {
-        "input": 0.80, "output": 4.00,
-        "cache_write": 1.00, "cache_read": 0.08,
+        "input": 1.00, "output": 5.00,
+        "cache_write": 1.25, "cache_read": 0.10,
     },
 }
 
