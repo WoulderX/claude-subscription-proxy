@@ -17,6 +17,12 @@ ANTHROPIC_HOSTS = {"api.anthropic.com"}
 # Real claude code hits /v1/messages?beta=true — flow.request.path
 # carries the query string, so we match on the bare path prefix.
 MESSAGES_PATH_PREFIX = "/v1/messages"
+# Path that backs the TUI `/usage` slash command. Triggered by sending
+# "/usage\r" to a worker's PTY; the response is a small JSON document
+# carrying 5h / 7d / 7d-per-model utilization. Captured verbatim and
+# shipped to the main process via session.events — no streaming, no
+# transformation.
+QUOTA_USAGE_PATH = "/api/oauth/usage"
 
 # Body fields the user payload owns: claude's originals are dropped, user's
 # values win. Everything else from claude's body is preserved verbatim
@@ -635,6 +641,70 @@ class HijackAddon:
             })
         except Exception:
             log.exception("failed to push 429 event")
+
+    # ---- /api/oauth/usage capture ----
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        """Capture the JSON body of `GET /api/oauth/usage` and ship it
+        to the main process via session.events. The `/v1/messages` path
+        is handled streamingly in responseheaders (above); /api/oauth/usage
+        is small enough to let mitm buffer the full body, so we read
+        flow.response.content here and don't need stream-tapping."""
+        if flow.request.host not in ANTHROPIC_HOSTS:
+            return
+        bare_path = flow.request.path.split("?", 1)[0]
+        if bare_path != QUOTA_USAGE_PATH:
+            return
+        status = flow.response.status_code if flow.response is not None else None
+        if status == 429:
+            # Upstream rate-limits /api/oauth/usage strictly (observed
+            # retry-after: 3600 — 1 call/hour/account in practice).
+            # Surface retry-after so QuotaProbeService can skip probes
+            # during the cooldown instead of burning another /usage
+            # PTY interrupt every tick.
+            retry_after_raw = flow.response.headers.get("retry-after") if flow.response else None
+            retry_after: float | None = None
+            if retry_after_raw:
+                try:
+                    retry_after = float(retry_after_raw.strip())
+                except ValueError:
+                    retry_after = None
+            import time as _time
+            try:
+                self.session.events.put_nowait({
+                    "type": "quota_usage_429",
+                    "retry_after_seconds": retry_after,
+                    "fetched_at_unix": _time.time(),
+                })
+            except Exception:
+                log.exception("user=%s failed to push quota_usage_429 event",
+                              self.session.user_id)
+            log.warning("user=%s /api/oauth/usage 429 retry_after=%s",
+                        self.session.user_id, retry_after)
+            return
+        if status != 200:
+            log.warning("user=%s /api/oauth/usage returned HTTP %s; skipping",
+                        self.session.user_id, status)
+            return
+        try:
+            text = flow.response.get_text() or "{}"
+            body = json.loads(text)
+        except (json.JSONDecodeError, ValueError) as e:
+            log.warning("user=%s /api/oauth/usage body parse failed: %s",
+                        self.session.user_id, e)
+            return
+        import time as _time
+        try:
+            self.session.events.put_nowait({
+                "type": "quota_usage",
+                "body": body,
+                "fetched_at_unix": _time.time(),
+            })
+            log.debug("user=%s captured /api/oauth/usage response",
+                      self.session.user_id)
+        except Exception:
+            log.exception("user=%s failed to push quota_usage event",
+                          self.session.user_id)
 
     def error(self, flow: http.HTTPFlow) -> None:
         """Mitm hit a flow-level error — typically upstream connection

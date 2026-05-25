@@ -80,7 +80,9 @@ class ClaudeSession:
 
     def __init__(self, user_id: str, mitm_port: int, config: Config,
                  on_rate_limit: Callable[[str, str, float], None] | None = None,
-                 on_usage: Callable[[str, dict], None] | None = None) -> None:
+                 on_usage: Callable[[str, dict], None] | None = None,
+                 on_quota: Callable[[str, dict, float], None] | None = None,
+                 on_quota_429: Callable[[str, float | None, float], None] | None = None) -> None:
         self.user_id = user_id
         self.mitm_port = mitm_port
         self.config = config
@@ -109,6 +111,14 @@ class ClaudeSession:
         # the channel's body_summary so the store row gets correctly
         # tagged. None disables accounting (usage:enabled=false).
         self._on_usage = on_usage
+        # Called when the mitm addon captures a /api/oauth/usage response:
+        # signature (user_id, body, fetched_at_unix). Manager fans this
+        # out to QuotaProbeService keyed by the worker's account.
+        self._on_quota = on_quota
+        # Same plumbing for the 429 case — manager forwards to the
+        # service's record_429() so the account enters a cooldown.
+        # signature: (user_id, retry_after_seconds_or_none, fetched_at_unix).
+        self._on_quota_429 = on_quota_429
 
     async def start(self) -> None:
         home = self.config.user_home(self.user_id).resolve()
@@ -377,6 +387,22 @@ class ClaudeSession:
                     # without falling back to a heuristic window.
                     self._handle_worker_rate_limit_event(msg)
                     continue
+                if t == "quota_usage":
+                    # Mitm addon captured a /api/oauth/usage response
+                    # body (triggered by a /usage probe). Hand the raw
+                    # body up to the manager-supplied callback; the
+                    # account-name lookup happens there because session
+                    # doesn't know which account it belongs to.
+                    self._handle_worker_quota_event(msg)
+                    continue
+                if t == "quota_usage_429":
+                    # Upstream rate-limited the probe. Forward with the
+                    # parsed retry-after so QuotaProbeService can put
+                    # the account into cooldown — saves a wasted /usage
+                    # PTY interrupt on every subsequent tick until the
+                    # window clears.
+                    self._handle_worker_quota_429(msg)
+                    continue
                 req_id = msg.get("id")
                 channel = self._channels.get(req_id)
                 if channel is None:
@@ -555,6 +581,61 @@ class ClaudeSession:
         except Exception:
             log.exception("rate-limit event callback failed user=%s",
                           self.user_id)
+
+    def _handle_worker_quota_event(self, msg: dict) -> None:
+        """Forward a `/api/oauth/usage` capture to the manager's quota
+        callback. We don't validate the body shape here — let
+        QuotaProbeService deal with schema drift; it has dedicated logic
+        for ignoring junk while keeping the last good snapshot."""
+        if self._on_quota is None:
+            return
+        body = msg.get("body")
+        if not isinstance(body, dict):
+            return
+        fetched_at = msg.get("fetched_at_unix")
+        if not isinstance(fetched_at, (int, float)):
+            fetched_at = time.time()
+        try:
+            self._on_quota(self.user_id, body, float(fetched_at))
+        except Exception:
+            log.exception("quota event callback failed user=%s",
+                          self.user_id)
+
+    def _handle_worker_quota_429(self, msg: dict) -> None:
+        """Forward a /api/oauth/usage 429 to the manager's 429 hook so
+        QuotaProbeService can record a cooldown and stop hammering."""
+        if self._on_quota_429 is None:
+            return
+        retry_after = msg.get("retry_after_seconds")
+        if not isinstance(retry_after, (int, float)):
+            retry_after = None
+        fetched_at = msg.get("fetched_at_unix")
+        if not isinstance(fetched_at, (int, float)):
+            fetched_at = time.time()
+        try:
+            self._on_quota_429(self.user_id,
+                                float(retry_after) if retry_after is not None else None,
+                                float(fetched_at))
+        except Exception:
+            log.exception("quota 429 callback failed user=%s", self.user_id)
+
+    async def probe_quota(self) -> bool:
+        """Send `/usage` to the worker's TUI. Returns True iff the probe
+        message was written. The actual response arrives asynchronously
+        via a quota_usage event handled by `_handle_worker_quota_event`,
+        so this method does NOT wait for it — fire-and-forget by design
+        so a stuck TUI can't block the periodic probe scheduler.
+
+        Caller MUST hold self.lock (or guarantee no concurrent /v1/messages
+        is in flight) so the /usage keystroke doesn't race with a normal
+        trigger pattern."""
+        if self.proc is None or self.proc.returncode is not None:
+            return False
+        assert self.proc.stdin is not None
+        line = json.dumps({"type": "probe_quota"}) + "\n"
+        self.proc.stdin.write(line.encode())
+        await self.proc.stdin.drain()
+        return True
 
     def idle_seconds(self) -> float:
         return time.monotonic() - self.last_used

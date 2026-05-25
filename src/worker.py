@@ -117,14 +117,11 @@ class WorkerSession:
                 # facing screen says.
                 screen_tail = self.pty.dump_screen_tail()
                 matcher_view = self.pty.dump_recent_chunks_squeezed()
-                # Also tell the operator what the matcher anchors are
-                # vs what the matcher sees right now, so they can read
-                # the boolean themselves without re-running regex.
-                markers_present = []
-                if "Esctocancel" in matcher_view:
-                    markers_present.append("Esctocancel")
-                if "Tabtoamend" in matcher_view:
-                    markers_present.append("Tabtoamend")
+                # Which of the known _DISMISS_RULES are currently
+                # matching? If NONE, the modal blocking input is one
+                # we don't have a rule for yet — eyeball the matcher
+                # view above and add it to ClaudePtyDriver._DISMISS_RULES.
+                markers_present = self.pty.matching_modal_names()
                 log.warning(
                     "user=%s mitm did not intercept within %.0fs; "
                     "closing response and clearing pending slot.\n"
@@ -295,7 +292,21 @@ async def amain() -> None:
             except json.JSONDecodeError:
                 log.warning("malformed stdin line: %r", line[:200])
                 continue
-            if msg.get("type") != "request":
+            mtype = msg.get("type")
+            if mtype == "probe_quota":
+                # Fire-and-forget: type `/usage` into the TUI. The mitm
+                # addon captures the resulting /api/oauth/usage response
+                # body and pushes a `quota_usage` event onto
+                # session.events, which the relay below ships up via
+                # stdout. No req_id correlation — main process matches
+                # by user_id when it lands.
+                try:
+                    await session.pty.send_slash_command("/usage")
+                    log.info("probe_quota: sent /usage to TUI")
+                except Exception:
+                    log.exception("probe_quota: failed to send /usage")
+                continue
+            if mtype != "request":
                 continue
             req_id = msg.get("id")
             body = msg.get("body") or {}

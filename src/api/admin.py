@@ -70,6 +70,7 @@ def build_router(
     credentials_paths,
     usage_store: UsageStore | None = None,
     usage_disabled_reason: str | None = None,
+    quota_probe=None,
 ) -> APIRouter:
     """Build the admin router.
 
@@ -281,6 +282,38 @@ def build_router(
         else:
             aggregate = "not_needed"
         return {"ok": True, "result": aggregate, "details": details}
+
+    @router.get("/quotas")
+    async def get_quotas(
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Per-account subscription quota (5h / 7d / 7d-per-model
+        utilization). Snapshots are refreshed in the background every
+        `tick_seconds` (default 300s) by sending /usage to one idle
+        worker per account; mitm captures the resulting
+        /api/oauth/usage response.
+
+        Returns 503 if QuotaProbeService is disabled (legacy single-
+        account mode or no `accounts:` block in config).
+
+        Response shape:
+          {
+            "tick_seconds": 300,
+            "accounts": {
+              "claude-1": {
+                "snapshot": {five_hour, seven_day, ...} | null,
+                "last_error": {error, attempted_at_unix} | null,
+                "age_seconds": <int> | null,
+                "seconds_until_next_tick": <int>
+              },
+              ...
+            }
+          }"""
+        if quota_probe is None:
+            raise HTTPException(503,
+                "quota probe service not enabled "
+                "(requires multi-account config with `accounts:` block)")
+        return {"ok": True, **quota_probe.state_dict()}
 
     @router.get("/usage")
     async def get_usage(

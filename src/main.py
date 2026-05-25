@@ -18,6 +18,7 @@ from .api.openai import build_router as build_openai_router
 from .auth import make_auth_dep
 from .config import Config
 from .oauth_refresh import OAuthRefresher
+from .quota_probe import QuotaProbeService
 from .session.manager import SessionManager
 from .usage import UsageStore
 
@@ -66,6 +67,23 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
     claude_version = _detect_claude_version(config.claude.binary)
     log.info("claude code CLI version: %s", claude_version)
 
+    # Per-account quota tracker. Only meaningful in multi-account mode —
+    # each account has its own .credentials.json and thus its own
+    # subscription quota. Legacy single-account deployments get None
+    # here and /admin/quotas returns 503.
+    quota_probe: QuotaProbeService | None = None
+    if config.accounts:
+        quota_probe = QuotaProbeService(
+            manager=manager,
+            accounts=list(config.accounts.keys()),
+            tick_seconds=300.0,
+        )
+        # Manager fans worker quota_usage events into the service keyed
+        # by account name (worker → account resolution happens inside
+        # the manager so the session doesn't have to know).
+        manager.quota_record_cb = quota_probe.record
+        manager.quota_429_cb = quota_probe.record_429
+
     # In multi-account mode this returns one .credentials.json per
     # account (under /data/shared-auth/<acc>/.credentials.json); in
     # legacy mode it's the single operator path. The refresher iterates
@@ -90,6 +108,8 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         log.warning("oauth_refresh.enabled=false — workers will self-refresh; "
                     "multi-worker refresh_token rotation race may re-emerge")
 
+    quota_state = SimpleNamespace(task=None)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Refresh once SYNCHRONOUSLY before any worker spawns, so the
@@ -101,9 +121,24 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
             refresher_state.task = asyncio.create_task(
                 refresher_state.refresher.run(), name="oauth-refresher")
         await manager.start()
+        # Quota probe runs AFTER manager.start because prewarm populates
+        # the sessions dict (probe needs an idle worker per account).
+        # Initial probe is fire-and-forget — it logs failures but never
+        # blocks startup, and the periodic tick will retry every 5 min.
+        if quota_probe is not None:
+            asyncio.create_task(quota_probe.initial_probe(),
+                                name="quota-initial-probe")
+            quota_state.task = asyncio.create_task(
+                quota_probe.run(), name="quota-probe")
         try:
             yield
         finally:
+            if quota_state.task is not None:
+                quota_state.task.cancel()
+                try:
+                    await quota_state.task
+                except asyncio.CancelledError:
+                    pass
             await manager.stop()
             if refresher_state.task is not None:
                 refresher_state.task.cancel()
@@ -121,6 +156,7 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         credentials_paths=credentials_paths,
         usage_store=usage_store,
         usage_disabled_reason=usage_disabled_reason,
+        quota_probe=quota_probe,
     ))
 
     @app.get("/healthz")

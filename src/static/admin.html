@@ -400,6 +400,56 @@
     .usd-cell { color: #34d399; }
     .usd-cell.dim { color: #6b7280; }
 
+    /* ── Subscription quota (Anthropic /usage) ────────────────── */
+    .quota-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 14px;
+    }
+    .quota-card {
+      background: #131826; border: 1px solid #1f2433; border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .quota-card-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+      margin-bottom: 8px;
+    }
+    .quota-card-head .name {
+      font-size: 14px; font-weight: 600; color: #f3f4f6;
+    }
+    .quota-card-head .meta {
+      font-size: 11px; color: #6b7280;
+    }
+    .quota-card-head .meta.stale { color: #fbbf24; }
+    .quota-tier {
+      display: grid; grid-template-columns: 110px 1fr 56px;
+      gap: 10px; align-items: center;
+      padding: 6px 0;
+      font-size: 12px;
+    }
+    .quota-tier .label { color: #9ca3af; }
+    .quota-tier .bar {
+      background: #1f2433; height: 8px; border-radius: 4px;
+      overflow: hidden;
+    }
+    .quota-tier .bar-fill {
+      height: 100%; background: #10b981; transition: width 0.4s;
+    }
+    .quota-tier .bar-fill.warn { background: #f59e0b; }
+    .quota-tier .bar-fill.danger { background: #ef4444; }
+    .quota-tier .pct {
+      font-variant-numeric: tabular-nums;
+      text-align: right; color: #e5e7eb;
+    }
+    .quota-tier .pct.dim { color: #6b7280; }
+    .quota-card .reset {
+      margin-top: 6px; font-size: 11px; color: #6b7280;
+    }
+    .quota-card .err {
+      font-size: 11px; color: #f87171; margin-top: 4px;
+      white-space: pre-wrap; word-break: break-word;
+    }
+
     /* ── Scrollbar dark ─────────────────────────────────────── */
     ::-webkit-scrollbar { width: 10px; height: 10px; }
     ::-webkit-scrollbar-track { background: #0a0c12; }
@@ -443,10 +493,19 @@
       </div>
     </div>
 
-    <!-- ── 账号配额状态（仅多账号模式） ─────────────────────── -->
+    <!-- ── 订阅配额（Anthropic /usage）─────────────────────────── -->
+    <div class="section" id="quotaSection" style="display:none;">
+      <div class="section-head">
+        <span class="section-title">订阅配额</span>
+        <span class="section-meta">前端每 60 秒读取一次缓存；服务端每 5 分钟尝试探测，但上游 <code>/api/oauth/usage</code> 限速 1 次/小时/账号，实际刷新约 1 小时一次</span>
+      </div>
+      <div class="quota-grid" id="quotaGrid"></div>
+    </div>
+
+    <!-- ── 账号路由状态（被限流 / 不可用）───────────────────── -->
     <div class="section" id="accountsSection" style="display:none;">
       <div class="section-head">
-        <span class="section-title">账号配额状态</span>
+        <span class="section-title">账号路由状态</span>
         <span class="section-meta">达到限额的账号会被路由跳过；窗口到期自动恢复</span>
       </div>
       <div class="card">
@@ -654,6 +713,10 @@
         // same cadence as the worker view so the numbers don't drift
         // by a whole auto-refresh interval.
         refreshUsage(true);
+        // Quota cache lives server-side (refreshed every 5 min). Loading
+        // here on every /status refresh is cheap and ensures the panel
+        // reflects the latest cached snapshot.
+        loadQuotas(true);
       } catch (e) {
         showBanner('请求失败：' + e.message);
       } finally {
@@ -1023,6 +1086,164 @@
       return '<span class="usd-cell">$' + v.toFixed(2) + '</span>';
     }
 
+    // ── Subscription quota (Anthropic /api/oauth/usage) ────────
+    // Server probes every 5 min by injecting /usage into one idle
+    // worker per account; we just read the cached snapshot. Polling
+    // at 60s gives a snappy first-load + catches the next tick within
+    // a minute of when it actually lands server-side.
+    let quotaTimer = null;
+    function quotaBarCls(u) {
+      if (u == null) return '';
+      const n = (u > 1) ? u / 100 : u;
+      if (n > 0.85) return 'danger';
+      if (n > 0.60) return 'warn';
+      return '';
+    }
+    function quotaFmtPct(u) {
+      if (u == null) return '—';
+      const n = (u > 1) ? u : u * 100;
+      return Math.floor(n) + '%';
+    }
+    function quotaFmtResetIso(iso) {
+      if (!iso) return '';
+      const dt = new Date(iso);
+      if (isNaN(dt)) return '';
+      const ms = dt - new Date();
+      if (ms <= 0) return '已过期，等待下一次刷新';
+      const totalMin = Math.floor(ms / 60000);
+      const d = Math.floor(totalMin / 1440);
+      const h = Math.floor((totalMin % 1440) / 60);
+      const m = totalMin % 60;
+      if (d > 0) return `${d}天${h}小时后重置`;
+      if (h > 0) return `${h}小时${m}分钟后重置`;
+      return `${m}分钟后重置`;
+    }
+
+    async function loadQuotas(silent = false) {
+      const auth = authHeader();
+      if (!auth) return;
+      try {
+        const resp = await fetch('/admin/quotas', { headers: auth });
+        if (resp.status === 503) {
+          // Single-account mode — hide the section silently.
+          $('quotaSection').style.display = 'none';
+          return;
+        }
+        if (resp.status === 401) { return; }
+        if (!resp.ok) {
+          if (!silent) showToast(`配额加载失败：HTTP ${resp.status}`, 'error');
+          return;
+        }
+        renderQuotas(await resp.json());
+      } catch (e) {
+        if (!silent) showToast('配额加载失败：' + e.message, 'error');
+      }
+    }
+
+    // Tier display order — `extra_tiers` (Anthropic future-adds) gets
+    // appended after these four. Labels are intentionally short so
+    // the 110px grid column doesn't wrap on a typical viewport.
+    const QUOTA_TIERS = [
+      { key: 'five_hour',         label: '5 小时窗口'   },
+      { key: 'seven_day',         label: '7 天总额度'   },
+      { key: 'seven_day_opus',    label: '7 天 Opus'    },
+      { key: 'seven_day_sonnet',  label: '7 天 Sonnet'  },
+    ];
+
+    function renderQuotaTier(label, tier) {
+      const u = tier ? (tier.utilization ?? tier.utilizationPercent) : null;
+      const reset = tier ? (tier.resets_at || tier.resetsAt
+                            || tier.reset_at || tier.resetAt) : '';
+      const pctText = quotaFmtPct(u);
+      const norm = (u == null) ? 0 : (u > 1 ? u / 100 : u);
+      const cls = quotaBarCls(u);
+      return `
+        <div class="quota-tier" ${reset ? `title="${escapeHtml(quotaFmtResetIso(reset))}"` : ''}>
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="bar"><div class="bar-fill ${cls}" style="width:${Math.min(100, norm * 100).toFixed(1)}%"></div></div>
+          <div class="pct ${u == null ? 'dim' : ''}">${pctText}</div>
+        </div>
+      `;
+    }
+
+    function renderQuotas(data) {
+      const accounts = data.accounts || {};
+      const names = Object.keys(accounts).sort();
+      if (!names.length) {
+        $('quotaSection').style.display = 'none';
+        return;
+      }
+      $('quotaSection').style.display = '';
+      const grid = $('quotaGrid');
+      grid.innerHTML = names.map(name => {
+        const a = accounts[name];
+        const snap = a.snapshot;
+        const err = a.last_error;
+        const cdRem = a.cooldown_seconds_remaining || 0;
+        // Stale heuristic: more than 2× tick interval old → operator
+        // sees a yellow badge. Server tick is 5min; >10min stale means
+        // probes have been failing or workers were all busy.
+        const ageS = a.age_seconds;
+        const stale = (ageS != null && ageS > (data.tick_seconds || 300) * 2);
+        let ageLabel;
+        if (ageS == null) {
+          ageLabel = cdRem > 0
+            ? `等待上游冷却 ${Math.ceil(cdRem/60)} 分钟`
+            : '尚未取到数据';
+        } else if (ageS < 60) {
+          ageLabel = `${ageS} 秒前刷新`;
+        } else if (ageS < 3600) {
+          ageLabel = `${Math.floor(ageS/60)} 分钟前刷新`;
+        } else {
+          ageLabel = `${(ageS/3600).toFixed(1)} 小时前刷新`;
+        }
+        if (ageS != null && cdRem > 0) {
+          ageLabel += `（下次 ${Math.ceil(cdRem/60)} 分钟后）`;
+        }
+
+        let tiersHtml;
+        if (snap) {
+          const all = [...QUOTA_TIERS];
+          // Append any extra_tiers Anthropic shipped that we don't
+          // have hardcoded labels for. Use the key itself as label.
+          const extra = snap.extra_tiers || {};
+          for (const k of Object.keys(extra)) {
+            all.push({ key: k, label: k, _extra: true });
+          }
+          tiersHtml = all.map(t => {
+            const tier = t._extra ? extra[t.key] : snap[t.key];
+            return renderQuotaTier(t.label, tier);
+          }).join('');
+        } else {
+          tiersHtml = `<div class="empty-state" style="padding:14px 0;">
+            ${err ? '探针失败，等待下一次刷新' : '尚未取到数据，请稍候'}
+          </div>`;
+        }
+        const errHtml = err
+          ? `<div class="err">最近一次失败：${escapeHtml(err.error || '')}</div>`
+          : '';
+        return `
+          <div class="quota-card">
+            <div class="quota-card-head">
+              <span class="name">${escapeHtml(name)}</span>
+              <span class="meta ${stale ? 'stale' : ''}">${ageLabel}</span>
+            </div>
+            ${tiersHtml}
+            ${errHtml}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function startQuotaPolling() {
+      if (quotaTimer) clearInterval(quotaTimer);
+      // 60s client poll — server itself only refreshes every 5min, so
+      // most polls just re-render the same numbers. Faster cadence is
+      // cheap (cached response) and ensures the operator sees the new
+      // numbers within a minute of the server's tick landing.
+      quotaTimer = setInterval(() => loadQuotas(true), 60 * 1000);
+    }
+
     async function refreshUsage(silent = false) {
       const auth = authHeader();
       if (!auth) return;
@@ -1158,6 +1379,7 @@
 
     // initial run
     setupAutoRefresh();
+    startQuotaPolling();
     if (apiKeyInput.value) {
       refresh();
     }

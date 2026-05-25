@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from ..config import Config
 from ..usage import UsageStore
@@ -54,6 +55,16 @@ class SessionManager:
         # _on_worker_usage short-circuits in that case so the worker
         # still emits the IPC (cheap) but we silently drop it.
         self.usage_store = usage_store
+        # Callable set by main.py once QuotaProbeService exists:
+        # signature (account_name, body, fetched_at_unix). When a worker
+        # emits a quota_usage event, _on_worker_quota looks up the
+        # account name and dispatches via this hook. None when the
+        # service is disabled (no `accounts:` block — there's no
+        # per-account state to keep).
+        self.quota_record_cb: Callable[[str, dict, float], None] | None = None
+        # Companion for the 429 path. signature:
+        # (account_name, retry_after_seconds_or_none, fetched_at_unix).
+        self.quota_429_cb: Callable[[str, float | None, float], None] | None = None
         self.sessions: dict[str, ClaudeSession] = {}
         self.lock = asyncio.Lock()
         self._next_port_offset = 0
@@ -232,6 +243,73 @@ class SessionManager:
             log.exception("usage record failed user=%s payload=%s",
                           user_id, payload)
 
+    def _on_worker_quota(self, user_id: str, body: dict,
+                          fetched_at_unix: float) -> None:
+        """Forward a /usage probe result to QuotaProbeService keyed by
+        account. Best-effort: any failure is logged, never propagates —
+        quota tracking is observability."""
+        if self.quota_record_cb is None:
+            return
+        try:
+            account = self._account_name_for(user_id)
+            if account is None:
+                # Legacy single-account mode has no account name — skip.
+                return
+            self.quota_record_cb(account, body, fetched_at_unix)
+        except Exception:
+            log.exception("quota record failed user=%s", user_id)
+
+    def _on_worker_quota_429(self, user_id: str,
+                              retry_after_seconds: float | None,
+                              fetched_at_unix: float) -> None:
+        """Forward a /api/oauth/usage 429 to QuotaProbeService keyed by
+        account, so the service can put the account into cooldown."""
+        if self.quota_429_cb is None:
+            return
+        try:
+            account = self._account_name_for(user_id)
+            if account is None:
+                return
+            self.quota_429_cb(account, retry_after_seconds, fetched_at_unix)
+        except Exception:
+            log.exception("quota 429 record failed user=%s", user_id)
+
+    async def probe_quota_for_account(self, account_name: str) -> str | None:
+        """Pick one idle worker in the account and trigger a /usage probe
+        on it. Returns the user_id used, or None if no worker was
+        available (all busy, or account has no workers).
+
+        Probing requires holding the worker's session.lock so the /usage
+        keystroke doesn't race with a real /v1/messages trigger. To
+        avoid waiting on a long-running call, we ONLY pick workers
+        whose lock is not currently held — if everyone's busy, this
+        tick is skipped and the next 5-min cycle retries."""
+        # Find workers belonging to this account.
+        candidates: list[ClaudeSession] = []
+        for user_id, sess in self.sessions.items():
+            if self._account_name_for(user_id) != account_name:
+                continue
+            if sess.proc is None or sess.proc.returncode is not None:
+                continue
+            candidates.append(sess)
+        if not candidates:
+            return None
+        # Prefer truly-idle workers (no in-flight + lock not held). Fall
+        # back to any worker with no in-flight even if lock briefly held
+        # (e.g. by a prewarm cycle). If everyone's busy serving real
+        # traffic, skip this tick.
+        idle_unlocked = [s for s in candidates
+                         if not s._channels and not s.lock.locked()]
+        target = idle_unlocked[0] if idle_unlocked else None
+        if target is None:
+            log.info("quota probe: no idle worker for account=%s "
+                     "(workers=%d); skipping this tick",
+                     account_name, len(candidates))
+            return None
+        async with target.lock:
+            ok = await target.probe_quota()
+        return target.user_id if ok else None
+
     def lifecycle_since(self, group_by: str, key: str) -> float:
         """Resolve the `range=lifecycle` query's lower bound for a given
         group bucket. Lifecycle is per-worker conceptually; for grouped
@@ -327,7 +405,8 @@ class SessionManager:
                 sess = ClaudeSession(user_id=user_id, mitm_port=port,
                                      config=self.config,
                                      on_rate_limit=self._on_worker_rate_limited,
-                                     on_usage=self._on_worker_usage)
+                                     on_usage=self._on_worker_usage,
+                                     on_quota=self._on_worker_quota)
                 await sess.start()
                 self.sessions[user_id] = sess
                 await sess.lock.acquire()
@@ -449,7 +528,9 @@ class SessionManager:
                     sess = ClaudeSession(user_id=uid, mitm_port=port,
                                          config=self.config,
                                          on_rate_limit=self._on_worker_rate_limited,
-                                         on_usage=self._on_worker_usage)
+                                         on_usage=self._on_worker_usage,
+                                         on_quota=self._on_worker_quota,
+                                         on_quota_429=self._on_worker_quota_429)
                     self.sessions[uid] = sess
                     # Hold sess.lock immediately so a real request that
                     # somehow races in (shouldn't on startup, but defensive)
