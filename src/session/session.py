@@ -55,12 +55,30 @@ def _summarize_body(
                     last_user_text = blk.get("text", "")
                     break
         break
+    # Strip Claude Code's `<system-reminder>...</system-reminder>`
+    # blocks before truncating. The CLI injects them into the last
+    # user message to carry harness metadata (available skills, cwd,
+    # permission mode, etc.) — useful upstream but pure noise on the
+    # /status preview, where the operator wants to see the actual
+    # natural-language intent of the request. Multiple reminder blocks
+    # can appear; strip them ALL, then collapse runs of whitespace
+    # left behind so the surviving prose reads naturally.
+    cleaned = re.sub(
+        r"<system-reminder>.*?</system-reminder>",
+        "", last_user_text, flags=re.DOTALL)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     # 留够多让 /ui 的 hover tooltip 能显示完整消息体；上限是为了避免
     # 把整段 system prompt / 多 KB 用户输入塞进 /status 响应。
     _PREVIEW_LIMIT = 2000
-    preview = last_user_text[:_PREVIEW_LIMIT]
-    if len(last_user_text) > _PREVIEW_LIMIT:
+    preview = cleaned[:_PREVIEW_LIMIT]
+    if len(cleaned) > _PREVIEW_LIMIT:
         preview += "…"
+    # Empty after stripping means the entire user message was just
+    # reminder boilerplate (Claude Code's startup probes do this).
+    # Show a placeholder so the column isn't blank and operators can
+    # tell it's a no-content request rather than a missing summary.
+    if not preview:
+        preview = "(仅 system-reminder, 无用户正文)"
     summary: dict[str, Any] = {
         "model": body.get("model"),
         "max_tokens": body.get("max_tokens"),
