@@ -222,7 +222,36 @@ class Config(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
+        """Load config.yaml. If a sibling runtime file exists at the
+        path returned by `runtime_accounts_path_for(config)`, its
+        `accounts:` block is merged on top of the static config — keys
+        in both files come from runtime (operator can override via
+        config.yaml by removing the runtime entry).
+
+        The runtime file is where dashboard-driven account additions
+        get persisted, so config.yaml stays read-only and pristine."""
         data: dict[str, Any] = yaml.safe_load(Path(path).read_text())
+        # Runtime accounts overlay. Path is derived from usage.db_path's
+        # parent (which is the RW-mounted /data/proxy/), with a fixed
+        # filename. Falls back silently when the file doesn't exist —
+        # cold-start runs through config.yaml alone, same as before.
+        runtime_path = _runtime_accounts_path(data)
+        if runtime_path is not None and runtime_path.is_file():
+            try:
+                runtime_data = yaml.safe_load(runtime_path.read_text()) or {}
+            except yaml.YAMLError:
+                runtime_data = {}
+            runtime_accounts = runtime_data.get("accounts")
+            if isinstance(runtime_accounts, dict):
+                merged_accounts = dict(data.get("accounts") or {})
+                merged_accounts.update(runtime_accounts)
+                data["accounts"] = merged_accounts
+                # If api_key is set and users[] wasn't explicitly
+                # carved out, expand the auto-populated pool to cover
+                # the newly merged accounts. Without this, the
+                # validator would still build users[api_key] from the
+                # full account set, but only if users[api_key] is
+                # absent — operator overrides win.
         return cls.model_validate(data)
 
     def user_home(self, user_id: str) -> Path:
@@ -265,3 +294,49 @@ class Config(BaseModel):
             self.account_dir(name) / ".credentials.json"
             for name in sorted(self.accounts.keys())
         ]
+
+    def runtime_accounts_path(self) -> Path | None:
+        """Where dashboard-added accounts get persisted. Lives alongside
+        the usage sqlite db (already RW-mounted) so we don't need a
+        separate writable volume. None if usage tracking is disabled —
+        in that case dynamic accounts are in-memory only and lost on
+        restart (a deliberate degradation, not a hard error)."""
+        if not self.usage.db_path:
+            return None
+        return Path(self.usage.db_path).parent / "accounts.runtime.yaml"
+
+    def write_runtime_accounts(self) -> None:
+        """Serialise self.accounts into the runtime overlay file. Writes
+        the FULL accounts dict — load() merges runtime on top of static
+        config.yaml, so anything in runtime wins. Operator-edited
+        accounts in config.yaml that ALSO appear in runtime would get
+        runtime's values; remove from runtime to fall back to static."""
+        path = self.runtime_accounts_path()
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "accounts": {
+                name: {"dir": acc.dir, "workers": acc.workers}
+                for name, acc in self.accounts.items()
+            }
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(yaml.safe_dump(payload, allow_unicode=True,
+                                       sort_keys=True))
+        tmp.replace(path)
+
+
+def _runtime_accounts_path(data: dict) -> Path | None:
+    """Module-level twin of `Config.runtime_accounts_path` for use
+    during `load()` — we need to know the path BEFORE the Config
+    instance exists. Reads usage.db_path out of the raw dict; falls
+    back to /data/proxy/accounts.runtime.yaml (the docker-compose
+    default) when usage block is missing."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    db_path: str | None = None
+    if isinstance(usage, dict):
+        db_path = usage.get("db_path") if isinstance(usage.get("db_path"), str) else None
+    if not db_path:
+        db_path = "/data/proxy/usage.db"
+    return Path(db_path).parent / "accounts.runtime.yaml"

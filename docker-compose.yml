@@ -60,16 +60,19 @@ services:
     volumes:
       # config (RO)
       - ./config.yaml:/data/config.yaml:ro
-      # Per-account bind mounts. Each account is one self-contained
-      # directory holding .credentials.json, .claude.json, projects/,
-      # etc. Workers symlink their ~/.claude to the matching dir, so a
-      # claude-CLI atomic token refresh (write tmp + rename) lands
-      # directly on the shared file and the rotated token is visible to
-      # every sibling worker. Add one line per account in `accounts:`
-      # of config.yaml — paths must match exactly.
-      - ./data/shared-auth/claude-1:/data/shared-auth/claude-1
-      - ./data/shared-auth/claude-2:/data/shared-auth/claude-2
-      - ./data/shared-auth/claude-3:/data/shared-auth/claude-3
+      # Whole shared-auth tree as a single bind mount. Each subdir is
+      # one account (claude-1, claude-2, ...), holding .credentials.json
+      # + .claude.json + projects/. Mounting the PARENT (not per-account)
+      # means new accounts added at runtime (via the dashboard's "+
+      # 添加账号" flow → claude auth login → writes to a fresh subdir)
+      # appear inside the container immediately, with no docker-compose
+      # edit + recreate required. Per-account isolation is still strict
+      # because each worker only symlinks ~/.claude to ITS assigned
+      # subdir; sibling subdirs are inaccessible from the worker's
+      # perspective. claude-CLI's atomic token refresh (write tmp +
+      # rename) lands inside the assigned subdir so the rotated token
+      # is visible to every worker sharing that account.
+      - ./data/shared-auth:/data/shared-auth
       # mitm CA — named volume so the auto-generated CA persists across
       # `docker compose down` / restart. Wipe with `docker compose down -v`.
       - mitm-ca:/home/coder/.mitmproxy

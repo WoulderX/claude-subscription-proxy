@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -49,6 +50,7 @@ _HOT_RELOADABLE = {
     "oauth_refresh.check_interval_seconds",
     "oauth_refresh.refresh_when_expires_within_seconds",
     "users",
+    "accounts",
 }
 
 _REQUIRES_RESTART = {
@@ -71,6 +73,7 @@ def build_router(
     usage_store: UsageStore | None = None,
     usage_disabled_reason: str | None = None,
     quota_probe=None,
+    login_registry=None,
 ) -> APIRouter:
     """Build the admin router.
 
@@ -130,6 +133,12 @@ def build_router(
         await _apply_oauth_refresh(
             config, new_config, refresher_state, credentials_paths,
             changes, warnings)
+
+        # --- accounts (add / remove / worker-count diff) ---
+        # Must run BEFORE users diff so the user pool entries that
+        # reference the new account's user_ids land on already-spawned
+        # sessions (get_or_create is happy to grab an existing one).
+        await _apply_accounts_diff(config, new_config, manager, changes)
 
         # --- users (add / remove) ---
         await _apply_users_diff(config, new_config, manager, changes)
@@ -314,6 +323,191 @@ def build_router(
                 "quota probe service not enabled "
                 "(requires multi-account config with `accounts:` block)")
         return {"ok": True, **quota_probe.state_dict()}
+
+    @router.post("/accounts/new")
+    async def begin_account_login(
+        payload: dict[str, Any] = Body(...),
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Start a `claude auth login --claudeai` flow for a new
+        account. Returns the OAuth authorize URL — the dashboard opens
+        it in a browser, the operator authorizes, and the resulting
+        callback code gets pasted back to POST .../finish.
+
+        Body: {"name": "claude-4", "workers": 5}  (workers optional, default 5)
+
+        Errors:
+          - 400 if name is invalid or already in use
+          - 503 if login_registry is not configured (legacy mode)
+          - 504 if the CLI doesn't print the URL in time"""
+        if login_registry is None:
+            raise HTTPException(503,
+                "OAuth login flow unavailable — login_registry not "
+                "wired (legacy single-account mode?)")
+        name = payload.get("name")
+        workers = payload.get("workers") or 5
+        if not isinstance(name, str) or not name or "/" in name:
+            raise HTTPException(400,
+                "name must be a non-empty string with no '/' (e.g. 'claude-4')")
+        if name in config.accounts:
+            raise HTTPException(400,
+                f"account {name!r} already exists in config; pick another name")
+        if not isinstance(workers, int) or workers < 1 or workers > 20:
+            raise HTTPException(400,
+                "workers must be an int in [1, 20]")
+        # Reserve the dest directory inside the shared-auth tree so
+        # finish() lands at a predictable path. The parent bind mount
+        # makes this visible on the host.
+        dest_dir = Path("/data/shared-auth") / name
+        if dest_dir.exists() and any(dest_dir.iterdir()):
+            raise HTTPException(400,
+                f"{dest_dir} already has contents — refuse to clobber. "
+                f"Remove the directory manually if you want to re-create "
+                f"this account.")
+        try:
+            url = await login_registry.begin(
+                name, dest_dir, claude_binary=config.claude.binary)
+        except Exception as e:
+            log.exception("OAuth login begin failed")
+            raise HTTPException(500, f"login begin failed: {e}")
+        return {
+            "ok": True,
+            "account": name,
+            "workers": workers,
+            "authorize_url": url,
+        }
+
+    @router.post("/accounts/new/{name}/finish")
+    async def finish_account_login(
+        name: str,
+        payload: dict[str, Any] = Body(...),
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Submit the OAuth callback code, complete the CLI's token
+        exchange, install credentials at /data/shared-auth/{name}/,
+        then add the account to config + spawn workers.
+
+        Body: {"code": "...", "workers": 5}  (workers optional, default 5)"""
+        if login_registry is None:
+            raise HTTPException(503, "OAuth login flow unavailable")
+        code = payload.get("code")
+        workers = payload.get("workers") or 5
+        if not isinstance(code, str) or not code.strip():
+            raise HTTPException(400, "code must be a non-empty string")
+        if not isinstance(workers, int) or workers < 1 or workers > 20:
+            raise HTTPException(400, "workers must be an int in [1, 20]")
+        try:
+            installed = await login_registry.finish(name, code)
+        except KeyError:
+            raise HTTPException(404,
+                f"no in-progress login flow for account {name!r}; "
+                "did POST /admin/accounts/new run first?")
+        except Exception as e:
+            log.exception("OAuth login finish failed")
+            raise HTTPException(500, f"login finish failed: {e}")
+
+        # Wire the new account into config + spawn workers. The
+        # AccountConfig type is imported at module-level; reuse it.
+        from ..config import AccountConfig
+        dest_dir = str(Path("/data/shared-auth") / name)
+        config.accounts[name] = AccountConfig(dir=dest_dir, workers=workers)
+        # Extend the auto-populated api_key pool if it exists (mirrors
+        # Config._wire_accounts behavior on cold start). If the operator
+        # is running with explicit per-account `users:` pools, they have
+        # to wire the new account themselves — we don't know which key
+        # should map to it.
+        new_user_ids = [f"{name}-{i}" for i in range(workers)]
+        if config.api_key and config.api_key in config.users:
+            existing = list(config.users[config.api_key])
+            for uid in new_user_ids:
+                if uid not in existing:
+                    existing.append(uid)
+            config.users[config.api_key] = existing
+        # Persist to the runtime overlay so the account survives
+        # container restarts without manual config.yaml edits.
+        try:
+            config.write_runtime_accounts()
+        except Exception:
+            log.exception("failed to persist runtime accounts overlay")
+        # Spawn workers (serial + prewarm within the account).
+        try:
+            spawned = await manager.spawn_account(name)
+        except Exception as e:
+            log.exception("spawn_account failed after successful login")
+            # Don't roll back config — credentials are written, the
+            # account exists. Operator can manually trigger a restart
+            # to retry the spawn.
+            raise HTTPException(500,
+                f"login succeeded but spawn_account failed: {e}; "
+                f"credentials are installed at /data/shared-auth/{name}/, "
+                f"restart the container to retry")
+        return {
+            "ok": True,
+            "account": name,
+            "workers_spawned": len(spawned),
+            "credentials_path": installed.get("credentials_path"),
+        }
+
+    @router.post("/accounts/new/{name}/abort")
+    async def abort_account_login(
+        name: str,
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Cancel an in-progress flow (e.g. operator changed their
+        mind). Idempotent — returns ok=true even if nothing to abort."""
+        if login_registry is None:
+            raise HTTPException(503, "OAuth login flow unavailable")
+        aborted = await login_registry.abort(name)
+        return {"ok": True, "aborted": aborted}
+
+    @router.delete("/accounts/{name}")
+    async def delete_account(
+        name: str,
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Stop all workers for an account and remove it from config.
+        The on-disk credentials at /data/shared-auth/{name}/ are
+        DELETED (account is gone for good).
+
+        Use /admin/accounts/{name}/clear-rate-limit if you just want
+        to clear a rate-limit mark without removing the account."""
+        if name not in config.accounts:
+            raise HTTPException(404,
+                f"account {name!r} not in config.accounts; "
+                f"available: {sorted(config.accounts.keys())}")
+        try:
+            stopped = await manager.stop_account(name)
+        except Exception as e:
+            log.exception("stop_account failed for %s", name)
+            raise HTTPException(500, f"stop_account failed: {e}")
+        # Drop from config + prune user pools.
+        config.accounts.pop(name, None)
+        prefix = f"{name}-"
+        for token, pool in list(config.users.items()):
+            kept = [u for u in pool if not u.startswith(prefix)]
+            if not kept:
+                config.users.pop(token, None)
+            else:
+                config.users[token] = kept
+        # Persist runtime overlay (or remove file if no dynamic accounts left)
+        try:
+            config.write_runtime_accounts()
+        except Exception:
+            log.exception("failed to persist runtime accounts overlay")
+        # Wipe credentials on disk
+        import shutil
+        dest_dir = Path("/data/shared-auth") / name
+        try:
+            if dest_dir.is_dir():
+                shutil.rmtree(dest_dir)
+        except Exception:
+            log.exception("failed to remove %s", dest_dir)
+        return {
+            "ok": True,
+            "account": name,
+            "workers_stopped": stopped,
+            "dir_removed": str(dest_dir),
+        }
 
     @router.get("/usage")
     async def get_usage(
@@ -542,6 +736,71 @@ async def _apply_oauth_refresh(
     config.oauth_refresh.enabled = new_enabled
     config.oauth_refresh.check_interval_seconds = new_check
     config.oauth_refresh.refresh_when_expires_within_seconds = new_window
+
+
+async def _apply_accounts_diff(
+    config: Config,
+    new_config: Config,
+    manager: SessionManager,
+    changes: list[str],
+) -> None:
+    """Compare old vs new accounts dict and reconcile via SessionManager.
+
+    Three kinds of change:
+      - added (name in new but not old)    → spawn workers + prewarm
+      - removed (in old but not new)       → drain + stop workers
+      - workers-count changed for same name → log warning, NOT applied
+        (changing N would require selectively spawning or stopping
+        workers within an account; we leave that for a future commit
+        and just refuse — operator can remove + re-add the account if
+        they really need to resize it).
+
+    Workers are spawned BEFORE config.accounts is mutated so that the
+    SessionManager's get_or_create / pick path sees the new account
+    consistently after this returns. Same for removal: stop_account is
+    awaited before we drop the dict entry."""
+    old_names = set(config.accounts.keys())
+    new_names = set(new_config.accounts.keys())
+    added_names = new_names - old_names
+    removed_names = old_names - new_names
+
+    # Worker-count change without name change — refuse for now.
+    for name in (old_names & new_names):
+        old_n = config.accounts[name].workers
+        new_n = new_config.accounts[name].workers
+        if old_n != new_n:
+            changes.append(
+                f"accounts.{name}.workers: {old_n} -> {new_n} "
+                "(ignored — resize requires remove + re-add for now)")
+
+    # Add: install in self.config.accounts first, then spawn (manager
+    # reads config.accounts to resolve which account a user_id belongs
+    # to during spawn).
+    for name in sorted(added_names):
+        config.accounts[name] = new_config.accounts[name]
+        try:
+            spawned = await manager.spawn_account(name)
+            changes.append(
+                f"accounts added: {name} ({len(spawned)} workers spawned)")
+        except Exception as e:
+            log.exception("spawn_account failed for %s", name)
+            # Roll back the config.accounts mutation so an unspawned
+            # account doesn't show up in /status as a phantom.
+            config.accounts.pop(name, None)
+            changes.append(f"accounts add FAILED: {name}: {e}")
+
+    # Remove: stop workers first, then drop the config entry. Workers
+    # whose account just got pulled have nothing to symlink ~/.claude
+    # to — keeping them alive would be a no-op.
+    for name in sorted(removed_names):
+        try:
+            stopped = await manager.stop_account(name)
+            config.accounts.pop(name, None)
+            changes.append(
+                f"accounts removed: {name} ({stopped} workers stopped)")
+        except Exception as e:
+            log.exception("stop_account failed for %s", name)
+            changes.append(f"accounts remove FAILED: {name}: {e}")
 
 
 async def _apply_users_diff(

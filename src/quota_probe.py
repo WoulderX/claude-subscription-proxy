@@ -30,7 +30,10 @@ import datetime
 import logging
 import time
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
+
+import yaml
 
 if TYPE_CHECKING:
     from .session.manager import SessionManager
@@ -89,10 +92,17 @@ class QuotaProbeService:
 
     def __init__(self, manager: "SessionManager", *,
                  accounts: list[str],
-                 tick_seconds: float = 300.0) -> None:
+                 tick_seconds: float = 300.0,
+                 cooldown_path: Path | None = None) -> None:
         self.manager = manager
         self.accounts = list(accounts)
         self.tick_seconds = float(tick_seconds)
+        # Where to persist active 429 cooldowns. None disables
+        # persistence — useful in tests or when /data/proxy isn't
+        # mounted RW. With persistence, container rebuild no longer
+        # triggers a fresh wave of probes against accounts that are
+        # still under Anthropic's penalty cooldown.
+        self.cooldown_path = cooldown_path
         self._snapshots: dict[str, QuotaSnapshot] = {}
         self._errors: dict[str, QuotaAttemptError] = {}
         # monotonic clock — defends against system clock jumps for
@@ -108,6 +118,120 @@ class QuotaProbeService:
         # (UI display) so a clock jump doesn't free a cooldown early.
         self._cooldown_until_mono: dict[str, float] = {}
         self._cooldown_until_wall: dict[str, float] = {}
+        # Wall-clock twin of `_last_success_mono`. Populated by record()
+        # on every successful probe; persisted to the cooldown file so
+        # a rebuild within `tick_seconds` of the last success soft-
+        # skips that account instead of triggering a fresh /usage burst.
+        self._last_success_wall: dict[str, float] = {}
+        # Restore any persisted cooldowns from a previous container
+        # incarnation. Expired entries are dropped silently. New
+        # accounts (not in the file) start with no gate, same as a
+        # fresh install.
+        self._load_cooldown_state()
+
+    # ── cooldown persistence (survives container restart) ───────────
+
+    def _load_cooldown_state(self) -> None:
+        """Restore active gates from disk. Two kinds:
+
+          - `until_unix`: a hard 429 cooldown. Active until that
+            wall-clock instant; past entries are dropped silently.
+          - `last_success_unix`: a soft tick-aware cooldown. The
+            account was last probed successfully at that moment;
+            we restore `_last_success_mono` so the periodic tick
+            (which gates on `now - last_success >= tick_seconds`)
+            soft-skips until the natural 5-min window elapses.
+
+        Monotonic anchors are reconstructed by translating wall-clock
+        distance into a future/past monotonic offset, so a clock jump
+        backward can't free a cooldown early."""
+        if self.cooldown_path is None or not self.cooldown_path.is_file():
+            return
+        try:
+            data = yaml.safe_load(self.cooldown_path.read_text()) or {}
+        except (yaml.YAMLError, OSError) as e:
+            log.warning("quota cooldown file unreadable (%s); ignoring", e)
+            return
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if not isinstance(accounts, dict):
+            return
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        restored_hard = 0
+        restored_soft = 0
+        for name, entry in accounts.items():
+            if not isinstance(entry, dict):
+                continue
+            until_wall = entry.get("until_unix")
+            last_success_wall = entry.get("last_success_unix")
+            if isinstance(until_wall, (int, float)):
+                # Hard cooldown path (429 not yet expired).
+                remaining = float(until_wall) - now_wall
+                if remaining <= 0:
+                    continue
+                self._cooldown_until_wall[name] = float(until_wall)
+                self._cooldown_until_mono[name] = now_mono + remaining
+                self._last_attempt_mono[name] = now_mono
+                self._errors[name] = QuotaAttemptError(
+                    attempted_at_unix=now_wall,
+                    error=(f"已持久化的 429 冷却，仍剩 {int(remaining)}s "
+                           f"— 下一次成功探测会清除"),
+                    cooldown_until_unix=float(until_wall),
+                )
+                restored_hard += 1
+            elif isinstance(last_success_wall, (int, float)):
+                # Soft cooldown: the tick gate compares
+                # (now_mono - _last_success_mono) against tick_seconds.
+                # Translate the recorded wall time into a synthetic
+                # monotonic so the comparison gives the same answer
+                # it would have if the process had not restarted.
+                elapsed = now_wall - float(last_success_wall)
+                if elapsed >= self.tick_seconds or elapsed < 0:
+                    # Too old (next tick should fire) or future (clock
+                    # jumped) — skip; treat as no prior success.
+                    continue
+                self._last_success_mono[name] = now_mono - elapsed
+                self._last_success_wall[name] = float(last_success_wall)
+                # Also bump _last_attempt_mono so the 60s MIN_REFRESH
+                # floor blocks an immediate refresh attempt too.
+                self._last_attempt_mono[name] = now_mono - elapsed
+                restored_soft += 1
+        if restored_hard or restored_soft:
+            log.info("quota cooldown: restored hard=%d soft=%d from %s",
+                     restored_hard, restored_soft, self.cooldown_path)
+
+    def _save_cooldown_state(self) -> None:
+        """Atomic-write the current gate state. For each account we
+        emit the strongest active gate: 429 cooldowns override
+        success windows; entries whose window has elapsed are omitted
+        so the file naturally drains. No-op when cooldown_path is None."""
+        if self.cooldown_path is None:
+            return
+        now_wall = time.time()
+        out: dict[str, dict[str, float]] = {}
+        # Hard 429 cooldowns first — they dominate per record_429's
+        # contract (which also pops last_success_wall).
+        for name, until in self._cooldown_until_wall.items():
+            if until > now_wall:
+                out[name] = {"until_unix": float(until)}
+        # Soft success windows. Skip accounts already captured by a
+        # 429 entry; skip success records older than tick_seconds (the
+        # tick would no longer block them, persisting is just noise).
+        for name, last_success in self._last_success_wall.items():
+            if name in out:
+                continue
+            if (now_wall - last_success) >= self.tick_seconds:
+                continue
+            out[name] = {"last_success_unix": float(last_success)}
+        payload = {"accounts": out}
+        try:
+            self.cooldown_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.cooldown_path.with_suffix(
+                self.cooldown_path.suffix + ".tmp")
+            tmp.write_text(yaml.safe_dump(payload, sort_keys=True))
+            tmp.replace(self.cooldown_path)
+        except OSError as e:
+            log.warning("quota cooldown persist failed: %s", e)
 
     # ── ingress: called from SessionManager._on_worker_quota ─────────
 
@@ -135,12 +259,20 @@ class QuotaProbeService:
             **kwargs,
         )
         self._errors.pop(account_name, None)
-        self._last_success_mono[account_name] = time.monotonic()
-        self._last_attempt_mono[account_name] = time.monotonic()
-        # Success clears any active cooldown — fresh data trumps a
-        # stale "we were rate-limited an hour ago" gate.
+        now_mono = time.monotonic()
+        self._last_success_mono[account_name] = now_mono
+        self._last_attempt_mono[account_name] = now_mono
+        # Track wall-clock so we can persist "last successful probe at
+        # T" — load() converts it back into a future monotonic skip.
+        self._last_success_wall[account_name] = fetched_at_unix
+        # Success clears any active 429 cooldown — fresh data trumps a
+        # stale "we were rate-limited an hour ago" gate. The persisted
+        # state replaces `until_unix` with `last_success_unix` for this
+        # account so the next rebuild within tick_seconds soft-skips
+        # instead of re-probing.
         self._cooldown_until_mono.pop(account_name, None)
         self._cooldown_until_wall.pop(account_name, None)
+        self._save_cooldown_state()
         log.info("quota recorded account=%s 5h=%s%% 7d=%s%%",
                  account_name,
                  (kwargs.get("five_hour") or {}).get("utilization"),
@@ -229,8 +361,17 @@ class QuotaProbeService:
             cooldown_until_unix=fetched_at_unix + backoff,
         )
         self._last_attempt_mono[account_name] = time.monotonic()
+        # 429 dominates any prior soft-cooldown from a past success —
+        # the upstream just told us to back off harder, the success
+        # window is no longer relevant.
+        self._last_success_wall.pop(account_name, None)
         log.warning("quota 429 account=%s backoff=%ss (retry_after=%s)",
                     account_name, int(backoff), retry_after_seconds)
+        # Persist so a docker compose restart doesn't reset our memory
+        # of the cooldown — without this, every rebuild fires a fresh
+        # initial_probe burst that immediately re-429s and the
+        # penalty window extends.
+        self._save_cooldown_state()
 
     # ── egress: dashboard reads via /admin/quotas ────────────────────
 

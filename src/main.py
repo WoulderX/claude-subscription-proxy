@@ -18,6 +18,7 @@ from .api.openai import build_router as build_openai_router
 from .auth import make_auth_dep
 from .config import Config
 from .oauth_refresh import OAuthRefresher
+from .oauth_login import LoginRegistry
 from .quota_probe import QuotaProbeService
 from .session.manager import SessionManager
 from .usage import UsageStore
@@ -67,16 +68,34 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
     claude_version = _detect_claude_version(config.claude.binary)
     log.info("claude code CLI version: %s", claude_version)
 
+    # Dashboard-driven OAuth login flows. Only useful in multi-account
+    # mode (legacy single-account mode has no /admin/accounts/new
+    # surface area). Sweeper is started in lifespan below.
+    login_registry: LoginRegistry | None = None
+    if config.accounts:
+        login_registry = LoginRegistry()
+
     # Per-account quota tracker. Only meaningful in multi-account mode —
     # each account has its own .credentials.json and thus its own
     # subscription quota. Legacy single-account deployments get None
     # here and /admin/quotas returns 503.
     quota_probe: QuotaProbeService | None = None
     if config.accounts:
+        # Cooldown file lives alongside the usage sqlite db (already
+        # RW-mounted from the host). Falls back to None — no
+        # persistence — when usage tracking is disabled or there's
+        # no writable mount: in that case rebuilds keep retriggering
+        # 429s but the in-memory cooldown gate still works during the
+        # container's lifetime.
+        cooldown_path = None
+        if config.usage.db_path:
+            from pathlib import Path
+            cooldown_path = Path(config.usage.db_path).parent / "quota_cooldown.yaml"
         quota_probe = QuotaProbeService(
             manager=manager,
             accounts=list(config.accounts.keys()),
             tick_seconds=300.0,
+            cooldown_path=cooldown_path,
         )
         # Manager fans worker quota_usage events into the service keyed
         # by account name (worker → account resolution happens inside
@@ -109,6 +128,7 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
                     "multi-worker refresh_token rotation race may re-emerge")
 
     quota_state = SimpleNamespace(task=None)
+    login_state = SimpleNamespace(task=None)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -130,9 +150,20 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
                                 name="quota-initial-probe")
             quota_state.task = asyncio.create_task(
                 quota_probe.run(), name="quota-probe")
+        if login_registry is not None:
+            # Sweeper drops abandoned login flows (10min lifetime) so
+            # orphaned PTY procs + tempdirs don't pile up.
+            login_state.task = asyncio.create_task(
+                login_registry.run_sweeper(), name="oauth-login-sweeper")
         try:
             yield
         finally:
+            if login_state.task is not None:
+                login_state.task.cancel()
+                try:
+                    await login_state.task
+                except asyncio.CancelledError:
+                    pass
             if quota_state.task is not None:
                 quota_state.task.cancel()
                 try:
@@ -157,6 +188,7 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         usage_store=usage_store,
         usage_disabled_reason=usage_disabled_reason,
         quota_probe=quota_probe,
+        login_registry=login_registry,
     ))
 
     @app.get("/healthz")

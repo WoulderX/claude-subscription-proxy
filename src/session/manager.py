@@ -467,6 +467,115 @@ class SessionManager:
             return False
         return self.is_account_rate_limited(acc_name)
 
+    async def spawn_account(self, account_name: str) -> list[str]:
+        """Spawn every worker for an account that was just added to
+        `self.config.accounts`. Mirrors the per-account chain logic from
+        `start()` (serial spawn + prewarm within the account, so the
+        per-OAuth bootstrap burst doesn't trip Anthropic's rate limiter).
+
+        Returns the list of user_ids that ended up successfully
+        registered in self.sessions. Already-existing sessions are
+        skipped (idempotent — safe to call after a partial failure).
+
+        Caller's responsibility: make sure `self.config.users` has a
+        pool referencing the new account's user_ids, otherwise the
+        workers will be alive but unrouted. /admin/accounts/new wires
+        this automatically; manual edits via /admin/reload go through
+        `_apply_accounts_diff` which does the same."""
+        acc = self.config.accounts.get(account_name)
+        if acc is None:
+            raise ValueError(f"account {account_name!r} not in config.accounts")
+        user_ids = [f"{account_name}-{i}" for i in range(acc.workers)]
+
+        # Allocate ports + register placeholder sessions under self.lock.
+        # Same single-pass approach as start() so each chain's spawn
+        # runs outside the lock (parallelism not blocked by lock contention).
+        chain: list[ClaudeSession] = []
+        async with self.lock:
+            for uid in user_ids:
+                if uid in self.sessions:
+                    continue
+                port = self.config.mitm.port_base + self._next_port_offset
+                self._next_port_offset += 1
+                sess = ClaudeSession(user_id=uid, mitm_port=port,
+                                     config=self.config,
+                                     on_rate_limit=self._on_worker_rate_limited,
+                                     on_usage=self._on_worker_usage,
+                                     on_quota=self._on_worker_quota,
+                                     on_quota_429=self._on_worker_quota_429)
+                self.sessions[uid] = sess
+                await sess.lock.acquire()
+                chain.append(sess)
+
+        spawned: list[str] = []
+        for sess in chain:
+            try:
+                await sess.start()
+                try:
+                    ok = await self._safe_prewarm(sess)
+                    if ok:
+                        log.info("spawn_account: prewarmed user=%s",
+                                 sess.user_id)
+                finally:
+                    if sess.lock.locked():
+                        sess.lock.release()
+                spawned.append(sess.user_id)
+            except Exception:
+                log.exception("spawn_account: spawn failed user=%s; "
+                              "dropping session", sess.user_id)
+                self.sessions.pop(sess.user_id, None)
+                if sess.lock.locked():
+                    sess.lock.release()
+        log.info("spawn_account account=%s spawned=%d/%d",
+                 account_name, len(spawned), len(user_ids))
+        return spawned
+
+    async def stop_account(self, account_name: str,
+                            drain_seconds: float = 30.0) -> int:
+        """Drain + stop every worker belonging to an account, then
+        remove them from self.sessions. Returns the number of workers
+        actually stopped. Best-effort: a worker that's mid-stream
+        gets up to `drain_seconds` for its current /v1/messages to
+        complete; after that the subprocess is killed.
+
+        Also clears any account-level routing block — once workers
+        are gone there's nothing to block. Caller should remove the
+        account from self.config.accounts AFTER this returns, plus
+        prune any user pools that referenced its user_ids."""
+        targets: list[ClaudeSession] = []
+        for uid, sess in list(self.sessions.items()):
+            if self._account_name_for(uid) == account_name:
+                targets.append(sess)
+
+        async def _drain_and_stop(sess: ClaudeSession) -> None:
+            try:
+                # Wait for in-flight requests to finish. The session
+                # lock is held while one is in flight; acquire it
+                # (with timeout) so we don't truncate a streaming
+                # response mid-token.
+                try:
+                    await asyncio.wait_for(sess.lock.acquire(),
+                                            timeout=drain_seconds)
+                    sess.lock.release()
+                except asyncio.TimeoutError:
+                    log.warning("stop_account: drain timed out for "
+                                "user=%s after %.0fs; killing anyway",
+                                sess.user_id, drain_seconds)
+                await sess.stop()
+            except Exception:
+                log.exception("stop_account: error stopping user=%s",
+                              sess.user_id)
+            finally:
+                self.sessions.pop(sess.user_id, None)
+
+        await asyncio.gather(*[_drain_and_stop(s) for s in targets])
+        # Clear any routing block — workers gone, no point keeping
+        # the block (or its expiry) around.
+        self._account_rl.pop(account_name, None)
+        log.info("stop_account account=%s stopped=%d",
+                 account_name, len(targets))
+        return len(targets)
+
     async def start(self) -> None:
         self._restarter_task = asyncio.create_task(self._restarter())
         # Prewarm: spawn a worker for every configured user during
