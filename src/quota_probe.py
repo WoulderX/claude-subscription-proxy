@@ -352,10 +352,14 @@ class QuotaProbeService:
             u = tier.get("utilization")
             if not isinstance(u, (int, float)):
                 continue
-            # API surface has flipped between 0..1 and 0..100 in
-            # different shipped CLI versions; normalise defensively.
-            norm = u / 100.0 if u > 1 else u
-            if norm < 1.0:
+            # Anthropic /api/oauth/usage consistently returns
+            # utilization on a 0..100 percent scale (e.g. 1.0 = 1%,
+            # 100.0 = at limit). An earlier 0..1 normalisation heuristic
+            # (`u / 100 if u > 1 else u`) accidentally treated
+            # utilization=1.0 as 100% and auto-blocked freshly-added
+            # accounts that had used 1% of their 5h window. Cap-check
+            # against >= 100 directly — no scale guessing.
+            if float(u) < 100.0:
                 continue
             resets = tier.get("resets_at") or tier.get("resetsAt")
             epoch = _parse_iso8601_epoch(resets)
