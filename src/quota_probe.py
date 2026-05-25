@@ -381,6 +381,53 @@ class QuotaProbeService:
                         time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                       time.gmtime(epoch)))
 
+    # ── runtime account registration ────────────────────────────────
+    #
+    # When operators add an account via the dashboard, manager.config
+    # learns about it but our `self.accounts` snapshot doesn't — the
+    # account never shows in /admin/quotas and never gets probed. The
+    # admin endpoint calls register_account() after spawn_account
+    # succeeds, optionally kicking a one-shot probe so the dashboard
+    # has data before the next periodic tick (300s away).
+
+    def register_account(self, account_name: str) -> bool:
+        """Add a new account to the rotation. Returns True if newly
+        added, False if already known (idempotent)."""
+        if account_name in self.accounts:
+            return False
+        self.accounts.append(account_name)
+        log.info("quota probe: registered account=%s", account_name)
+        return True
+
+    def unregister_account(self, account_name: str) -> bool:
+        """Remove an account from the rotation + drop its state.
+        Returns True if it was present."""
+        if account_name not in self.accounts:
+            return False
+        self.accounts.remove(account_name)
+        self._snapshots.pop(account_name, None)
+        self._errors.pop(account_name, None)
+        self._last_success_mono.pop(account_name, None)
+        self._last_success_wall.pop(account_name, None)
+        self._last_attempt_mono.pop(account_name, None)
+        self._cooldown_until_mono.pop(account_name, None)
+        self._cooldown_until_wall.pop(account_name, None)
+        self._consecutive_429s.pop(account_name, None)
+        self._save_cooldown_state()
+        log.info("quota probe: unregistered account=%s", account_name)
+        return True
+
+    def probe_now(self, account_name: str) -> None:
+        """Schedule a one-shot probe outside the periodic tick. Used
+        right after register_account so the dashboard fills in without
+        waiting tick_seconds (default 300s) for the next cycle."""
+        if account_name not in self.accounts:
+            log.warning("quota probe: probe_now called for unknown "
+                        "account=%s (forgot register_account?)",
+                        account_name)
+            return
+        asyncio.create_task(self._probe_one(account_name))
+
     def record_429(self, account_name: str,
                     retry_after_seconds: float | None,
                     fetched_at_unix: float) -> None:

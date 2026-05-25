@@ -25,6 +25,7 @@ but practically the dashboard only drives one at a time."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -33,6 +34,33 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+
+def _ensure_onboarding_complete(path: Path) -> None:
+    """Patch a freshly-written .claude.json so claude CLI doesn't drop
+    a new worker onto the "Select login method" first-run picker.
+
+    `claude auth login --claudeai` writes everything needed for token
+    refresh (oauthAccount, userID, expiresAt, accountUuid, ...) but
+    leaves hasCompletedOnboarding out — claude CLI then prompts at
+    next launch. Setting the flag here is enough; the entrypoint stub
+    has been using the same single-key stub for years."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if data.get("hasCompletedOnboarding") is True:
+        return
+    data["hasCompletedOnboarding"] = True
+    # Atomic write so a concurrent worker boot reading the same file
+    # never observes a half-written JSON.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
 
 import ptyprocess
 
@@ -271,6 +299,16 @@ class LoginSession:
             if target.exists():
                 target.unlink()
             shutil.move(str(marker_src), str(target))
+            # `claude auth login --claudeai` only writes the OAuth
+            # bookkeeping (oauthAccount block, userID, expiresAt). It
+            # does NOT set hasCompletedOnboarding, so when a fresh
+            # worker boots against this dir claude CLI shows its
+            # first-run "Select login method" picker — which eats
+            # trigger() keystrokes and times the prewarm out. Patch
+            # the file here so every worker that seeds from this dest
+            # skips onboarding. Atomic write so a concurrent worker
+            # read can't see a partial JSON.
+            _ensure_onboarding_complete(target)
 
         # Permissions: container runs as uid 1000, but tempfile.mkdtemp
         # uses the current process uid. Since we're spawned by the proxy

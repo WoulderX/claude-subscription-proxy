@@ -437,9 +437,13 @@ def build_router(
             config.write_runtime_accounts()
         except Exception:
             log.exception("failed to persist runtime accounts overlay")
-        # Spawn workers (serial + prewarm within the account).
+        # Spawn workers. background_rest=True keeps this HTTP request
+        # snappy (~10s for the first-worker validation, vs ~50s for a
+        # full 5-worker chain) — the remaining workers spawn in a
+        # background task, and the dashboard's /status polling reflects
+        # them as they come up.
         try:
-            spawned = await manager.spawn_account(name)
+            spawned = await manager.spawn_account(name, background_rest=True)
         except Exception as e:
             log.exception("spawn_account failed after successful login")
             # Don't roll back config — credentials are written, the
@@ -449,10 +453,20 @@ def build_router(
                 f"login succeeded but spawn_account failed: {e}; "
                 f"credentials are installed at /data/shared-auth/{name}/, "
                 f"restart the container to retry")
+        # Register with the quota probe so the dashboard's 订阅配额
+        # panel picks up the new account on its next /admin/quotas
+        # poll instead of waiting for a container restart. probe_now
+        # kicks one immediately so the panel fills without the 300s
+        # tick latency. Both are no-ops in legacy single-account mode.
+        if quota_probe is not None:
+            quota_probe.register_account(name)
+            quota_probe.probe_now(name)
         return {
             "ok": True,
             "account": name,
             "workers_spawned": len(spawned),
+            "workers_total": workers,
+            "workers_pending": max(0, workers - len(spawned)),
             "credentials_path": installed.get("credentials_path"),
         }
 
@@ -488,6 +502,11 @@ def build_router(
         except Exception as e:
             log.exception("stop_account failed for %s", name)
             raise HTTPException(500, f"stop_account failed: {e}")
+        # Drop quota probe registration so the deleted account no longer
+        # shows on /admin/quotas + stops eating periodic ticks. Mirrors
+        # the register_account call in /admin/accounts/new/.../finish.
+        if quota_probe is not None:
+            quota_probe.unregister_account(name)
         # Drop from config + prune user pools.
         config.accounts.pop(name, None)
         prefix = f"{name}-"

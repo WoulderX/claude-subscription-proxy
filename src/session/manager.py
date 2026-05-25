@@ -498,7 +498,8 @@ class SessionManager:
             return False
         return self.is_account_rate_limited(acc_name)
 
-    async def spawn_account(self, account_name: str) -> list[str]:
+    async def spawn_account(self, account_name: str,
+                              background_rest: bool = False) -> list[str]:
         """Spawn every worker for an account that was just added to
         `self.config.accounts`. Mirrors the per-account chain logic from
         `start()` (serial spawn + prewarm within the account, so the
@@ -507,6 +508,17 @@ class SessionManager:
         Returns the list of user_ids that ended up successfully
         registered in self.sessions. Already-existing sessions are
         skipped (idempotent — safe to call after a partial failure).
+
+        `background_rest`: when True (used by the dashboard's add-
+        account flow), only the FIRST worker is spawned + prewarmed
+        synchronously. The remaining workers run in a fire-and-forget
+        asyncio.Task so the HTTP request returns in ~10s instead of
+        ~50s for a 5-worker account. The first sync spawn still
+        validates credentials end-to-end — if it fails, the caller
+        gets an exception and the rest never get scheduled. The
+        background workers hold their session locks for the duration
+        of their own spawn, so real requests that pick those user_ids
+        wait until each worker is actually ready.
 
         Caller's responsibility: make sure `self.config.users` has a
         pool referencing the new account's user_ids, otherwise the
@@ -538,8 +550,7 @@ class SessionManager:
                 await sess.lock.acquire()
                 chain.append(sess)
 
-        spawned: list[str] = []
-        for sess in chain:
+        async def _spawn_one(sess: ClaudeSession) -> bool:
             try:
                 await sess.start()
                 try:
@@ -550,13 +561,60 @@ class SessionManager:
                 finally:
                     if sess.lock.locked():
                         sess.lock.release()
-                spawned.append(sess.user_id)
+                return True
             except Exception:
                 log.exception("spawn_account: spawn failed user=%s; "
                               "dropping session", sess.user_id)
                 self.sessions.pop(sess.user_id, None)
                 if sess.lock.locked():
                     sess.lock.release()
+                return False
+
+        if not chain:
+            log.info("spawn_account account=%s spawned=0/0 (no new workers)",
+                     account_name)
+            return []
+
+        # Synchronous: first worker. Doubles as credentials validation
+        # — if claude CLI can't read .credentials.json or fails OAuth
+        # bootstrap, this raises and the caller sees the failure
+        # without us having scheduled background work that will also
+        # fail in the same way.
+        first, rest = chain[0], chain[1:]
+        spawned: list[str] = []
+        if await _spawn_one(first):
+            spawned.append(first.user_id)
+
+        if not rest:
+            log.info("spawn_account account=%s spawned=%d/%d",
+                     account_name, len(spawned), len(user_ids))
+            return spawned
+
+        if background_rest:
+            async def _spawn_rest() -> None:
+                # Serial within an account (same per-OAuth bootstrap-
+                # burst rationale as start()). Each iteration awaits
+                # the previous before kicking off the next.
+                bg_spawned = 0
+                for sess in rest:
+                    if await _spawn_one(sess):
+                        bg_spawned += 1
+                log.info("spawn_account background account=%s "
+                         "spawned=%d/%d (foreground=%d, total=%d/%d)",
+                         account_name, bg_spawned, len(rest),
+                         len(spawned), bg_spawned + len(spawned),
+                         len(user_ids))
+            # Fire-and-forget: exceptions are logged in _spawn_one,
+            # nothing else needs the result.
+            asyncio.create_task(_spawn_rest())
+            log.info("spawn_account account=%s spawned=%d/%d "
+                     "(rest %d in background)",
+                     account_name, len(spawned), len(user_ids), len(rest))
+            return spawned
+
+        for sess in rest:
+            if await _spawn_one(sess):
+                spawned.append(sess.user_id)
         log.info("spawn_account account=%s spawned=%d/%d",
                  account_name, len(spawned), len(user_ids))
         return spawned

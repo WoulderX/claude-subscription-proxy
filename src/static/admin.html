@@ -833,8 +833,8 @@
               <!-- Step 3: success -->
               <div data-step="3" style="display:none;">
                 <div class="form-success">
-                  ✓ 账号 <span id="newAcctDoneName"></span> 已登录，spawn 了
-                  <span id="newAcctDoneCount"></span> 个 worker。
+                  ✓ 账号 <span id="newAcctDoneName"></span> 已登录，已 spawn
+                  <span id="newAcctDoneCount"></span> 个 worker<span id="newAcctPendingNote"></span>。
                 </div>
                 <div class="form-actions">
                   <button class="btn-primary" id="newAcctCloseOk">关闭</button>
@@ -1624,6 +1624,10 @@
         }
         $('newAcctDoneName').textContent = data.account || pendingAcctName;
         $('newAcctDoneCount').textContent = data.workers_spawned ?? '?';
+        const pending = Number(data.workers_pending || 0);
+        $('newAcctPendingNote').textContent = pending > 0
+          ? `（剩余 ${pending} 个正在后台 spawn，几十秒内陆续就绪）`
+          : '';
         showAcctStep(3);
         pendingAcctName = null;   // success — don't abort on close
       } catch (e) {
