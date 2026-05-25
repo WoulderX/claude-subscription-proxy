@@ -619,22 +619,40 @@ class ClaudeSession:
         except Exception:
             log.exception("quota 429 callback failed user=%s", self.user_id)
 
-    async def probe_quota(self) -> bool:
-        """Send `/usage` to the worker's TUI. Returns True iff the probe
-        message was written. The actual response arrives asynchronously
-        via a quota_usage event handled by `_handle_worker_quota_event`,
-        so this method does NOT wait for it — fire-and-forget by design
-        so a stuck TUI can't block the periodic probe scheduler.
+    # How long probe_quota holds the lock past stdin write. Has to cover
+    # the worker side's: PTY write /usage → wait for screen render
+    # (~1s) → 2s sleep → Esc → screen returns to prompt. 5s gives a
+    # comfortable margin; if the dismiss runs faster the lock is just
+    # released a moment late — no harm. If a future CLI version slows
+    # the screen render, bump this; the symptom would be trigger()
+    # racing onto the /usage screen and timing out at 90s with a
+    # screen-tail that contains 'Resets MMM DD' text.
+    _PROBE_LOCK_HOLD_SECONDS = 5.0
 
-        Caller MUST hold self.lock (or guarantee no concurrent /v1/messages
-        is in flight) so the /usage keystroke doesn't race with a normal
-        trigger pattern."""
+    async def probe_quota(self) -> bool:
+        """Send `/usage` to the worker's TUI and hold the lock until
+        the worker has had time to dismiss the resulting screen.
+
+        Returns True iff the probe message was written. The actual
+        /api/oauth/usage response arrives asynchronously via a
+        quota_usage event; this method doesn't wait for it.
+
+        Caller MUST hold self.lock — the lock window enforced here is
+        what prevents a concurrent trigger() from typing "say hi" onto
+        the /usage screen. The previous (fire-and-forget) design
+        released the lock the instant the stdin write returned, well
+        before the TUI had finished rendering /usage, which left a
+        ~2s race window where a real call could hijack the worker
+        mid-probe and time out with /usage text on screen (which the
+        timeout fallback misclassified as a rate-limit modal)."""
         if self.proc is None or self.proc.returncode is not None:
             return False
         assert self.proc.stdin is not None
         line = json.dumps({"type": "probe_quota"}) + "\n"
         self.proc.stdin.write(line.encode())
         await self.proc.stdin.drain()
+        # Hold the lock while the worker handles the probe end-to-end.
+        await asyncio.sleep(self._PROBE_LOCK_HOLD_SECONDS)
         return True
 
     def idle_seconds(self) -> float:

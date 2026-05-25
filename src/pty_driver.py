@@ -201,6 +201,19 @@ class ClaudePtyDriver:
         # eats our trigger keystrokes and every request times out at
         # mitm_intercept_timeout with 0 bytes returned.
         ((b"HowisClaudedoing", b"0:Dismiss"), b"0", "feedback_survey"),
+        # /usage slash-command screen ("Session · Total cost · Current
+        # session · Resets ... · Current week ..."). Triggered by our
+        # quota probe writing "/usage\r" — the HTTP call to
+        # /api/oauth/usage fires during the screen render, mitm captures
+        # the response, and then we want the TUI back at the prompt
+        # ASAP so a subsequent trigger() doesn't type "say hi" INTO this
+        # screen (which has 'd to day', 'w to week' shortcuts and the
+        # 'Resets May DD' text — the latter previously fooled the
+        # mitm-intercept-timeout fallback into marking the account as
+        # weekly_limit rate-limited). Markers chosen to be unique to
+        # this screen across CLI versions: tab bar text + footer hint.
+        ((b"SettingsStatusConfigUsageStats", b"Esctocancel"),
+         b"\x1b", "usage_command"),
     )
 
     def _matching_rules(self, squeezed: bytes) -> list[tuple[tuple[bytes, ...], bytes, str]]:

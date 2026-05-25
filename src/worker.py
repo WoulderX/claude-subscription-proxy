@@ -153,9 +153,32 @@ class WorkerSession:
                 #      resort if the modal lost its spaces to TUI
                 #      redraw artifacts).
                 rl_snippet = self.pty.dump_rate_limit_snippet()
-                reset_epoch = (parse_reset_time(rl_snippet)
-                               or parse_reset_time(screen_tail)
-                               or parse_reset_time(matcher_view))
+                # Don't mistake the /usage slash-command screen for a
+                # rate-limit modal: /usage renders "Resets MMM DD,
+                # Xpm (UTC)" for the 5h + weekly quota windows, which
+                # parse_reset_time happily matches and was previously
+                # tagged as weekly_limit, marking the whole account
+                # offline for days. The /usage tab bar marker is
+                # specific enough that no real rate-limit modal carries
+                # it. When detected, skip the reset parse entirely —
+                # the underlying timeout is "TUI swallowed our trigger"
+                # (a probe-cleanup race), not "Anthropic said no".
+                screen_blob = (matcher_view or "") + " " + (screen_tail or "")
+                is_usage_screen = (
+                    "SettingsStatusConfigUsageStats" in screen_blob
+                    or ("Currentsession" in screen_blob.replace(" ", "")
+                        and "Currentweek" in screen_blob.replace(" ", "")))
+                if is_usage_screen:
+                    log.warning(
+                        "user=%s mitm-intercept timeout while TUI was on "
+                        "/usage screen — skipping rate-limit parse (the "
+                        "'Resets MMM DD' text on /usage is a quota display, "
+                        "not a rate-limit modal)", self.user_id)
+                    reset_epoch = None
+                else:
+                    reset_epoch = (parse_reset_time(rl_snippet)
+                                   or parse_reset_time(screen_tail)
+                                   or parse_reset_time(matcher_view))
                 if rl_snippet:
                     log.info(
                         "rate-limit snippet captured (%d chars): %r",
@@ -254,6 +277,21 @@ async def amain() -> None:
         format="%(asctime)s %(levelname)s [worker:%(name)s:" + args.user_id + "] %(message)s",
         stream=sys.stderr,
     )
+    # mitmproxy.proxy.server logs every TCP client/server connect +
+    # disconnect at INFO — with 15 workers × dozens of upstream
+    # connections per minute (api.anthropic.com, npm registry, datadog,
+    # etc.) this is ~95% of all container log volume in steady state
+    # and crowds out anything actually interesting. Push it to WARNING.
+    # Keep `mitmproxy.proxy.mode_servers` (listener bind announcements)
+    # and `mitmproxy.master` (startup/shutdown) at the inherited level.
+    logging.getLogger("mitmproxy.proxy.server").setLevel(logging.WARNING)
+    # PTY driver chats at INFO during boot ("TUI prompt visible after N
+    # bytes", "TUI ready, total boot bytes=N") × 15 workers — pure
+    # noise in normal operation. Keep WARNING so the modal auto-dismiss
+    # line (which indicates the TUI was about to swallow our keystroke)
+    # still surfaces, along with any exception traces. Drop to INFO
+    # temporarily when debugging a stuck PTY.
+    logging.getLogger("src.pty_driver").setLevel(logging.WARNING)
 
     session = WorkerSession(
         user_id=args.user_id,
@@ -294,15 +332,26 @@ async def amain() -> None:
                 continue
             mtype = msg.get("type")
             if mtype == "probe_quota":
-                # Fire-and-forget: type `/usage` into the TUI. The mitm
-                # addon captures the resulting /api/oauth/usage response
-                # body and pushes a `quota_usage` event onto
-                # session.events, which the relay below ships up via
-                # stdout. No req_id correlation — main process matches
-                # by user_id when it lands.
+                # Fire-and-forget: type `/usage` into the TUI, then Esc
+                # to dismiss the resulting screen so the next trigger
+                # lands on the prompt, not on the /usage tab bar.
+                # The mitm addon captures the /api/oauth/usage response
+                # body while this is happening and pushes a quota_usage
+                # event onto session.events; the explicit Esc here is a
+                # belt-and-suspenders backup for the drain loop's
+                # auto-dismiss rule (debounce shared across rules can
+                # occasionally swallow the Esc keystroke).
                 try:
                     await session.pty.send_slash_command("/usage")
                     log.info("probe_quota: sent /usage to TUI")
+                    # 2s: enough for the HTTP call to land + screen to
+                    # finish drawing. The mitm capture is independent
+                    # of when we Esc — addon hooks on response complete
+                    # which fires regardless of TUI screen state.
+                    await asyncio.sleep(2.0)
+                    if session.pty.proc and session.pty.proc.isalive():
+                        session.pty.proc.write(b"\x1b")
+                        log.info("probe_quota: sent Esc to dismiss /usage")
                 except Exception:
                     log.exception("probe_quota: failed to send /usage")
                 continue

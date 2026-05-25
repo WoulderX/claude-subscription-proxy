@@ -360,7 +360,12 @@ def main() -> None:
     config_path = os.environ.get("CONFIG", "config.yaml")
     config = Config.load(config_path)
     app = create_app(config, config_path=config_path)
-    uvicorn.run(app, host=config.listen_host, port=config.listen_port)
+    # Suppress per-request access lines from uvicorn — with the
+    # dashboard auto-polling /status + /admin/usage + /admin/quotas
+    # they add ~4 lines/minute of noise that obscures real events.
+    # Errors and lifespan messages still come through.
+    uvicorn.run(app, host=config.listen_host, port=config.listen_port,
+                access_log=False)
 
 
 if __name__ == "__main__":

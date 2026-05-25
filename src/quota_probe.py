@@ -26,6 +26,7 @@ one bad tick.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import time
 from dataclasses import dataclass, field, asdict
@@ -144,6 +145,68 @@ class QuotaProbeService:
                  account_name,
                  (kwargs.get("five_hour") or {}).get("utilization"),
                  (kwargs.get("seven_day") or {}).get("utilization"))
+        # Plumb saturated quotas into the routing-block table so
+        # pick() avoids accounts that we already know are out of
+        # budget — saves a wasted /v1/messages whose only outcome is
+        # a 429. Only the overall windows (five_hour / seven_day)
+        # block routing: per-model tiers (seven_day_opus / _sonnet)
+        # don't, because pick() routes by account, not model.
+        self._maybe_mark_from_quota(account_name, kwargs)
+
+    def _maybe_mark_from_quota(self, account_name: str,
+                                tiers: dict[str, Any]) -> None:
+        """Inspect the per-window utilization. For each overall window
+        at >=100% with a future resets_at, mark the account as
+        rate-limited until that moment via the manager. If multiple
+        windows are saturated, pick the LATEST resets_at — the account
+        is blocked until all known limits clear.
+
+        Reset clearing is implicit: mark_account_rate_limited_until
+        installs `until=epoch`; manager.account_rate_limit() lazily
+        GCs expired entries on read. When the window resets and the
+        next probe shows <100%, we simply don't re-mark; the old mark
+        expires on its own at the same epoch."""
+        candidates: list[tuple[str, float]] = []
+        # Mapping of snapshot key → reason token the UI knows how to
+        # label (REASON_LABEL in admin.html). Order is informational —
+        # we pick the LATEST timestamp regardless.
+        WINDOWS = (("five_hour", "5hour_limit"),
+                   ("seven_day", "weekly_limit"))
+        for key, reason in WINDOWS:
+            tier = tiers.get(key)
+            if not isinstance(tier, dict):
+                continue
+            u = tier.get("utilization")
+            if not isinstance(u, (int, float)):
+                continue
+            # API surface has flipped between 0..1 and 0..100 in
+            # different shipped CLI versions; normalise defensively.
+            norm = u / 100.0 if u > 1 else u
+            if norm < 1.0:
+                continue
+            resets = tier.get("resets_at") or tier.get("resetsAt")
+            epoch = _parse_iso8601_epoch(resets)
+            if epoch is None or epoch <= time.time():
+                continue
+            candidates.append((reason, epoch))
+        if not candidates:
+            return
+        # Latest reset wins — multi-limit accounts stay blocked until
+        # the longest window clears. mark_account_rate_limited_until
+        # overwrites unconditionally, but we never call it with a
+        # SHORTER until than what's already there (we always pass the
+        # maximum across saturated windows here, and on the next
+        # probe we re-evaluate).
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        reason, epoch = candidates[0]
+        if hasattr(self.manager, "mark_account_rate_limited_until"):
+            self.manager.mark_account_rate_limited_until(
+                account_name, reason, epoch)
+            log.warning("quota auto-block account=%s reason=%s until=%s "
+                        "(driven by /api/oauth/usage)",
+                        account_name, reason,
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                      time.gmtime(epoch)))
 
     def record_429(self, account_name: str,
                     retry_after_seconds: float | None,
@@ -283,3 +346,21 @@ class QuotaProbeService:
         # captures the /api/oauth/usage response. Nothing more to do
         # here — _last_attempt_mono is set, the snapshot will update
         # whenever the body arrives (typically <1s).
+
+
+def _parse_iso8601_epoch(value: Any) -> float | None:
+    """Parse an Anthropic-style ISO 8601 reset timestamp into a unix
+    epoch. Returns None for missing / unparseable input. Accepts both
+    `Z` suffix and explicit `+00:00` offsets; assumes UTC when no
+    timezone info is present (Anthropic always sends one but we tolerate
+    drift)."""
+    if not isinstance(value, str) or not value:
+        return None
+    raw = value[:-1] if value.endswith("Z") else value
+    try:
+        dt = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
