@@ -18,6 +18,24 @@ log = logging.getLogger(__name__)
 _READY_MARKERS = (b"\xe2\x9d\xaf", b"Try ")
 _READY_TIMEOUT = 15.0
 
+# Tool-permission modal anchors. "❯" (U+276F) is the focused-option
+# arrow; the digit+dot+label suffixes are unique to claude's permission
+# dialog and observed atomic across all TUI redraws we have screen
+# dumps for. Module-level so they're constructed once instead of
+# re-encoding on every match.
+_TOOL_PERMISSION_OPTION1 = "❯1.Yes".encode("utf-8")
+_TOOL_PERMISSION_OPTION3 = b"3.No"
+
+# When this byte sequence shows up in the squeezed PTY view, the TUI
+# thinks something is in flight on its end ("esc to interrupt" is the
+# footer hint claude code renders while a model call streams in or a
+# local subprocess runs). If the SessionManager has already picked
+# this worker — meaning our _channels is empty — that activity is
+# leftover from a previous request that we already finished forwarding;
+# typing the placeholder into that state gets the keystroke swallowed
+# (mitm never sees /v1/messages). Pre-trigger we send Esc to clear it.
+_STALE_INTERRUPT_MARKER = b"esctointerrupt"
+
 
 class ClaudePtyDriver:
     """Spawns `claude` in a PTY with HTTPS_PROXY pointing at our mitm port.
@@ -77,6 +95,17 @@ class ClaudePtyDriver:
         env["HTTPS_PROXY"] = self.https_proxy
         env["HTTP_PROXY"] = self.https_proxy
         env["NODE_EXTRA_CA_CERTS"] = str(self.ca_cert)
+        # Disable claude code's in-process auto-updater. It runs
+        # `npm i -g @anthropic-ai/claude-code` against the global node
+        # prefix, which in our container is owned by root and not
+        # writable by uid 1000 — so the update always FAILS, but
+        # before failing it hangs the TUI for ~30-60s, during which
+        # our placeholder keystrokes get swallowed and mitm intercept
+        # times out. We pin the CLI version at image build time
+        # (Dockerfile ARG CLAUDE_CODE_VERSION); upgrades are a manual
+        # rebuild, not a runtime ambush. Env-var documented in claude
+        # code source as the canonical disable knob.
+        env["DISABLE_AUTOUPDATER"] = "1"
         # Strip env vars that mark THIS process as a claude-code child; we
         # want the new subprocess to look like an independent CLI launch.
         for k in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
@@ -158,9 +187,30 @@ class ClaudePtyDriver:
         """Type a placeholder + submit so claude emits one outbound
         request. The placeholder is thrown away — mitm swaps the real body.
         Multi-char strings are more reliable than single chars (claude code
-        2.1.144 sometimes ignores 1-char submissions)."""
+        2.1.144 sometimes ignores 1-char submissions).
+
+        Before typing the placeholder, force a synchronous dismiss-scan
+        of the current `_recent_chunks` view. Reason: SessionManager
+        sees a worker as "idle" the moment its last response channel
+        closes (channels pop on `event: message_stop`), but the TUI can
+        be lingering on a tool_permission modal that the response just
+        produced. Without this pre-trigger dismiss, our placeholder
+        keystrokes land INSIDE the modal, the modal eats them, mitm
+        never sees a /v1/messages, and the caller hits an
+        intercept-timeout 90s later. Forcing the scan here bypasses the
+        normal background-drain debounce so the dismiss fires
+        immediately rather than waiting for the next chunk to arrive.
+        """
         if not self.proc or not self.proc.isalive():
             raise RuntimeError("claude PTY not alive")
+        dismissed = self._force_dismiss_before_trigger()
+        if dismissed:
+            # Give the TUI time to repaint after the dismiss key so our
+            # placeholder doesn't land before the modal is gone. 80ms
+            # covers a single screen refresh on most setups without
+            # adding noticeable latency to the happy path (which won't
+            # even enter this branch).
+            await asyncio.sleep(0.08)
         # Use ptyprocess.write which goes through its buffered file
         # object + flush — equivalent to what the probe_trigger.py probe
         # did successfully.
@@ -171,6 +221,65 @@ class ClaudePtyDriver:
         # swallowed the keystroke, and that path logs at WARNING.
         log.debug("pty trigger wrote %d bytes via ptyprocess: %r",
                   len(data), data)
+
+    def _force_dismiss_before_trigger(self) -> bool:
+        """Bypass-debounce dismiss scan used by `trigger()` to clear any
+        stale modal that survived the last request. Same matching path
+        as `_dismiss_if_dialog`, but ignores the debounce window so a
+        modal that appeared between requests gets handled even if the
+        background drain just dismissed something else.
+
+        Returns True iff a dismiss key was actually written — caller
+        uses this to decide whether to wait for the TUI to repaint
+        before typing the placeholder."""
+        if not self.proc or not self.proc.isalive():
+            return False
+        try:
+            text = bytes(self._recent_chunks).decode("utf-8", "replace")
+        except Exception:
+            return False
+        s = re.sub(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]", "", text)
+        s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", s)
+        s = re.sub(r"\x1b[@-Z\\-_]", "", s)
+        s_squeezed = re.sub(r"\s+", "", s).encode("utf-8", "replace")
+        for _markers, key, name in self._matching_rules(s_squeezed):
+            try:
+                self.proc.write(key)
+                self._last_dialog_dismiss = time.monotonic()
+                self._recent_chunks.clear()
+                log.warning("pre-trigger dismissed claude TUI modal=%s "
+                            "key=%r (avoids modal-eats-placeholder race)",
+                            name, key)
+                return True
+            except Exception:
+                log.exception("pre-trigger dismiss failed modal=%s", name)
+                return False
+        # No known modal matched — check for the generic "stale
+        # in-flight" signal. This is the case where a previous response
+        # finished from OUR perspective (channel closed, _channels empty,
+        # manager handed us a new request) but the TUI is still on a
+        # mid-stream screen with the "esc to interrupt" footer hint
+        # showing. We observed this with cases:
+        #   - Spinner dots + filename + "↓ N tokens" left on screen.
+        #   - "Baking…" mid-response with footer still showing interrupt.
+        # In both cases the typed placeholder lands into a TUI that
+        # isn't reading input → mitm never sees /v1/messages → 90s
+        # timeout. One Esc clears the lingering state; the 80ms
+        # post-dismiss sleep in trigger() lets the TUI repaint the
+        # prompt before we type.
+        if _STALE_INTERRUPT_MARKER in s_squeezed:
+            try:
+                self.proc.write(b"\x1b")
+                self._last_dialog_dismiss = time.monotonic()
+                self._recent_chunks.clear()
+                log.warning("pre-trigger Esc-interrupted stale TUI "
+                            "activity (esc-to-interrupt footer present "
+                            "but manager picked us as idle)")
+                return True
+            except Exception:
+                log.exception("pre-trigger Esc-interrupt failed")
+                return False
+        return False
 
     # Modal auto-dismiss rules. Each entry is (markers, key, name):
     #   markers — all of these byte substrings must appear in the
@@ -187,13 +296,27 @@ class ClaudePtyDriver:
     # debounce window so cascading dismisses don't fight each other.
     _DISMISS_RULES: tuple[tuple[tuple[bytes, ...], bytes, str], ...] = (
         # Tool-permission dialog ("1. Yes  2. Yes always  3. No").
-        # Footer is "Esc to cancel · Tab to amend · ctrl+e to explain".
         # Esc cancels cleanly: claude CLI does NOT execute the tool,
         # does NOT send a tool_result follow-up (which would burn quota),
         # and returns to IDLE so the next trigger works. Safe because
         # the model's tool_use blocks are for the *API caller* — claude
         # CLI on this worker executing them too is redundant + harmful.
-        ((b"Esctocancel", b"Tabtoamend"), b"\x1b", "tool_permission"),
+        #
+        # Anchor history:
+        #   v1 ("Esctocancel", "Tabtoamend") — footer hints; got
+        #        fragmented as "Esctocacl" / "Tabtomend" by cursor
+        #        positioning, broke matching.
+        #   v2 ("Doyouwanttoproceed", "2.Yes,allow") — header + option;
+        #        better, but we then observed "Doyouwattoproceed"
+        #        (missing 'n') in another failure dump. Still fragile.
+        #   v3 (current) "❯1.Yes" + "3.No" — both are 4-6 char atomic
+        #        strings that the TUI renders as a single contiguous
+        #        run. "❯" is the prompt marker U+276F (3-byte UTF-8),
+        #        and the digit+dot+capital combo is unique to this
+        #        modal across the CLI surface area we've seen. Both
+        #        must match (AND) to keep the false-positive rate at 0.
+        ((_TOOL_PERMISSION_OPTION1, _TOOL_PERMISSION_OPTION3),
+         b"\x1b", "tool_permission"),
         # Session-feedback survey newer claude-code TUI may pop:
         # "How is Claude doing this session? (optional)
         #  1: Bad  2: Fine  3: Good  0: Dismiss"

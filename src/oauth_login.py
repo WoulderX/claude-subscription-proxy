@@ -99,6 +99,10 @@ class LoginSession:
         env = os.environ.copy()
         env["HOME"] = str(self.tmp_home)
         env["TERM"] = "xterm-256color"
+        # Same auto-update kill-switch as the worker PTY (see pty_driver.py).
+        # The login flow runs for ~30s; an auto-update kicking in mid-flow
+        # would race with the operator pasting the OAuth code.
+        env["DISABLE_AUTOUPDATER"] = "1"
         # Strip any inherited claude-code marker env vars so the spawned
         # CLI doesn't think it's being launched by another claude.
         for k in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID",

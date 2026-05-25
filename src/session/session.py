@@ -117,6 +117,17 @@ class ClaudeSession:
         self._next_req_id = 0
         self._channels: dict[int, ResponseChannel] = {}
         self._closed = False
+        # Timestamp (monotonic) of the most-recent response-channel
+        # close. Used by SessionManager.pick() as a "TUI cooldown"
+        # signal: even though _channels is empty the moment we put(None)
+        # to the channel, the claude TUI may still be rendering the
+        # tail of the response stream (spinner animation, tool-permission
+        # modal, etc.) for ~1-2s afterwards. Picking a worker that just
+        # closed its channel makes trigger() type the placeholder INTO
+        # that lingering TUI state — observed as mitm-intercept timeouts
+        # with screens full of "(1m 0s · ↑ 156 tokens)" / spinner dots.
+        # `None` means "never finished a request" (fresh worker).
+        self._last_channel_close_at: float | None = None
         # Called when we spot `rate_limit_error` in the head of an SSE
         # response: signature (user_id, reason, window_seconds). The
         # manager wires this up to its per-account rate-limit table so
@@ -448,19 +459,25 @@ class ClaudeSession:
                 elif t == "end":
                     channel.queue.put_nowait(None)
                     self._channels.pop(req_id, None)
+                    self._last_channel_close_at = time.monotonic()
                 elif t == "error":
                     log.error("user=%s worker error: %s",
                               self.user_id, msg.get("msg"))
                     channel.queue.put_nowait(None)
                     self._channels.pop(req_id, None)
+                    self._last_channel_close_at = time.monotonic()
         except asyncio.CancelledError:
             return
         except Exception:
             log.exception("reader loop crashed user=%s", self.user_id)
         finally:
-            # If worker died, flush every waiting channel.
+            # If worker died, flush every waiting channel. Stamp close
+            # time too so pick() doesn't grab the dead session at full
+            # priority before respawn paperwork settles.
             for ch in list(self._channels.values()):
                 ch.queue.put_nowait(None)
+            if self._channels:
+                self._last_channel_close_at = time.monotonic()
             self._channels.clear()
 
     # Roughly 4 KB head buffer is plenty to spot `rate_limit_error`:
@@ -691,6 +708,7 @@ class ClaudeSession:
         self._reader_task = None
         self._next_req_id = 0
         self._channels = {}
+        self._last_channel_close_at = None
         self.started_at = time.monotonic()
         self.started_at_wall = time.time()
         self.last_used = time.monotonic()

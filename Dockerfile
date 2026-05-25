@@ -89,9 +89,15 @@ RUN chmod +x /entrypoint.sh
 
 # HOME=/home/coder → _seed_home reads OAuth creds from this dir
 # CONFIG=/data/config.yaml → mounted in at runtime
+# DISABLE_AUTOUPDATER=1 → claude CLI's npm self-upgrade would fail
+#   anyway (global npm prefix is root-owned, container runs as uid 1000)
+#   but it hangs the TUI for tens of seconds while it tries. Belt-and-
+#   braces with the per-spawn setting in src/pty_driver.py for anyone
+#   who runs `docker compose exec proxy claude ...` to debug.
 ENV HOME=/home/coder \
     CONFIG=/data/config.yaml \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    DISABLE_AUTOUPDATER=1
 
 # Stay root for entrypoint so we can chown runtime-mounted volumes; entrypoint
 # gosu-drops to `coder` before exec'ing the server.

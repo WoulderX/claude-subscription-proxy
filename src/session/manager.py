@@ -419,6 +419,15 @@ class SessionManager:
                 sess.lock.release()
         return sess
 
+    # How long a session is treated as "TUI cooling down" after its
+    # last response channel closed. Keeps pick() from racing the
+    # placeholder keystroke against the tail-end of TUI rendering
+    # (spinner animations, tool_permission modals, "(1m 0s · ↑ N tokens)"
+    # status lines, etc.). 2.0s is long enough to cover one TUI redraw
+    # at typical refresh rates and short enough that under sustained
+    # load every worker eventually clears the cooldown.
+    _PICK_TUI_COOLDOWN_SECONDS = 2.0
+
     async def pick(self, pool: list[str]) -> ClaudeSession:
         """Pick a session from a token's user pool.
 
@@ -428,8 +437,9 @@ class SessionManager:
              whole pool — at least one of them needs to handle the
              request, and going through a limited account at least lets
              Anthropic re-confirm whether the limit still applies.
-          2. Workers with no in-flight request (idle).
-          3. Fewest-in-flight, RR-tied so the load spreads instead of
+          2. Cool idle — _channels empty AND last close > cooldown.
+          3. Warm idle — _channels empty but in cooldown window.
+          4. Fewest-in-flight, RR-tied so the load spreads instead of
              piling on whichever worker won the min() comparison first.
         """
         if len(pool) == 1:
@@ -446,14 +456,35 @@ class SessionManager:
                         "accounts; routing through anyway", len(sessions))
             usable = sessions
 
-        idle = [s for s in usable if not s._channels]
+        now = time.monotonic()
+        cooldown = self._PICK_TUI_COOLDOWN_SECONDS
+
+        def _is_cool_idle(s: ClaudeSession) -> bool:
+            if s._channels:
+                return False
+            t = s._last_channel_close_at
+            return (t is None) or (now - t >= cooldown)
+
         key = tuple(pool)
-        if idle:
-            # Among idle workers, round-robin too so a burst of fast
-            # requests doesn't always hit pool[0].
-            idx = self._rr.get(key, 0) % len(idle)
+        cool_idle = [s for s in usable if _is_cool_idle(s)]
+        if cool_idle:
+            idx = self._rr.get(key, 0) % len(cool_idle)
             self._rr[key] = idx + 1
-            return idle[idx]
+            return cool_idle[idx]
+
+        # No cool worker available — prefer a warm-idle one over an
+        # actually-busy one. Warm idle still has _channels empty but is
+        # within the TUI cooldown window; trigger() will pre-dismiss
+        # any leftover modal, and the 80ms wait there covers the most
+        # common race. This branch only fires under sustained burst load
+        # where every worker has just finished a request — picking a
+        # warm-idle is still better than piling onto an in-flight one.
+        warm_idle = [s for s in usable if not s._channels]
+        if warm_idle:
+            idx = self._rr.get(key, 0) % len(warm_idle)
+            self._rr[key] = idx + 1
+            return warm_idle[idx]
+
         # All busy — fewest in-flight wins, RR breaks ties.
         min_inflight = min(len(s._channels) for s in usable)
         candidates = [s for s in usable if len(s._channels) == min_inflight]
