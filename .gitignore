@@ -1,6 +1,7 @@
 # User data and credentials
 users/
 config.yaml
+data/
 
 # Python
 __pycache__/

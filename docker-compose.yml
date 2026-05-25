@@ -67,9 +67,9 @@ services:
       # directly on the shared file and the rotated token is visible to
       # every sibling worker. Add one line per account in `accounts:`
       # of config.yaml — paths must match exactly.
-      - /data/shared-auth/claude-1:/data/shared-auth/claude-1
-      - /data/shared-auth/claude-2:/data/shared-auth/claude-2
-      - /data/shared-auth/claude-3:/data/shared-auth/claude-3
+      - ./data/shared-auth/claude-1:/data/shared-auth/claude-1
+      - ./data/shared-auth/claude-2:/data/shared-auth/claude-2
+      - ./data/shared-auth/claude-3:/data/shared-auth/claude-3
       # mitm CA — named volume so the auto-generated CA persists across
       # `docker compose down` / restart. Wipe with `docker compose down -v`.
       - mitm-ca:/home/coder/.mitmproxy
