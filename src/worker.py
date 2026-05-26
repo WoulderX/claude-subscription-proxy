@@ -92,10 +92,17 @@ class WorkerSession:
     async def call(self, body: dict[str, Any]) -> ResponseChannel:
         async with self.lock:
             self.response = ResponseChannel()
-            self.pending = PendingRequest(body=body)
+            # Keep a local reference: mitm.addon clears self.session.pending
+            # the moment it hijacks a flow (addon.py:344), and that happens
+            # mid-await of pty.trigger() — by the time we resume, the
+            # attribute has already been nulled, so re-reading self.pending
+            # would NoneType-explode. The PendingRequest object lives on
+            # via this local; setting `.consumed` on it still works.
+            pending = PendingRequest(body=body)
+            self.pending = pending
             await self.pty.trigger()
             try:
-                await asyncio.wait_for(self.pending.consumed.wait(),
+                await asyncio.wait_for(pending.consumed.wait(),
                                        timeout=self.mitm_intercept_timeout)
             except asyncio.TimeoutError:
                 # mitm never saw a /v1/messages it could claim — most
@@ -163,11 +170,31 @@ class WorkerSession:
                 # it. When detected, skip the reset parse entirely —
                 # the underlying timeout is "TUI swallowed our trigger"
                 # (a probe-cleanup race), not "Anthropic said no".
-                screen_blob = (matcher_view or "") + " " + (screen_tail or "")
+                #
+                # Important: the snippet itself must also be checked.
+                # pty_driver freezes a ±512B window the first time it
+                # sees "Resets" and dump_rate_limit_snippet() returns
+                # that frozen view; by the time worker.py inspects the
+                # screen on a later timeout, matcher_view/screen_tail
+                # have redrawn past /usage, but rl_snippet still holds
+                # the old /usage text. Treat the snippet as additional
+                # source of /usage telltales (Total cost / % used /
+                # two separate "Resets" lines — never present in the
+                # single-line rate-limit modal).
+                screen_blob = ((matcher_view or "") + " "
+                                + (screen_tail or "") + " "
+                                + (rl_snippet or ""))
+                squeezed = screen_blob.replace(" ", "")
                 is_usage_screen = (
                     "SettingsStatusConfigUsageStats" in screen_blob
-                    or ("Currentsession" in screen_blob.replace(" ", "")
-                        and "Currentweek" in screen_blob.replace(" ", "")))
+                    or ("Currentsession" in squeezed
+                        and "Currentweek" in squeezed)
+                    or "%used" in squeezed
+                    or "Totalcost" in squeezed
+                    or "Totalduration" in squeezed
+                    # Two "Resets" hits = a quota display (5h + weekly
+                    # rows). The real rate-limit modal has exactly one.
+                    or squeezed.lower().count("resets") >= 2)
                 if is_usage_screen:
                     log.warning(
                         "user=%s mitm-intercept timeout while TUI was on "

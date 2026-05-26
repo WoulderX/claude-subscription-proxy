@@ -289,13 +289,29 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
                     "body": ch.body_summary,
                 })
 
-            # Stuck heuristic: any in-flight request older than
-            # STALL_THRESHOLD that has either received no bytes ever, or
-            # gone silent for STALL_THRESHOLD. Healthy long-running calls
-            # still emit a chunk every couple of seconds, so a 30 s gap
-            # is decisive.
-            stuck = any(d["stalled_seconds"] > STALL_THRESHOLD
-                        for d in in_flight_detail)
+            # Stuck heuristic. Two cases need different thresholds:
+            #   - stream:True or already-received bytes: a healthy SSE
+            #     emits a chunk every couple of seconds, so a
+            #     STALL_THRESHOLD gap is decisive.
+            #   - stream:False with 0 bytes: Anthropic buffers the full
+            #     response server-side and only flushes when composition
+            #     finishes. Big prompts + max_tokens=8192 routinely sit
+            #     silent for 60–120s before the first byte arrives;
+            #     flagging at 30s shows monitors red on perfectly
+            #     healthy long-running calls. Use 4× the streaming
+            #     threshold for this case so the badge only lights when
+            #     the wait is genuinely abnormal.
+            stuck = False
+            for d in in_flight_detail:
+                body = d.get("body") or {}
+                bytes_recv = d.get("bytes_received") or 0
+                is_streaming = bool(body.get("stream"))
+                effective = (STALL_THRESHOLD
+                              if (is_streaming or bytes_recv > 0)
+                              else STALL_THRESHOLD * 4)
+                if d["stalled_seconds"] > effective:
+                    stuck = True
+                    break
 
             # Account this worker belongs to (multi-account mode). null
             # in legacy single-account mode; the UI uses this to drive
