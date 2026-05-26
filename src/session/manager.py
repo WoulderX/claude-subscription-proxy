@@ -459,11 +459,30 @@ class SessionManager:
         now = time.monotonic()
         cooldown = self._PICK_TUI_COOLDOWN_SECONDS
 
+        def _pty_busy(s: ClaudeSession) -> bool:
+            # Cross-channel idleness: even after our SSE channel closes,
+            # claude CLI may still be running the tool chain triggered
+            # by tool_use blocks in the response (Task subagents, Read,
+            # Bash, etc) — visible as "esc to interrupt" footer or as
+            # a tool-permission modal on screen_tail. Sending the next
+            # "say hi" placeholder into a TUI in that state queues the
+            # keystroke without firing /v1/messages, so the next request
+            # eats a 90s mitm-intercept timeout.
+            pty = getattr(s, "pty", None)
+            if pty is None:
+                return False
+            try:
+                return pty.is_tui_busy()
+            except Exception:
+                return False
+
         def _is_cool_idle(s: ClaudeSession) -> bool:
             if s._channels:
                 return False
             t = s._last_channel_close_at
-            return (t is None) or (now - t >= cooldown)
+            if t is not None and (now - t) < cooldown:
+                return False
+            return not _pty_busy(s)
 
         key = tuple(pool)
         cool_idle = [s for s in usable if _is_cool_idle(s)]
@@ -474,12 +493,16 @@ class SessionManager:
 
         # No cool worker available — prefer a warm-idle one over an
         # actually-busy one. Warm idle still has _channels empty but is
-        # within the TUI cooldown window; trigger() will pre-dismiss
-        # any leftover modal, and the 80ms wait there covers the most
-        # common race. This branch only fires under sustained burst load
-        # where every worker has just finished a request — picking a
-        # warm-idle is still better than piling onto an in-flight one.
-        warm_idle = [s for s in usable if not s._channels]
+        # within the TUI cooldown window OR has a busy PTY; trigger()
+        # will pre-dismiss any leftover modal, and the 80ms wait there
+        # covers the most common race. This branch only fires under
+        # sustained burst load where every worker has just finished a
+        # request — picking a warm-idle is still better than piling
+        # onto an in-flight one. We DO bias against pty-busy workers
+        # within this branch when there's a not-busy alternative.
+        warm_idle_all = [s for s in usable if not s._channels]
+        warm_idle_quiet = [s for s in warm_idle_all if not _pty_busy(s)]
+        warm_idle = warm_idle_quiet or warm_idle_all
         if warm_idle:
             idx = self._rr.get(key, 0) % len(warm_idle)
             self._rr[key] = idx + 1

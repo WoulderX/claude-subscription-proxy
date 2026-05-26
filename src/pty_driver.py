@@ -365,6 +365,40 @@ class ClaudePtyDriver:
     def _matching_rules(self, squeezed: bytes) -> list[tuple[tuple[bytes, ...], bytes, str]]:
         return [r for r in self._DISMISS_RULES if all(m in squeezed for m in r[0])]
 
+    def is_tui_busy(self) -> bool:
+        """Heuristic: is claude CLI doing something that would swallow
+        an inbound placeholder keystroke?
+
+        Returns True for either of:
+          - the `esc to interrupt` footer hint is in screen_tail (CLI
+            is mid-tool-execution / mid-spinner — the user-facing SSE
+            may already have closed, but claude CLI is still running
+            the tool chain triggered by tool_use blocks in the response)
+          - any known dismiss-rule modal is currently rendered (modal
+            grabs input — typed "say hi" gets treated as a 1/2/3 choice)
+
+        Used by SessionManager.pick() so a worker mid-tool-chain isn't
+        handed a new user request — the placeholder write would land
+        into a TUI that's not reading the prompt line, mitm would never
+        see the outbound /v1/messages, and the API caller would get a
+        90s upstream_unavailable.
+
+        Best-effort: any decode/regex failure → False (treat as idle)
+        so a broken heuristic can't permanently exclude a worker."""
+        try:
+            tail_squeezed = re.sub(r"\s+", "",
+                                    self.dump_screen_tail()).encode(
+                                        "utf-8", "replace")
+        except Exception:
+            return False
+        if not tail_squeezed:
+            return False
+        if _STALE_INTERRUPT_MARKER in tail_squeezed:
+            return True
+        if self._matching_rules(tail_squeezed):
+            return True
+        return False
+
     def matching_modal_names(self) -> list[str]:
         """Names of `_DISMISS_RULES` whose markers are all present in
         EITHER the 4KB chunk matcher view OR the 16KB rendered screen
