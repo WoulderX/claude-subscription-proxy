@@ -242,18 +242,41 @@ class ClaudePtyDriver:
         s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", s)
         s = re.sub(r"\x1b[@-Z\\-_]", "", s)
         s_squeezed = re.sub(r"\s+", "", s).encode("utf-8", "replace")
-        for _markers, key, name in self._matching_rules(s_squeezed):
-            try:
-                self.proc.write(key)
-                self._last_dialog_dismiss = time.monotonic()
-                self._recent_chunks.clear()
-                log.warning("pre-trigger dismissed claude TUI modal=%s "
-                            "key=%r (avoids modal-eats-placeholder race)",
-                            name, key)
-                return True
-            except Exception:
-                log.exception("pre-trigger dismiss failed modal=%s", name)
-                return False
+        # Two-layer match: prefer the 4KB chunk window (cheapest, no
+        # false positives from screen redraw artifacts), but fall back
+        # to the 16KB ANSI-stripped screen_tail. We observed cases where
+        # a tool-permission modal sat at the bottom of the rendered
+        # screen while claude TUI was *also* spinning agent activity
+        # ("Running 2 agents… Read ... Bash command ...") — those redraw
+        # chunks flooded the 4KB window and pushed the modal anchors
+        # out, so `_matching_rules(s_squeezed)` came back empty even
+        # though the modal was still on screen, eating our keystroke.
+        # screen_tail is the post-render view and survives that flood.
+        candidate_views = [s_squeezed]
+        try:
+            tail_squeezed = re.sub(r"\s+", "",
+                                    self.dump_screen_tail()).encode(
+                                        "utf-8", "replace")
+            if tail_squeezed and tail_squeezed != s_squeezed:
+                candidate_views.append(tail_squeezed)
+        except Exception:
+            log.debug("pre-trigger screen_tail squeeze failed",
+                      exc_info=True)
+        for view in candidate_views:
+            for _markers, key, name in self._matching_rules(view):
+                try:
+                    self.proc.write(key)
+                    self._last_dialog_dismiss = time.monotonic()
+                    self._recent_chunks.clear()
+                    log.warning("pre-trigger dismissed claude TUI modal=%s "
+                                "key=%r (avoids modal-eats-placeholder race; "
+                                "matched via %s view)",
+                                name, key,
+                                "chunks" if view is s_squeezed else "screen_tail")
+                    return True
+                except Exception:
+                    log.exception("pre-trigger dismiss failed modal=%s", name)
+                    return False
         # No known modal matched — check for the generic "stale
         # in-flight" signal. This is the case where a previous response
         # finished from OUR perspective (channel closed, _channels empty,
@@ -344,13 +367,29 @@ class ClaudePtyDriver:
 
     def matching_modal_names(self) -> list[str]:
         """Names of `_DISMISS_RULES` whose markers are all present in
-        the current `_recent_chunks` matcher view. Exposed for the
-        watchdog's diagnostic dump (worker.py) so an operator can see
-        which known modals were on screen when a request timed out —
-        and, by elimination, when NONE matches, that the modal blocking
-        input is new and needs its own rule added here."""
-        return [name for _, _, name in self._matching_rules(
-            self.dump_recent_chunks_squeezed().encode("utf-8", "replace"))]
+        EITHER the 4KB chunk matcher view OR the 16KB rendered screen
+        tail (squeezed). Both views matter: a modal that's been pushed
+        out of `_recent_chunks` by mid-tool redraw activity can still
+        be sitting at the bottom of the rendered screen, eating input.
+        Exposed for the watchdog's diagnostic dump (worker.py) so the
+        operator can see which known modals were on screen when a
+        request timed out — and, by elimination, when NONE matches,
+        the blocking modal is new and needs its own rule added here."""
+        names: list[str] = []
+        seen: set[str] = set()
+        chunks_view = self.dump_recent_chunks_squeezed().encode(
+            "utf-8", "replace")
+        try:
+            tail_view = re.sub(r"\s+", "", self.dump_screen_tail()).encode(
+                "utf-8", "replace")
+        except Exception:
+            tail_view = b""
+        for view in (chunks_view, tail_view):
+            for _, _, name in self._matching_rules(view):
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
 
     def _dismiss_if_dialog(self, chunk: bytes) -> None:
         """Apply `_DISMISS_RULES` against recent PTY output. Without

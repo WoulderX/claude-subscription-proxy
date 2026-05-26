@@ -576,7 +576,22 @@ class ClaudeSession:
         litellm = channel.body_summary.get("litellm") if isinstance(
             channel.body_summary, dict) else None
         if isinstance(litellm, dict):
-            for k in ("user_api_key_alias", "user_id", "user_api_key_hash"):
+            # Fallback chain: alias is the human label an operator
+            # configured for the virtual key. If that's missing, fall
+            # back to the LiteLLM-side user UUID. Only as a last resort
+            # do we record the SHA256 of the key itself — it survives
+            # everything (LiteLLM always ships it), but it's unreadable
+            # noise in the usage table.
+            #
+            # NB: LiteLLM forwards user identity as x-litellm-user-api-
+            # key-user-id, never as a bare x-litellm-user-id. The old
+            # fallback's "user_id" key was dead code — it never matched
+            # any real LiteLLM header, so any key without an alias
+            # tipped straight into hash territory.
+            for k in ("user_api_key_alias",
+                      "user_api_key_user_id",
+                      "user_api_key_user_email",
+                      "user_api_key_hash"):
                 v = litellm.get(k)
                 if isinstance(v, str) and v:
                     litellm_user = v
