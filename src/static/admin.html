@@ -852,11 +852,15 @@
               <div class="section-title">用量统计</div>
               <div class="section-meta">USD 仅为按 Anthropic API 价目表估算的等价成本；订阅账号实际按月计费</div>
               <div class="spacer"></div>
-              <div class="section-controls">
+              <div class="section-controls" style="flex-wrap:wrap;row-gap:8px;">
                 <div class="pill-group" id="usageRangePills">
                   <button data-range="lifecycle">当前生命周期</button>
-                  <button data-range="today" class="active">今天 (UTC)</button>
-                  <button data-range="7d">最近 7 天</button>
+                  <button data-range="today" class="active">今天</button>
+                  <button data-range="yesterday">昨天</button>
+                  <button data-range="7d">近 7 天</button>
+                  <button data-range="30d">近 30 天</button>
+                  <button data-range="this_month">本月</button>
+                  <button data-range="custom">自定义</button>
                 </div>
                 <div class="pill-group" id="usageGroupPills">
                   <button data-group="account" class="active">按账号</button>
@@ -866,7 +870,14 @@
               </div>
             </div>
 
-            <div style="display:flex;align-items:center;gap:14px;margin-bottom:10px;">
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap;">
+              <div id="usageCustomRow" style="display:none;align-items:center;gap:8px;">
+                <span class="text-muted" style="font-size:12px;">起：</span>
+                <input type="date" id="usageCustomSince" style="background:var(--surface);border:1px solid var(--border-strong);border-radius:6px;color:var(--text);padding:4px 8px;font-family:inherit;font-size:12px;">
+                <span class="text-muted" style="font-size:12px;">止：</span>
+                <input type="date" id="usageCustomUntil" style="background:var(--surface);border:1px solid var(--border-strong);border-radius:6px;color:var(--text);padding:4px 8px;font-family:inherit;font-size:12px;">
+                <span class="text-muted" style="font-size:12px;">（含起止两天，本地时区）</span>
+              </div>
               <label class="toggle-row" id="showNullLitellmRow" style="display:none;">
                 <input type="checkbox" id="showNullLitellm">
                 <span>显示空 LiteLLM 用户的行（prewarm / 内部探针）</span>
@@ -1674,9 +1685,18 @@
       const auth = authHeader();
       if (!auth) return;
       try {
+        // Use local-time bounds (matches the new section pills) so
+        // "今天" here means the same wall-clock day as in the table.
+        const localMidnight = (() => {
+          const d = new Date(); d.setHours(0,0,0,0);
+          return d.getTime() / 1000;
+        })();
+        const nowS = Date.now() / 1000;
+        const qToday = `range=custom&group_by=account&since=${localMidnight.toFixed(3)}`;
+        const q7d    = `range=custom&group_by=account&since=${(nowS - 7*86400).toFixed(3)}`;
         const [todayResp, weekResp] = await Promise.all([
-          fetch('/admin/usage?range=today&group_by=account', { headers: auth }),
-          fetch('/admin/usage?range=7d&group_by=account',    { headers: auth }),
+          fetch('/admin/usage?' + qToday, { headers: auth }),
+          fetch('/admin/usage?' + q7d,    { headers: auth }),
         ]);
         if (todayResp.status === 503 || weekResp.status === 503) {
           $('ovUsdToday').textContent = '—';
@@ -1713,13 +1733,40 @@
     }
 
     // ── Usage table (with sort + null-litellm filter) ───────
+    // Valid range tokens accepted by /admin/usage. Anything else
+    // (including stale localStorage from prior versions) falls back
+    // to 'today' so the page never lands on an unknown pill.
+    const USAGE_RANGES = new Set([
+      'lifecycle','today','yesterday','7d','30d','this_month','custom',
+    ]);
     let usageRange = localStorage.getItem('usageRange') || 'today';
+    if (!USAGE_RANGES.has(usageRange)) usageRange = 'today';
     let usageGroup = localStorage.getItem('usageGroup') || 'account';
     let usageSort  = JSON.parse(localStorage.getItem('usageSort') || 'null')
                    || { col: 'estimated_usd', dir: 'desc' };
+    // Custom-range date strings (YYYY-MM-DD, browser-local). Default
+    // span is "last 7 days inclusive" so opening the picker for the
+    // first time gives a sensible window instead of two empty fields.
+    function _ymdLocal(d) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth()+1).padStart(2,'0');
+      const day = String(d.getDate()).padStart(2,'0');
+      return `${y}-${m}-${day}`;
+    }
+    const _todayLocal = new Date();
+    const _sevenAgo = new Date(_todayLocal.getTime() - 6*86400000);
+    let usageCustomSinceStr = localStorage.getItem('usageCustomSince')
+                              || _ymdLocal(_sevenAgo);
+    let usageCustomUntilStr = localStorage.getItem('usageCustomUntil')
+                              || _ymdLocal(_todayLocal);
     const openRows = new Set();
     const usageRangePills = $('usageRangePills');
     const usageGroupPills = $('usageGroupPills');
+    const usageCustomRow = $('usageCustomRow');
+    const usageCustomSinceInput = $('usageCustomSince');
+    const usageCustomUntilInput = $('usageCustomUntil');
+    usageCustomSinceInput.value = usageCustomSinceStr;
+    usageCustomUntilInput.value = usageCustomUntilStr;
     function syncUsagePills() {
       usageRangePills.querySelectorAll('button').forEach(b => {
         b.classList.toggle('active', b.dataset.range === usageRange);
@@ -1733,6 +1780,9 @@
       // meaningful when grouping by litellm_user.
       $('showNullLitellmRow').style.display =
         (usageGroup === 'litellm_user') ? '' : 'none';
+      // Custom date range row only appears under the "自定义" pill.
+      usageCustomRow.style.display =
+        (usageRange === 'custom') ? 'inline-flex' : 'none';
       // Sort indicator in headers.
       document.querySelectorAll('table.usage th.sortable').forEach(th => {
         const active = th.dataset.sort === usageSort.col;
@@ -1742,6 +1792,39 @@
       });
     }
     syncUsagePills();
+    // Resolve a (since, until) pair in Unix epoch seconds for the
+    // active range, using BROWSER-LOCAL time so calendar boundaries
+    // line up with what the operator sees on their wall clock.
+    // Returns {since: null} for the lifecycle range (server handles
+    // its own per-bucket lookup). Custom range honors the date
+    // inputs inclusively — picking 5/20 to 5/26 spans 5/20 00:00
+    // through 5/27 00:00 (i.e. 7 full days).
+    function computeUsageBounds() {
+      if (usageRange === 'lifecycle') return { since: null, until: null };
+      const now = Date.now() / 1000;
+      const localMidnight = (() => {
+        const d = new Date(); d.setHours(0,0,0,0);
+        return d.getTime() / 1000;
+      })();
+      if (usageRange === 'today')     return { since: localMidnight, until: null };
+      if (usageRange === 'yesterday') return { since: localMidnight - 86400, until: localMidnight };
+      if (usageRange === '7d')        return { since: now - 7  * 86400, until: null };
+      if (usageRange === '30d')       return { since: now - 30 * 86400, until: null };
+      if (usageRange === 'this_month') {
+        const d = new Date(); d.setDate(1); d.setHours(0,0,0,0);
+        return { since: d.getTime() / 1000, until: null };
+      }
+      if (usageRange === 'custom') {
+        // YYYY-MM-DD interpreted as local midnight. End is inclusive,
+        // so add one day to convert to the exclusive upper bound the
+        // server uses (ts < until).
+        const s = new Date(usageCustomSinceStr + 'T00:00:00');
+        const u = new Date(usageCustomUntilStr + 'T00:00:00');
+        if (isNaN(s) || isNaN(u)) return { since: null, until: null };
+        return { since: s.getTime()/1000, until: (u.getTime() + 86400000)/1000 };
+      }
+      return { since: null, until: null };
+    }
     usageRangePills.addEventListener('click', e => {
       const b = e.target.closest('button[data-range]');
       if (!b) return;
@@ -1749,6 +1832,21 @@
       localStorage.setItem('usageRange', usageRange);
       openRows.clear(); syncUsagePills(); refreshUsage();
     });
+    function onCustomDateChange() {
+      usageCustomSinceStr = usageCustomSinceInput.value;
+      usageCustomUntilStr = usageCustomUntilInput.value;
+      if (!usageCustomSinceStr || !usageCustomUntilStr) return;
+      // Self-correct reversed ranges instead of issuing a 400.
+      if (usageCustomSinceStr > usageCustomUntilStr) {
+        usageCustomUntilStr = usageCustomSinceStr;
+        usageCustomUntilInput.value = usageCustomUntilStr;
+      }
+      localStorage.setItem('usageCustomSince', usageCustomSinceStr);
+      localStorage.setItem('usageCustomUntil', usageCustomUntilStr);
+      if (usageRange === 'custom') { openRows.clear(); refreshUsage(); }
+    }
+    usageCustomSinceInput.addEventListener('change', onCustomDateChange);
+    usageCustomUntilInput.addEventListener('change', onCustomDateChange);
     usageGroupPills.addEventListener('click', e => {
       const b = e.target.closest('button[data-group]');
       if (!b) return;
@@ -1781,8 +1879,27 @@
       const auth = authHeader();
       if (!auth) return;
       try {
-        const url = `/admin/usage?range=${encodeURIComponent(usageRange)}` +
-                    `&group_by=${encodeURIComponent(usageGroup)}`;
+        // Always send range=custom + locally-computed since/until for
+        // non-lifecycle presets so calendar boundaries align with the
+        // operator's browser timezone (server-side named-range fallback
+        // uses UTC and is kept only for direct API hits).
+        const bounds = computeUsageBounds();
+        const params = new URLSearchParams({ group_by: usageGroup });
+        if (usageRange === 'lifecycle') {
+          params.set('range', 'lifecycle');
+        } else if (bounds.since != null) {
+          params.set('range', 'custom');
+          params.set('since', bounds.since.toFixed(3));
+          if (bounds.until != null) params.set('until', bounds.until.toFixed(3));
+        } else {
+          // Custom range with no valid dates picked yet — skip the fetch
+          // and show an empty-state in-place instead of hammering the API.
+          usageBody.innerHTML = `<tr><td colspan="7" class="empty-state">
+            请先选择有效的起止日期
+          </td></tr>`;
+          return;
+        }
+        const url = '/admin/usage?' + params.toString();
         const resp = await fetch(url, { headers: auth });
         if (resp.status === 503) {
           let reason = '用量统计未启用';

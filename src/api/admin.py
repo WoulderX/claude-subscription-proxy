@@ -540,17 +540,34 @@ def build_router(
     async def get_usage(
         range: str = "today",
         group_by: str = "account",
+        since: float | None = None,
+        until: float | None = None,
         _pool: list[str] = Depends(auth_dep),
     ) -> dict[str, Any]:
         """Token-usage aggregates.
 
         Query params:
-          range:    lifecycle | today | 7d
+          range:    lifecycle | today | yesterday | 7d | 30d
+                    | this_month | custom
                     - "lifecycle" filters by ts >= the earliest live
-                      worker's started_at (per group bucket).
-                    - "today" filters by ts >= local-day-midnight UTC.
-                    - "7d" filters by ts >= now - 7 days.
+                      worker's started_at (per group bucket); since/
+                      until query params are ignored.
+                    - "custom" requires `since` (and optionally `until`)
+                      as Unix epoch seconds, computed by the caller.
+                      The dashboard uses this for every preset so
+                      ranges align with the operator's local timezone
+                      (UTC presets below are kept for compat).
+                    - "today" / "yesterday" / "this_month" — UTC
+                      calendar boundaries. Kept for back-compat with
+                      direct API callers; the dashboard now sends
+                      `range=custom` + locally-computed since/until.
+                    - "7d" / "30d" — rolling now-N*86400.
           group_by: account | worker | litellm_user
+          since:    Unix epoch seconds; lower bound (inclusive). Honored
+                    when `range=custom` (or any non-lifecycle range
+                    when supplied — overrides the server-computed value).
+          until:    Unix epoch seconds; upper bound (exclusive). Optional
+                    even with range=custom (defaults to now).
 
         Returns one row per bucket with summed token counters and the
         published-API USD equivalent (subscription accounts don't pay
@@ -569,32 +586,66 @@ def build_router(
         if group_by not in ("account", "worker", "litellm_user"):
             raise HTTPException(400,
                 "group_by must be account | worker | litellm_user")
-        if range not in ("lifecycle", "today", "7d"):
+        valid_ranges = ("lifecycle", "today", "yesterday", "7d", "30d",
+                        "this_month", "custom")
+        if range not in valid_ranges:
             raise HTTPException(400,
-                "range must be lifecycle | today | 7d")
+                f"range must be one of: {' | '.join(valid_ranges)}")
+
+        # ── helpers ─────────────────────────────────────────────
+        def _utc_midnight(epoch: float) -> float:
+            """UTC midnight at or before `epoch`, in Unix epoch."""
+            t = time.gmtime(epoch)
+            mt = time.mktime(time.struct_time(
+                (t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, 0)))
+            # mktime returns local-epoch; subtract tz offset for UTC.
+            return mt - time.timezone
+
+        # Reject negative bounds and out-of-order ranges early —
+        # otherwise sqlite would happily run a degenerate query and
+        # return zero rows, which looks like "no data" to operators.
+        if since is not None and since < 0:
+            raise HTTPException(400, "since must be >= 0")
+        if until is not None and until < 0:
+            raise HTTPException(400, "until must be >= 0")
+        if since is not None and until is not None and until < since:
+            raise HTTPException(400, "until must be >= since")
 
         now = time.time()
-        if range == "today":
-            # UTC midnight — keeps the cutoff deterministic regardless
-            # of host timezone, and matches Anthropic's reset semantics
-            # (their daily/weekly windows are UTC-anchored too).
-            today = time.gmtime(now)
-            since = time.mktime(time.struct_time(
-                (today.tm_year, today.tm_mon, today.tm_mday,
-                 0, 0, 0, 0, 0, 0)))
-            # mktime returns local-epoch; convert to UTC-epoch by
-            # subtracting timezone offset.
-            since -= time.timezone
-            until: float | None = None
-        elif range == "7d":
-            since = now - 7 * 86400
-            until = None
-        else:
-            # Lifecycle: server resolves a per-bucket lower bound after
-            # we know which buckets exist. Use 0.0 here for the bulk
-            # query (returns everything), then filter rows below.
+        if range == "custom":
+            if since is None:
+                raise HTTPException(400,
+                    "range=custom requires `since` query param")
+            # until=None → "up to now", handled naturally by sqlite
+        elif range == "lifecycle":
+            # Server resolves a per-bucket lower bound after we know
+            # which buckets exist. Use 0.0 here for the bulk query
+            # (returns everything), then filter rows below.
             since = 0.0
             until = None
+        elif since is None and until is None:
+            # Named range, no client override → compute UTC bounds
+            # server-side (legacy behavior — used by direct API hits).
+            if range == "today":
+                since = _utc_midnight(now)
+                until = None
+            elif range == "yesterday":
+                today_mid = _utc_midnight(now)
+                since = today_mid - 86400
+                until = today_mid
+            elif range == "this_month":
+                t = time.gmtime(now)
+                mt = time.mktime(time.struct_time(
+                    (t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0)))
+                since = mt - time.timezone
+                until = None
+            elif range == "7d":
+                since = now - 7 * 86400
+                until = None
+            elif range == "30d":
+                since = now - 30 * 86400
+                until = None
+        # else: client passed since/until for a named range — honor them.
 
         rows = usage_store.query(
             since=since, until=until, group_by=group_by)
