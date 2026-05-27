@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -128,6 +129,27 @@ class ClaudeSession:
         # with screens full of "(1m 0s · ↑ 156 tokens)" / spinner dots.
         # `None` means "never finished a request" (fresh worker).
         self._last_channel_close_at: float | None = None
+        # Consecutive intercept-timeout failures (worker received our
+        # trigger keystroke but mitm never saw the outbound /v1/messages
+        # within mitm_intercept_seconds → channel closed with zero
+        # bytes). A single failure can be transient (claude CLI mid-tool-
+        # chain, brief PTY buffer hiccup) but two in a row signals the
+        # worker is genuinely stuck (V8 hang, PTY corruption, modal we
+        # can't dismiss). When the counter hits _FORCE_RESTART_THRESHOLD
+        # mark_intercept_failure() schedules a force-restart so the
+        # worker self-heals within seconds instead of waiting for the
+        # 4h scheduled restart. Cleared by mark_request_success().
+        self.consecutive_intercept_failures: int = 0
+        # In-flight guard so two near-simultaneous failures don't queue
+        # two restart tasks (the second would wait on self.lock that
+        # the first holds, then attempt a double-restart). Cleared in
+        # the restart task's finally block.
+        self._force_restart_in_progress: bool = False
+        # Periodic self-test so stuck workers are caught BEFORE the
+        # next real user request lands on them. See _keepalive_loop()
+        # for the full rationale; the task is started by start() and
+        # cancelled by stop()/restart().
+        self._keepalive_task: asyncio.Task | None = None
         # Called when we spot `rate_limit_error` in the head of an SSE
         # response: signature (user_id, reason, window_seconds). The
         # manager wires this up to its per-account rate-limit table so
@@ -207,6 +229,8 @@ class ClaudeSession:
 
         self._reader_task = asyncio.create_task(
             self._read_loop(), name=f"session-reader-{self.user_id}")
+        self._keepalive_task = asyncio.create_task(
+            self._keepalive_loop(), name=f"session-keepalive-{self.user_id}")
         log.info("session up user=%s worker_pid=%s mitm_port=%s",
                  self.user_id, self.proc.pid, self.mitm_port)
 
@@ -322,6 +346,9 @@ class ClaudeSession:
 
     async def stop(self) -> None:
         self._closed = True
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
         if self.proc and self.proc.returncode is None:
             try:
                 self.proc.terminate()
@@ -727,4 +754,139 @@ class ClaudeSession:
         self.started_at = time.monotonic()
         self.started_at_wall = time.time()
         self.last_used = time.monotonic()
+        self.consecutive_intercept_failures = 0
         await self.start()
+
+    # Number of back-to-back intercept failures we tolerate before
+    # force-restarting the worker. 2 because a single failure can be
+    # the pick→trigger race (which our heuristic already mitigates but
+    # cannot prove won't trip once); two in a row makes random transient
+    # causes very unlikely and strongly suggests the CLI is wedged.
+    _FORCE_RESTART_THRESHOLD = 2
+
+    def mark_intercept_failure(self) -> None:
+        """Called by the API handler when a request closed with zero
+        bytes received (mitm intercept timeout / watchdog early close).
+        Bumps the streak counter; at threshold spawns a background
+        force-restart that the next request avoids by virtue of pick()
+        seeing the session busy with the restart-holding lock."""
+        self.consecutive_intercept_failures += 1
+        log.warning("user=%s intercept-failure streak=%d/%d",
+                    self.user_id, self.consecutive_intercept_failures,
+                    self._FORCE_RESTART_THRESHOLD)
+        if (self.consecutive_intercept_failures >= self._FORCE_RESTART_THRESHOLD
+                and not self._force_restart_in_progress):
+            self._force_restart_in_progress = True
+            asyncio.create_task(self._force_restart_async(),
+                                 name=f"force-restart-{self.user_id}")
+
+    def mark_request_success(self) -> None:
+        """Called by the API handler when bytes flowed on a channel.
+        Clears the streak so a worker recovering on its own (single
+        transient failure followed by success) doesn't accumulate to
+        threshold over hours."""
+        if self.consecutive_intercept_failures:
+            log.info("user=%s intercept-failure streak cleared (was %d)",
+                     self.user_id, self.consecutive_intercept_failures)
+            self.consecutive_intercept_failures = 0
+
+    async def _force_restart_async(self) -> None:
+        """Spawn-and-forget restart used by mark_intercept_failure().
+        Acquires self.lock so any in-flight pick() that landed here
+        between the failure and now waits for the new worker."""
+        try:
+            log.warning("user=%s force-restart: consecutive intercept "
+                        "failures hit threshold", self.user_id)
+            async with self.lock:
+                try:
+                    await self.restart()
+                    log.info("user=%s force-restart complete", self.user_id)
+                except Exception:
+                    log.exception("user=%s force-restart failed",
+                                  self.user_id)
+        finally:
+            self._force_restart_in_progress = False
+            self.consecutive_intercept_failures = 0
+
+    # How often to self-test an idle worker. 15 min picked so that:
+    #   - across 40 workers we average ~2.7 keepalive calls/min, an
+    #     imperceptible drop in the quota bucket (haiku, max_tokens=1
+    #     → tens of tokens per call)
+    #   - a worker that wedges between requests has a bounded "stuck
+    #     but undiscovered" window — at most 15 min before keepalive
+    #     reveals it (and mark_intercept_failure triggers restart)
+    _KEEPALIVE_INTERVAL_SECONDS = 900.0
+    # Tiny haiku call. Same shape as the bootstrap prewarm so we know
+    # the path works. Cost: ~tens of input tokens + max_tokens=1.
+    _KEEPALIVE_BODY: dict[str, Any] = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ok"}],
+    }
+
+    async def _keepalive_loop(self) -> None:
+        """Periodic self-test on idle workers. Discovers stuck workers
+        (V8 hang, PTY corruption, modal we can't dismiss) BEFORE a
+        real user request lands on them — failure here marks the worker
+        for force-restart via mark_intercept_failure(), success keeps
+        the streak counter clean.
+
+        Strict skip conditions to avoid interfering with real traffic:
+          - session closed / worker dead
+          - any in-flight channel (worker busy with real request)
+          - a force-restart already in flight
+          - cannot acquire self.lock within 100ms (someone else won it)
+        """
+        # Stagger initial sleep across the keepalive interval so 40
+        # workers don't all keepalive at the same wall-clock instant
+        # (would otherwise produce a thundering-herd quota burst every
+        # 15min on the dot).
+        try:
+            await asyncio.sleep(random.uniform(0, self._KEEPALIVE_INTERVAL_SECONDS))
+        except asyncio.CancelledError:
+            return
+        while not self._closed:
+            try:
+                await asyncio.sleep(self._KEEPALIVE_INTERVAL_SECONDS)
+                if self._closed:
+                    return
+                if self.proc is None or self.proc.returncode is not None:
+                    continue
+                if self._channels or self._force_restart_in_progress:
+                    continue
+                # Try-acquire with tiny timeout: never block a real
+                # request waiting on the lock.
+                try:
+                    await asyncio.wait_for(self.lock.acquire(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    try:
+                        channel = await self._submit(self._KEEPALIVE_BODY)
+                    except Exception:
+                        log.exception("user=%s keepalive submit failed",
+                                      self.user_id)
+                        continue
+                    got_bytes = False
+                    try:
+                        async for chunk in channel.iter():
+                            if chunk:
+                                got_bytes = True
+                    except Exception:
+                        log.exception("user=%s keepalive drain error",
+                                      self.user_id)
+                    if got_bytes:
+                        self.mark_request_success()
+                        log.debug("user=%s keepalive OK", self.user_id)
+                    else:
+                        log.warning("user=%s keepalive ping returned 0 bytes "
+                                    "— marking intercept failure",
+                                    self.user_id)
+                        self.mark_intercept_failure()
+                finally:
+                    if self.lock.locked():
+                        self.lock.release()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("user=%s keepalive loop error", self.user_id)

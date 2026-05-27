@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -8,8 +9,22 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..session.manager import SessionManager
+from ..session.session import ClaudeSession
+from ..session.state import ResponseChannel
 
 log = logging.getLogger(__name__)
+
+# Hedge timer: if the primary worker hasn't produced any bytes within
+# this many seconds, dispatch a parallel retry on a different worker.
+# 10s picked because:
+#   - healthy workers respond well under 1s (PTY trigger → mitm
+#     intercept → first SSE event)
+#   - bursts of subagent activity can occasionally delay first byte to
+#     5–8s legitimately; we don't want to hedge on those
+#   - the 90s mitm-intercept timeout is the worst-case fallback —
+#     waiting 10s before hedging means a stuck worker costs the user
+#     ~10s + the backup's response time, not 90s
+_HEDGE_TIMEOUT_SECONDS = 10.0
 
 
 def _extract_litellm_headers(headers) -> dict[str, str]:
@@ -33,6 +48,167 @@ def _extract_litellm_headers(headers) -> dict[str, str]:
     return out
 
 
+async def _consume_first_byte(channel: ResponseChannel) -> bytes | None:
+    """Read from the channel until we get a non-empty chunk OR the
+    channel closes with no bytes. Returns the first chunk (bytes) on
+    success, or None if the channel closed empty (i.e. mitm intercept
+    timeout / watchdog early close). This is the per-channel signal
+    used by the hedging race in `_open_with_hedge`."""
+    async for chunk in channel.iter():
+        if chunk:
+            return chunk
+    return None
+
+
+async def _drain_loser(loser_sess: ClaudeSession,
+                       loser_channel: ResponseChannel,
+                       loser_first_task: asyncio.Task) -> None:
+    """Background drain for the channel that LOST the hedge race.
+    Two purposes:
+      1. Let the worker's pending slot clear naturally (the response
+         will eventually arrive or timeout at the worker, whichever
+         comes first). Without this the slot stays full for 90s.
+      2. Update the failure-streak counter: if the loser produced 0
+         bytes by the time its channel closed, that's a genuine
+         intercept failure and the worker gets force-restarted via
+         mark_intercept_failure(). If it produced bytes (just slow),
+         mark_request_success() resets the streak."""
+    try:
+        first_chunk = await loser_first_task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("user=%s loser drain task error",
+                      loser_sess.user_id)
+        return
+    if first_chunk is None:
+        log.warning("hedge loser=%s closed with zero bytes — counting "
+                    "as intercept failure", loser_sess.user_id)
+        loser_sess.mark_intercept_failure()
+        return
+    loser_sess.mark_request_success()
+    # Drain the rest so the worker's slot clears cleanly.
+    try:
+        async for _ in loser_channel.iter():
+            pass
+    except Exception:
+        pass
+
+
+async def _open_with_hedge(
+    manager: SessionManager, pool: list[str],
+    body: dict[str, Any], request_metadata: dict[str, Any] | None,
+) -> tuple[ClaudeSession, ResponseChannel, bytes | None]:
+    """Open up to 2 parallel requests and return the one that produced
+    the first byte. The "loser" (if any) gets drained in the background
+    so its worker's pending slot clears cleanly.
+
+    Hedging behavior:
+      - Pick primary, submit, race first byte with `_HEDGE_TIMEOUT_SECONDS`
+      - If primary fast → return (primary, channel, first_chunk)
+      - If primary slow AND pool > 1 alternative available:
+          pick backup, submit, wait for either's first byte
+          winner returned, loser drained in background
+      - If primary slow but no alternative (singleton pool, all others
+        excluded by rate-limit) → keep waiting on primary, return when
+        it eventually responds OR closes empty (first_chunk=None)
+
+    Returns (winning_session, winning_channel, first_chunk_or_None).
+    If first_chunk is None the caller is responsible for synthesizing
+    an error response — both attempts (or the only attempt) failed."""
+    primary_sess = await manager.pick(pool)
+    primary_channel = await primary_sess.call(
+        body, request_metadata=request_metadata)
+    primary_first_task = asyncio.create_task(
+        _consume_first_byte(primary_channel),
+        name=f"first-byte-{primary_sess.user_id}")
+
+    # Phase 1: wait up to _HEDGE_TIMEOUT_SECONDS for primary's first byte
+    try:
+        first_chunk = await asyncio.wait_for(
+            asyncio.shield(primary_first_task), _HEDGE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        first_chunk = None
+
+    if first_chunk is not None:
+        # Primary won fast. Don't even consider hedging.
+        primary_sess.mark_request_success()
+        return primary_sess, primary_channel, first_chunk
+
+    # Phase 2: primary is slow. Try to start a backup.
+    backup_sess = await manager.pick_excluding(
+        pool, exclude_user_ids={primary_sess.user_id})
+    if backup_sess is None:
+        # No alternative — wait on primary indefinitely (until its
+        # 90s intercept timeout fires and the channel closes).
+        log.info("hedge skipped (no alternative worker available); "
+                 "waiting on primary=%s", primary_sess.user_id)
+        try:
+            first_chunk = await primary_first_task
+        except Exception:
+            first_chunk = None
+        if first_chunk is None:
+            primary_sess.mark_intercept_failure()
+        else:
+            primary_sess.mark_request_success()
+        return primary_sess, primary_channel, first_chunk
+
+    log.info("hedging: primary=%s slow >%.1fs → starting backup=%s",
+             primary_sess.user_id, _HEDGE_TIMEOUT_SECONDS,
+             backup_sess.user_id)
+    backup_channel = await backup_sess.call(
+        body, request_metadata=request_metadata)
+    backup_first_task = asyncio.create_task(
+        _consume_first_byte(backup_channel),
+        name=f"first-byte-{backup_sess.user_id}")
+
+    # Phase 3: race them. asyncio.wait returns the first to complete.
+    done, _pending = await asyncio.wait(
+        {primary_first_task, backup_first_task},
+        return_when=asyncio.FIRST_COMPLETED)
+    if primary_first_task in done:
+        winner_first_task = primary_first_task
+        winner_sess, winner_channel = primary_sess, primary_channel
+        loser_sess, loser_channel = backup_sess, backup_channel
+        loser_task = backup_first_task
+    else:
+        winner_first_task = backup_first_task
+        winner_sess, winner_channel = backup_sess, backup_channel
+        loser_sess, loser_channel = primary_sess, primary_channel
+        loser_task = primary_first_task
+
+    try:
+        first_chunk = winner_first_task.result()
+    except Exception:
+        first_chunk = None
+
+    # Spawn loser drain — don't await it; user response shouldn't wait.
+    asyncio.create_task(
+        _drain_loser(loser_sess, loser_channel, loser_task),
+        name=f"hedge-drain-{loser_sess.user_id}")
+
+    if first_chunk is None:
+        # Winner closed empty too (rare: both primary and backup failed
+        # before backup even got a chance to be considered "winner").
+        # Still drained loser above; mark winner failure.
+        winner_sess.mark_intercept_failure()
+    else:
+        winner_sess.mark_request_success()
+    return winner_sess, winner_channel, first_chunk
+
+
+async def _iter_with_prefix(channel: ResponseChannel,
+                            first_chunk: bytes | None):
+    """Iterate a channel, yielding first_chunk (if present) before
+    delegating to channel.iter(). Lets hedged-retry code peek at the
+    first byte for race purposes and still hand a complete byte
+    sequence to the streaming/collapse code."""
+    if first_chunk:
+        yield first_chunk
+    async for chunk in channel.iter():
+        yield chunk
+
+
 def build_router(manager: SessionManager, auth_dep) -> APIRouter:
     router = APIRouter()
 
@@ -43,8 +219,8 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
         litellm = _extract_litellm_headers(req.headers)
         request_metadata = {"litellm": litellm} if litellm else None
 
-        sess = await manager.pick(pool)
-        channel = await sess.call(body, request_metadata=request_metadata)
+        sess, channel, first_chunk = await _open_with_hedge(
+            manager, pool, body, request_metadata)
 
         if wants_stream:
             async def gen():
@@ -68,7 +244,7 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
                 saw_message_stop = False
                 model_hint = (body.get("model") or "") if isinstance(body, dict) else ""
 
-                async for chunk in channel.iter():
+                async for chunk in _iter_with_prefix(channel, first_chunk):
                     if not decided:
                         head.extend(chunk)
                         stripped = bytes(head).lstrip()
@@ -141,7 +317,7 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
         # Buffer + collapse SSE events into a single Anthropic non-streaming
         # response. The simplest faithful conversion is to reconstruct the
         # final Message from the event stream.
-        message = await _collapse_stream(channel)
+        message = await _collapse_stream(_iter_with_prefix(channel, first_chunk))
         return JSONResponse(message)
 
     return router
@@ -196,14 +372,17 @@ def _synthetic_error_sse(err_type: str, err_msg: str, model: str = "") -> bytes:
     ])
 
 
-async def _collapse_stream(channel) -> dict[str, Any]:
+async def _collapse_stream(byte_iter) -> dict[str, Any]:
     """Re-assemble Anthropic SSE events into a final Message JSON object,
-    matching the non-streaming /v1/messages response shape."""
+    matching the non-streaming /v1/messages response shape. Accepts any
+    async byte iterator so hedged retry can feed the first-consumed
+    chunk through `_iter_with_prefix` rather than re-reading the
+    channel from scratch."""
     message: dict[str, Any] = {}
     content_blocks: list[dict[str, Any]] = []
     buf = b""
     saw_sse_event = False
-    async for chunk in channel.iter():
+    async for chunk in byte_iter:
         buf += chunk
         while b"\n\n" in buf:
             raw_event, buf = buf.split(b"\n\n", 1)

@@ -521,6 +521,21 @@ class SessionManager:
             return False
         return self.is_account_rate_limited(acc_name)
 
+    async def pick_excluding(self, pool: list[str],
+                             exclude_user_ids: set[str]) -> ClaudeSession | None:
+        """Variant of pick() used by hedged retry: pick a worker from
+        the pool that is NOT in `exclude_user_ids`. Returns None if no
+        such worker exists (pool size 1, or all alternatives excluded).
+
+        Uses the same selection layers as pick() so the backup worker
+        is still preferred to be idle / not on a rate-limited account.
+        Falls back through the same warm-idle and fewest-in-flight
+        tiers when no truly-idle alternative exists."""
+        filtered_pool = [u for u in pool if u not in exclude_user_ids]
+        if not filtered_pool:
+            return None
+        return await self.pick(filtered_pool)
+
     async def spawn_account(self, account_name: str,
                               background_rest: bool = False) -> list[str]:
         """Spawn every worker for an account that was just added to

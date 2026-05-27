@@ -36,6 +36,16 @@ _TOOL_PERMISSION_OPTION3 = b"3.No"
 # (mitm never sees /v1/messages). Pre-trigger we send Esc to clear it.
 _STALE_INTERRUPT_MARKER = b"esctointerrupt"
 
+# How long after the last drain chunk containing the busy marker we
+# still treat the worker as busy. Must exceed the gap between
+# consecutive spinner-frame renders (claude CLI redraws the footer
+# every ~100-200ms during tool execution) AND cover the gap between
+# subagent steps (when one subagent finishes and the next is about to
+# print its first marker). 2s matches the existing TUI cooldown that
+# pick() applies after channel close, so a session is never picked
+# faster than the marker-staleness check anyway.
+_BUSY_MARKER_FRESH_SECONDS = 2.0
+
 
 class ClaudePtyDriver:
     """Spawns `claude` in a PTY with HTTPS_PROXY pointing at our mitm port.
@@ -79,6 +89,20 @@ class ClaudePtyDriver:
         # dialog is gone.
         self._recent_chunks: bytearray = bytearray()
         self._recent_chunks_limit: int = 4096
+        # Monotonic timestamp of the most recent drain chunk that
+        # contained the "esc to interrupt" footer marker. is_tui_busy()
+        # treats the worker as busy while this is fresh. The buffer-scan
+        # heuristics (screen_tail / _recent_chunks) only catch the
+        # marker if it sits in the buffer at lookup time — but when
+        # claude CLI is running 6 parallel subagents, the marker is
+        # generated faster than the 16KB buffer can preserve it, so
+        # individual snapshots will sometimes miss it. A timestamp
+        # outlives the byte buffer: any chunk that ever contained the
+        # marker keeps the worker marked busy for BUSY_MARKER_FRESH
+        # seconds afterward, which spans the gap between spinner
+        # frames even under heavy subagent output. Set by
+        # `_dismiss_if_dialog` on every chunk (debounce-independent).
+        self._last_busy_marker_seen: float = 0.0
         # Rate-limit modal capture. claude TUI may briefly show
         # "You've hit your limit · resets MMM DD, hham UTC" on startup
         # and then redraw over it within seconds — by the time mitm-
@@ -377,26 +401,62 @@ class ClaudePtyDriver:
           - any known dismiss-rule modal is currently rendered (modal
             grabs input — typed "say hi" gets treated as a 1/2/3 choice)
 
+        Consults BOTH the 16KB screen_tail AND the 4KB _recent_chunks
+        view, matching what `_force_dismiss_before_trigger()` checks
+        at trigger time. Without the chunks view, pick() and trigger()
+        could disagree under load: pick() reads screen_tail at T0 and
+        decides idle, then ~50ms later the drain loop appends a fresh
+        "esc to interrupt" spinner frame into _recent_chunks, and
+        trigger() at T1 has to fire pre-trigger Esc on a worker the
+        manager just handed out — exactly the 06:21 / 06:42 burst
+        failure pattern. Checking both views in pick() closes that
+        race window so the worker gets bypassed entirely.
+
         Used by SessionManager.pick() so a worker mid-tool-chain isn't
         handed a new user request — the placeholder write would land
         into a TUI that's not reading the prompt line, mitm would never
         see the outbound /v1/messages, and the API caller would get a
         90s upstream_unavailable.
 
-        Best-effort: any decode/regex failure → False (treat as idle)
-        so a broken heuristic can't permanently exclude a worker."""
+        Best-effort: any decode/regex failure on one view falls through
+        to the others; if all views fail the worker is treated as idle
+        (a broken heuristic can't permanently exclude a worker)."""
+        # Timestamp check first: catches the case where heavy subagent
+        # output flushed the marker out of both byte buffers between
+        # snapshots. _dismiss_if_dialog updates this on every drain
+        # chunk; while the tool chain is rendering spinner frames the
+        # timestamp keeps refreshing, so this returns True the entire
+        # time the worker is busy. After the chain ends the spinner
+        # stops and the timestamp goes stale within
+        # _BUSY_MARKER_FRESH_SECONDS.
+        if self._last_busy_marker_seen:
+            since = time.monotonic() - self._last_busy_marker_seen
+            if since < _BUSY_MARKER_FRESH_SECONDS:
+                return True
+        views: list[bytes] = []
         try:
             tail_squeezed = re.sub(r"\s+", "",
                                     self.dump_screen_tail()).encode(
                                         "utf-8", "replace")
+            if tail_squeezed:
+                views.append(tail_squeezed)
         except Exception:
-            return False
-        if not tail_squeezed:
-            return False
-        if _STALE_INTERRUPT_MARKER in tail_squeezed:
-            return True
-        if self._matching_rules(tail_squeezed):
-            return True
+            pass
+        try:
+            text = bytes(self._recent_chunks).decode("utf-8", "replace")
+            s = re.sub(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]", "", text)
+            s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", s)
+            s = re.sub(r"\x1b[@-Z\\-_]", "", s)
+            chunks_squeezed = re.sub(r"\s+", "", s).encode("utf-8", "replace")
+            if chunks_squeezed and (not views or chunks_squeezed != views[0]):
+                views.append(chunks_squeezed)
+        except Exception:
+            pass
+        for view in views:
+            if _STALE_INTERRUPT_MARKER in view:
+                return True
+            if self._matching_rules(view):
+                return True
         return False
 
     def matching_modal_names(self) -> list[str]:
@@ -447,14 +507,12 @@ class ClaudePtyDriver:
         if len(self._recent_chunks) > self._recent_chunks_limit:
             del self._recent_chunks[:-self._recent_chunks_limit]
 
-        now = time.monotonic()
-        if now - self._last_dialog_dismiss < self._dialog_dismiss_debounce:
-            return  # debounce — shared across all rules
-
         # Strip ANSI + squeeze whitespace for robust matching. Terminal
         # cursor moves can render text without spaces between words
         # (cursor positioning instead of typing space), so we squeeze
-        # before substring-matching.
+        # before substring-matching. Done BEFORE the dismiss-debounce
+        # check because the busy-marker timestamp must keep updating
+        # even while we're holding off on firing another Esc.
         try:
             text = bytes(self._recent_chunks).decode("utf-8", "replace")
         except Exception:
@@ -463,6 +521,18 @@ class ClaudePtyDriver:
         s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", s)
         s = re.sub(r"\x1b[@-Z\\-_]", "", s)
         s_squeezed = re.sub(r"\s+", "", s).encode("utf-8", "replace")
+
+        now = time.monotonic()
+        # Refresh busy-marker timestamp on every drain chunk that
+        # contains the footer hint, regardless of debounce. is_tui_busy()
+        # consults this so a worker mid-tool-chain stays excluded from
+        # pick() even when the marker has scrolled past the byte
+        # buffers between snapshots.
+        if _STALE_INTERRUPT_MARKER in s_squeezed:
+            self._last_busy_marker_seen = now
+
+        if now - self._last_dialog_dismiss < self._dialog_dismiss_debounce:
+            return  # debounce — shared across dismiss rules
         for _markers, key, name in self._matching_rules(s_squeezed):
             try:
                 self.proc.write(key)

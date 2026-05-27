@@ -10,7 +10,12 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..session.manager import SessionManager
-from .anthropic import _collapse_stream, _extract_litellm_headers
+from .anthropic import (
+    _collapse_stream,
+    _extract_litellm_headers,
+    _iter_with_prefix,
+    _open_with_hedge,
+)
 from .translate import anthropic_sse_to_openai_sse, openai_to_anthropic
 
 log = logging.getLogger(__name__)
@@ -28,16 +33,18 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
         request_metadata = {"litellm": litellm} if litellm else None
 
         anth_req = openai_to_anthropic(oi_req)
-        sess = await manager.pick(pool)
-        channel = await sess.call(anth_req, request_metadata=request_metadata)
+        sess, channel, first_chunk = await _open_with_hedge(
+            manager, pool, anth_req, request_metadata)
 
         if wants_stream:
             async def gen():
-                async for sse in anthropic_sse_to_openai_sse(channel.iter(), model):
+                async for sse in anthropic_sse_to_openai_sse(
+                        _iter_with_prefix(channel, first_chunk), model):
                     yield sse
             return StreamingResponse(gen(), media_type="text/event-stream")
 
-        message = await _collapse_stream(channel)
+        message = await _collapse_stream(
+            _iter_with_prefix(channel, first_chunk))
         return JSONResponse(_anthropic_message_to_openai(message, model))
 
     return router

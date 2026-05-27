@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     NODE_VERSION=20 \
-    TZ=UTC
+    TZ=Asia/Shanghai
 
 # Pin claude code CLI to a known-good version. The proxy depends on
 # private CLI internals (system[0] billing header, anthropic-beta token
