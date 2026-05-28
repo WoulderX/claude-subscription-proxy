@@ -114,6 +114,19 @@ def build_router(
             changes.append(
                 f"claude.restart_interval_seconds: {old} -> {config.claude.restart_interval_seconds}")
 
+        # --- claude.session_affinity{,_ttl_seconds} + rate_limit backoff ---
+        # All read live in SessionManager (pick() / mark_account_rate_limited),
+        # so mutating in place takes effect on the very next request — lets
+        # an operator A/B the routing + backoff strategy without a restart.
+        for field in ("session_affinity", "session_affinity_ttl_seconds",
+                      "rate_limit_base_cooldown_seconds",
+                      "rate_limit_max_cooldown_seconds"):
+            old = getattr(config.claude, field)
+            new = getattr(new_config.claude, field)
+            if old != new:
+                setattr(config.claude, field, new)
+                changes.append(f"claude.{field}: {old} -> {new}")
+
         # --- claude.timeouts.* ---
         for field in new_config.claude.timeouts.model_fields:
             old = getattr(config.claude.timeouts, field)

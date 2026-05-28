@@ -397,8 +397,8 @@ async def messages(req, pool: list[str] = Depends(auth_dep)):
 
 ### 1.9 多 worker pool：单 key 服务端负载均衡
 
-一个 token 可以映射到一个 user_id **池**（`src/session/manager.py:41-66`
-`pick()`）：
+一个 token 可以映射到一个 user_id **池**（`src/session/manager.py`
+`SessionManager.pick()`）：
 
 ```yaml
 users:
@@ -408,32 +408,29 @@ users:
     - litellm-2
 ```
 
-LiteLLM / 客户端只配一个 key，本服务收到请求后从池里挑一个 worker：
+LiteLLM / 客户端只配一个 key，本服务收到请求后从池里挑一个 worker。
+`pick()` 的选址分层（最优先在前）：
 
-```python
-async def pick(self, pool):
-    if len(pool) == 1:
-        return await self.get_or_create(pool[0])
-    sessions = [await self.get_or_create(u) for u in pool]
-    idle = [s for s in sessions if not s._channels]
-    if idle:
-        # 空闲 worker 之间 round-robin
-        idx = self._rr.get(tuple(pool), 0) % len(idle)
-        self._rr[tuple(pool)] = idx + 1
-        return idle[idx]
-    # 全忙：选 _channels 最少的，多个同 min 时 RR
-    min_inflight = min(len(s._channels) for s in sessions)
-    candidates = [s for s in sessions if len(s._channels) == min_inflight]
-    idx = self._rr.get(tuple(pool), 0) % len(candidates)
-    self._rr[tuple(pool)] = idx + 1
-    return candidates[idx]
-```
+1. **过滤限流账号**：跳过当前处在冷却窗口内的账号的 worker；只有当池里
+   全部账号都在冷却时才放行（让请求去 Anthropic 重新确认限制是否还在）
+2. **会话亲和**（`claude.session_affinity`，默认开）：带 `session_key`
+   的请求优先落到该对话上次路由到的**账号**，命中上游 prompt cache。亲
+   和账号被限流 / TTL 过期时透明退回下面的均衡逻辑（见下）
+3. **空闲优先**：cool-idle（无 in-flight 且过了 TUI 冷却）优先于
+   warm-idle（无 in-flight 但仍在 TUI 冷却窗内 / PTY 忙）
+4. **同层 round-robin**：候选之间轮转，避免总集中到 pool[0]
+5. **全忙 fallback**：选 in-flight 最少的；同 min 时 RR
 
-选址策略：
+**会话亲和怎么定 key**（`src/api/anthropic.py` `_session_key_for`）：
+对 `model + system + tools + messages[0]` 取 hash。后续轮次的 `messages[0]`
+不变，所以同一对话每轮都映射到同一个 key → 钉在同一账号；不同对话
+（首条消息不同）散到不同账号 → 负载仍然均衡。**适用前提**：并发对话数
+> 账号数。若是少数巨型对话，亲和会把负载挤到少数账号、反而更容易撞
+per-account TPM 上限 —— 这种工作负载建议 `session_affinity: false` 回到
+纯 round-robin 均摊（可 `/admin/reload` 热切换 A/B 对比）。
 
-1. **优先 idle**：扫池，挑没有 in-flight 请求的 worker
-2. **多个 idle 之间 round-robin**：避免请求总集中到 pool[0]
-3. **全忙 fallback**：选 in-flight 最少的；同 min 时 RR
+亲和是按对话锁**账号**而非锁单个 worker：同账号 N 个 worker 共享同一份
+上游 cache（§1.10 凭据共享），所以账号内仍然并行选 worker，不损失并行度。
 
 容器启动时所有池成员都会预热：**账号间并行，账号内串行**（每账号约
 N × 10s），见 §1.11 中的 `bootstrap prewarm` 条目。
@@ -513,6 +510,10 @@ claude TUI + 订阅 OAuth 这条路径有一组反复出现的失败模式：TUI
 | **scheduled restart**<br>（`session/manager.py` `_restarter`） | worker age > `restart_interval_seconds`（默认 4h） | 等 in-flight 排空（最多 60s）→ restart → prewarm。清掉 Ink 缓冲、内存 transcript、缓存的访问 token |
 | **OAuthRefresher**<br>（`oauth_refresh.py`） | 主进程后台任务，每 5 min 检查 token 寿命 < 1h | 集中刷新写回共享 .credentials.json。详见 §1.10 |
 | **`/admin/workers/{id}/restart`**<br>（`api/admin.py`） | 运维手动调用 | drain in-flight → restart → prewarm，单 worker 立即恢复 |
+| **hedged retry**<br>（`api/anthropic.py` `_open_with_hedge`） | primary worker 10s 内没吐出首字节 | 并发起一个 backup worker（`pick_excluding`，避开 primary），谁先出首字节用谁，loser 后台 drain。把"卡死 worker"对用户的延迟从 90s 砍到 ~10s + backup 响应时间。loser 若 0 字节则计一次 intercept 失败 |
+| **keepalive ping**<br>（`session/session.py` `_keepalive_loop`） | worker 空闲超过 ~15min | 自动发一发 haiku/max_tokens=1 保活，防止 worker 长时间空闲后 V8/PTY 卡死、首发真实请求吃满 90s intercept timeout |
+| **consecutive-failure force-restart**<br>（`session/session.py`） | 同 worker 连续 N 次（默认 2）intercept 失败 | 强制重启该 worker 自愈，不等 4h 定时。一次成功响应清零计数 |
+| **account rate-limit cooldown + 指数退避**<br>（`session/manager.py`） | worker 收到 `rate_limit_error` | 把整个账号标进冷却表，`pick()` 在窗口内跳过；裸无-reset-头的 TPM 尖峰用 per-account 指数退避（120→…→600 封顶），权威 reset 用真实窗口。详见 §3.4 |
 
 **关键认知**：watchdog 只**解开当前那一发卡住的请求**，让 worker 重新
 显示 IDLE，**不重启 worker 进程**。如果 claude TUI 卡在 error state，
@@ -520,10 +521,12 @@ claude TUI + 订阅 OAuth 这条路径有一组反复出现的失败模式：TUI
 restart（4h）或手动 `POST /admin/workers/{id}/restart`。
 
 **根因 vs 兜底**：这些机制是兜底，不是根因修复。多数 stuck 的根因是
-**单 OAuth 账号被多 worker 打超并发限**（订阅大约 2-3 并发上限）。如果
-你 pool 配 10 worker 跑一个账号，大部分请求会被 429，watchdog 让代理
-不死但请求实际是空响应。彻底解决方向：降 worker 数到 ≤ 3，或加多账号
-池（暂未实现）。
+**单 OAuth 账号被多 worker 打超并发限**（订阅大约 2-3 并发上限），或
+**单用户高 TPM 流量打满 per-account 限速**。如果你 pool 配 10 worker 跑
+一个账号，大部分请求会被 429，watchdog 让代理不死但请求实际是空响应。
+彻底解决方向：降单账号 worker 数、加多账号池摊开负载（`accounts:` 已
+支持，见 §3.2），或在上游（LiteLLM）给高 TPM 用户加限速削峰。路由层
+只能重新分配固定的总需求，创造不了容量。
 
 ### 1.12 几个关键设计决策
 
@@ -1056,6 +1059,10 @@ curl -s -H "Authorization: Bearer $KEY" \
 | `claude.binary` | `claude` 二进制；镜像里已在 `$PATH` | ❌ 需重启容器 |
 | `claude.home_template` | 每用户隔离 `$HOME` 路径模板。Docker 里 `/data/users/{user_id}` | ❌ 需重启容器 |
 | `claude.restart_interval_seconds` | 定时重启间隔。默认 14400（4h）。必须 < OAuth token 寿命 (~8h)（详见 §3.7） | ✅ `/admin/reload` |
+| `claude.session_affinity` | 会话亲和路由：同一对话固定到同一账号，保持上游 prompt cache 命中。默认 `true`；账号被限流 / 无可用 worker 时自动退回 round-robin（详见 §1.9） | ✅ `/admin/reload` |
+| `claude.session_affinity_ttl_seconds` | 空闲对话保留账号绑定的时长，默认 600；每次请求刷新，活跃对话不过期 | ✅ `/admin/reload` |
+| `claude.rate_limit_base_cooldown_seconds` | 裸 `rate_limit_error`（无 reset 头 = 滚动 TPM/RPM 尖峰）的首次冷却，默认 120；指数退避基数（详见 §3.4） | ✅ `/admin/reload` |
+| `claude.rate_limit_max_cooldown_seconds` | 上述退避的封顶冷却，默认 600（10min） | ✅ `/admin/reload` |
 | `claude.timeouts.*` | 7 个 timeout 微调（详见 §3.6） | ✅ 部分立即生效，部分下次 spawn 才生效 |
 | `oauth_refresh.*` | 主进程集中刷每个账号的 OAuth token（详见 §3.7） | ✅ `enabled` 切换会立即起/停后台任务 |
 | `usage.*` | token 用量记录（sqlite + `/admin/usage` + `/ui` 用量统计面板，详见 §3.8） | ❌ 需重启容器（enabled 切换不热重载） |
@@ -1112,12 +1119,13 @@ users:
     - litellm-2
 ```
 
-调度逻辑（适用所有模式）：
+调度逻辑（适用所有模式，完整分层见 §1.9）：
 
 1. 客户端用某个 token 发请求 → 鉴权拿到对应的 user 列表
-2. 优先挑列表里**没有 in-flight 请求**的 worker
-3. 多个候选时 round-robin（避免总集中到 list[0]）
-4. 全忙时挑 in-flight 最少的；同 min 时 RR
+2. 过滤掉处在限流冷却窗口内的账号（除非全部都在冷却）
+3. 会话亲和（默认开）：同一对话优先回到上次的账号（命中 cache）
+4. 空闲优先（cool-idle > warm-idle），同层 round-robin
+5. 全忙时挑 in-flight 最少的；同 min 时 RR
 
 每个 user_id 都会占一个 mitm 端口（`port_base + N`），所以 2 账号 × 5
 worker 占 10 个端口；预热时间约 5 × 10s（账号间并行，账号内串行 ——
@@ -1142,9 +1150,24 @@ worker 占 10 个端口；预热时间约 5 × 10s（账号间并行，账号内
 - Anthropic 订阅有 per-OAuth 隐含并发限制（约 2-3 并发）；**单账号 pool
   建议 ≤ 5**（实测可以撑，再大会撞 429 / 上游沉默）。多账号模式下
   `accounts:` 里每个账号的 `workers` 都遵守这条上限
-- 跨账号请求由 `SessionManager.pick` 自动调度（空闲优先 + RR），客户端
-  无感；账号配额追踪 / 失效摘除不在当前实现范围内（被限流的账号会以请
-  求超时形式表现，运维可在 `/ui` 的"账号"列定位）
+- 跨账号请求由 `SessionManager.pick` 自动调度（限流过滤 + 会话亲和 +
+  空闲优先 + RR，见 §1.9），客户端无感
+- **账号限流追踪 + 摘除**：worker 收到 `rate_limit_error`（SSE 错误体 /
+  TUI modal）时，`SessionManager` 把整个**账号**标进冷却表，`pick()`
+  在窗口内跳过它，到期后下一发请求作为 recheck 探针。`/status` /
+  `/ui` 的"账号"列显示剩余冷却时间
+- **冷却时长**分两类来源：
+  - **有权威 reset**（解析到 SSE/modal 的 reset 时间，或命中 weekly /
+    5-hour 文案）→ 用真实窗口（weekly 默认 3600s、5-hour 1800s）
+  - **裸 `rate_limit_error` 无 reset 头**（= 滚动 TPM/RPM 尖峰，几十秒就
+    在上游 reset）→ **per-account 指数退避**：首次只冷却
+    `rate_limit_base_cooldown_seconds`（默认 120s），同账号在恢复间隔内
+    每次 recheck 又被打回就翻倍（120→240→480→…），封顶
+    `rate_limit_max_cooldown_seconds`（默认 600s）；账号恢复（出现一段
+    健康间隔）后自动重置回基数。同账号多 worker 在 5s 内一起 429 算同
+    一次（burst 去重），streak 不会跳级
+- 这样设计避免了"固定长冷却把刚恢复的账号继续 park 导致池子骤缩→级联
+  限流"，同时对真·持续过载的账号又能逐步拉长冷却、不反复 hammer 上游
 
 ### 3.5 热重载 `/admin/reload`
 

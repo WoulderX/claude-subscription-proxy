@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
@@ -95,6 +96,35 @@ async def _drain_loser(loser_sess: ClaudeSession,
         pass
 
 
+def _session_key_for(body: dict[str, Any]) -> str | None:
+    """Derive a stable per-conversation key for account affinity.
+
+    Hashes the parts that stay constant across a conversation's turns
+    (model + system + tools + the FIRST message) but differ between
+    conversations. Deliberately excludes the later messages so that
+    every turn of one conversation maps to the same key — that's what
+    keeps the conversation pinned to one account (and its prompt cache).
+
+    Returns None when there's nothing stable to key on (no first
+    message), so the caller falls back to plain round-robin."""
+    if not isinstance(body, dict):
+        return None
+    msgs = body.get("messages")
+    first_msg = msgs[0] if isinstance(msgs, list) and msgs else None
+    if first_msg is None:
+        return None
+    try:
+        raw = json.dumps({
+            "model": body.get("model"),
+            "system": body.get("system"),
+            "tools": body.get("tools"),
+            "msg0": first_msg,
+        }, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 async def _open_with_hedge(
     manager: SessionManager, pool: list[str],
     body: dict[str, Any], request_metadata: dict[str, Any] | None,
@@ -116,7 +146,8 @@ async def _open_with_hedge(
     Returns (winning_session, winning_channel, first_chunk_or_None).
     If first_chunk is None the caller is responsible for synthesizing
     an error response — both attempts (or the only attempt) failed."""
-    primary_sess = await manager.pick(pool)
+    session_key = _session_key_for(body)
+    primary_sess = await manager.pick(pool, session_key=session_key)
     primary_channel = await primary_sess.call(
         body, request_metadata=request_metadata)
     primary_first_task = asyncio.create_task(

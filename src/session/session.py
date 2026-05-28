@@ -98,7 +98,7 @@ class ClaudeSession:
     process at a time."""
 
     def __init__(self, user_id: str, mitm_port: int, config: Config,
-                 on_rate_limit: Callable[[str, str, float], None] | None = None,
+                 on_rate_limit: Callable[..., None] | None = None,
                  on_usage: Callable[[str, dict], None] | None = None,
                  on_quota: Callable[[str, dict, float], None] | None = None,
                  on_quota_429: Callable[[str, float | None, float], None] | None = None) -> None:
@@ -554,6 +554,11 @@ class ClaudeSession:
             head_text = ""
         reset_epoch = extract_reset_from_response(head_text)
 
+        # escalate=True asks the manager to apply per-account exponential
+        # backoff instead of trusting `window`. Only the bare no-reset
+        # generic case below sets it — every authoritative window (parsed
+        # reset, weekly, 5-hour) keeps its real reset time.
+        escalate = False
         if reset_epoch is not None:
             # Time delta is the authoritative classifier — a body that
             # SAYS "5-hour limit" but RESETS 4 days out is actually the
@@ -571,14 +576,17 @@ class ClaudeSession:
             elif self._RL_5H_HINT.search(head_bytes):
                 reason, window = "5hour_limit", 1800.0
             else:
-                reason, window = "rate_limit", 600.0
+                # Bare rate_limit_error, no reset header — the rolling
+                # TPM/RPM spike. Hand the cooldown to the manager's
+                # exponential backoff (window here is just a placeholder).
+                reason, window, escalate = "rate_limit", 0.0, True
             excerpt = head_text[:600].replace("\n", " ").replace("\r", " ")
             log.warning(
                 "user=%s rate_limit_error detected but no reset time "
-                "parsed; using %.0fs default + %s. Body head excerpt: %r",
-                self.user_id, window, reason, excerpt)
+                "parsed; reason=%s escalate=%s. Body head excerpt: %r",
+                self.user_id, reason, escalate, excerpt)
         try:
-            self._on_rate_limit(self.user_id, reason, window)
+            self._on_rate_limit(self.user_id, reason, window, escalate=escalate)
         except Exception:
             log.exception("rate-limit callback failed user=%s", self.user_id)
 
@@ -654,7 +662,8 @@ class ClaudeSession:
         window = max(60.0, min(float(until_epoch) - time.time(),
                                14 * 86400))
         try:
-            self._on_rate_limit(self.user_id, reason, window)
+            # Authoritative reset from the TUI modal — never escalate.
+            self._on_rate_limit(self.user_id, reason, window, escalate=False)
         except Exception:
             log.exception("rate-limit event callback failed user=%s",
                           self.user_id)

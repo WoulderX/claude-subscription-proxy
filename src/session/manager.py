@@ -72,6 +72,13 @@ class SessionManager:
         # Round-robin tiebreaker counter, keyed by the tuple of pool
         # members. Used only when every worker in the pool is busy.
         self._rr: dict[tuple[str, ...], int] = {}
+        # Session→account affinity table. Keyed by a hash of the
+        # conversation's stable material (system+tools+first message),
+        # value is (account_name, last_used_monotonic). Keeps a
+        # conversation's turns on one account so Anthropic's per-account
+        # prompt cache stays warm. Lazily expired on read; bulk-pruned
+        # when it grows past _SESSION_AFFINITY_MAX.
+        self._session_affinity: dict[str, tuple[str, float]] = {}
         # Per-account routing-block table. Keyed by account name from
         # the `accounts:` config block; legacy single-account deployments
         # never populate this. Entries have a `kind` field that the UI
@@ -79,6 +86,12 @@ class SessionManager:
         # unknown failure" — both block routing, but the operator's
         # next move differs (wait for reset vs. investigate).
         self._account_rl: dict[str, AccountIssue] = {}
+        # Per-account exponential-backoff streak for the bare-rate_limit
+        # (no-reset-header) 429. Value is (streak, last_seen_monotonic).
+        # _next_rl_backoff() escalates the cooldown while 429s keep
+        # recurring and resets after a healthy gap. See
+        # rate_limit_base/max_cooldown_seconds in config.
+        self._rl_streak: dict[str, tuple[int, float]] = {}
 
     # ---------- account rate-limit table ----------
 
@@ -93,16 +106,57 @@ class SessionManager:
                 return name
         return None
 
+    # Sibling workers on one account can all 429 within a second or two
+    # of the same TPM spike. Treat 429s closer together than this as one
+    # incident so the streak doesn't jump several steps from a single burst.
+    _RL_BURST_DEBOUNCE_SECONDS = 5.0
+
     def mark_account_rate_limited(self, account_name: str, reason: str,
-                                  window_seconds: float) -> None:
+                                  window_seconds: float,
+                                  escalate: bool = False) -> None:
         """Record that an account hit a positive rate-limit signal
         (SSE error / TUI modal / 429). See `_mark_account_issue` for
         the merge semantics — short windows don't shrink a longer
         existing window, but a rate_limit observation upgrades a prior
-        `degraded` mark (we now know it's quota, not perms)."""
+        `degraded` mark (we now know it's quota, not perms).
+
+        When `escalate` is set (the bare no-reset-header 429 — a rolling
+        TPM/RPM spike), the cooldown is computed by exponential backoff
+        per account instead of using `window_seconds`. Authoritative
+        windows (parsed reset / weekly / 5-hour) pass escalate=False so
+        their real reset time is honored verbatim."""
+        if escalate:
+            window_seconds = self._next_rl_backoff(account_name)
         self._mark_account_issue(
             account_name, kind="rate_limit", reason=reason,
             window_seconds=window_seconds)
+
+    def _next_rl_backoff(self, account_name: str) -> float:
+        """Compute the next cooldown for a bare-rate_limit 429 on this
+        account and advance its streak.
+
+          - gap < debounce  → same incident (sibling worker); reuse streak
+          - gap > cap        → account recovered; reset to base (streak 1)
+          - otherwise        → consecutive probe re-429'd; double the window
+
+        Window = min(base * 2^(streak-1), cap)."""
+        base = float(self.config.claude.rate_limit_base_cooldown_seconds)
+        cap = float(self.config.claude.rate_limit_max_cooldown_seconds)
+        now = time.monotonic()
+        streak, last = self._rl_streak.get(account_name, (0, 0.0))
+        gap = now - last
+        if gap < self._RL_BURST_DEBOUNCE_SECONDS and streak >= 1:
+            pass                       # same burst — don't advance
+        elif gap > cap:
+            streak = 1                 # recovered — fresh incident
+        else:
+            streak += 1                # back-to-back — escalate
+        streak = max(streak, 1)
+        window = min(base * (2 ** (streak - 1)), cap)
+        self._rl_streak[account_name] = (streak, now)
+        log.info("account=%s rate-limit backoff: streak=%d window=%.0fs",
+                 account_name, streak, window)
+        return window
 
     def mark_account_degraded(self, account_name: str, reason: str,
                               window_seconds: float) -> None:
@@ -176,7 +230,10 @@ class SessionManager:
 
     def clear_account_rate_limit(self, account_name: str) -> bool:
         """Manually clear an account's limit (admin endpoint hook).
-        Returns True if a marker was removed."""
+        Returns True if a marker was removed. Also resets the backoff
+        streak — the operator asserting the account is fine means the
+        next 429 should start fresh at the base cooldown."""
+        self._rl_streak.pop(account_name, None)
         return self._account_rl.pop(account_name, None) is not None
 
     def mark_account_rate_limited_until(self, account_name: str,
@@ -342,10 +399,12 @@ class SessionManager:
         return oldest or 0.0
 
     def _on_worker_rate_limited(self, user_id: str, reason: str,
-                                window_seconds: float) -> None:
+                                window_seconds: float,
+                                escalate: bool = False) -> None:
         """Callback wired into every ClaudeSession; fires when its
         SSE stream's head contained `rate_limit_error`. Resolves the
-        worker → account and marks the account."""
+        worker → account and marks the account. `escalate` forwards the
+        per-account exponential-backoff request for bare no-reset 429s."""
         acc_name = self._account_name_for(user_id)
         if acc_name is None:
             # Legacy single-account mode: no account scope to mark. Log
@@ -353,7 +412,8 @@ class SessionManager:
             log.warning("user=%s hit rate_limit_error (%s) — no account "
                         "scope to mark in legacy mode", user_id, reason)
             return
-        self.mark_account_rate_limited(acc_name, reason, window_seconds)
+        self.mark_account_rate_limited(
+            acc_name, reason, window_seconds, escalate=escalate)
 
     # ---------- session lifecycle ----------
 
@@ -428,7 +488,12 @@ class SessionManager:
     # load every worker eventually clears the cooldown.
     _PICK_TUI_COOLDOWN_SECONDS = 2.0
 
-    async def pick(self, pool: list[str]) -> ClaudeSession:
+    # Cap on the affinity table. Each entry is tiny, but distinct
+    # conversations are unbounded over time, so prune past this.
+    _SESSION_AFFINITY_MAX = 10000
+
+    async def pick(self, pool: list[str],
+                   session_key: str | None = None) -> ClaudeSession:
         """Pick a session from a token's user pool.
 
         Selection layers (most-preferred first):
@@ -437,9 +502,14 @@ class SessionManager:
              whole pool — at least one of them needs to handle the
              request, and going through a limited account at least lets
              Anthropic re-confirm whether the limit still applies.
-          2. Cool idle — _channels empty AND last close > cooldown.
-          3. Warm idle — _channels empty but in cooldown window.
-          4. Fewest-in-flight, RR-tied so the load spreads instead of
+          2. Session affinity (when `session_key` given and the feature
+             is on): restrict candidates to the account this conversation
+             was last routed to, so Anthropic's per-account prompt cache
+             stays warm across turns. Transparent fallback to the full
+             usable set when that account is rate-limited / absent.
+          3. Cool idle — _channels empty AND last close > cooldown.
+          4. Warm idle — _channels empty but in cooldown window.
+          5. Fewest-in-flight, RR-tied so the load spreads instead of
              piling on whichever worker won the min() comparison first.
         """
         if len(pool) == 1:
@@ -456,6 +526,34 @@ class SessionManager:
                         "accounts; routing through anyway", len(sessions))
             usable = sessions
 
+        # Session affinity: narrow to one account's workers when this
+        # conversation already has a (still-valid, not-rate-limited)
+        # binding. Selection below then spreads across THAT account's
+        # workers; cross-conversation spreading is preserved because
+        # different session_keys bind to different accounts.
+        candidates = usable
+        use_affinity = (session_key is not None
+                        and self.config.claude.session_affinity)
+        if use_affinity:
+            acct = self._resolve_affinity(session_key)
+            if acct is not None:
+                same_acct = [s for s in usable
+                             if self._account_name_for(s.user_id) == acct]
+                if same_acct:
+                    candidates = same_acct
+
+        chosen = self._select_within(candidates)
+
+        if use_affinity:
+            acct = self._account_name_for(chosen.user_id)
+            if acct is not None:
+                self._record_affinity(session_key, acct)
+        return chosen
+
+    def _select_within(self, usable: list[ClaudeSession]) -> ClaudeSession:
+        """Apply the idle/busy selection tiers to a candidate set and
+        return one session. RR-keyed by the candidate user_ids so the
+        rotation is stable per (sub)pool."""
         now = time.monotonic()
         cooldown = self._PICK_TUI_COOLDOWN_SECONDS
 
@@ -484,7 +582,7 @@ class SessionManager:
                 return False
             return not _pty_busy(s)
 
-        key = tuple(pool)
+        key = tuple(s.user_id for s in usable)
         cool_idle = [s for s in usable if _is_cool_idle(s)]
         if cool_idle:
             idx = self._rr.get(key, 0) % len(cool_idle)
@@ -514,6 +612,45 @@ class SessionManager:
         idx = self._rr.get(key, 0) % len(candidates)
         self._rr[key] = idx + 1
         return candidates[idx]
+
+    def _resolve_affinity(self, session_key: str) -> str | None:
+        """Return the bound account for this conversation, or None if no
+        binding exists, it has expired, or the account is currently
+        rate-limited (in which case the caller spreads normally and
+        rebinds to wherever the request lands)."""
+        entry = self._session_affinity.get(session_key)
+        if entry is None:
+            return None
+        acct, ts = entry
+        ttl = self.config.claude.session_affinity_ttl_seconds
+        if (time.monotonic() - ts) > ttl:
+            self._session_affinity.pop(session_key, None)
+            return None
+        if self.is_account_rate_limited(acct):
+            return None
+        return acct
+
+    def _record_affinity(self, session_key: str, account_name: str) -> None:
+        """Bind (or refresh) this conversation to an account. Refreshing
+        the timestamp on every turn keeps an active conversation pinned;
+        idle ones age out via _resolve_affinity's TTL check."""
+        self._session_affinity[session_key] = (account_name, time.monotonic())
+        if len(self._session_affinity) > self._SESSION_AFFINITY_MAX:
+            self._prune_affinity()
+
+    def _prune_affinity(self) -> None:
+        """Drop expired bindings; if still over cap, drop the oldest."""
+        ttl = self.config.claude.session_affinity_ttl_seconds
+        now = time.monotonic()
+        self._session_affinity = {
+            k: v for k, v in self._session_affinity.items()
+            if (now - v[1]) <= ttl
+        }
+        if len(self._session_affinity) > self._SESSION_AFFINITY_MAX:
+            keep = sorted(self._session_affinity.items(),
+                          key=lambda kv: kv[1][1],
+                          reverse=True)[:self._SESSION_AFFINITY_MAX]
+            self._session_affinity = dict(keep)
 
     def _is_session_account_rate_limited(self, sess: ClaudeSession) -> bool:
         acc_name = self._account_name_for(sess.user_id)

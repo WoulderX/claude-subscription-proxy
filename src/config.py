@@ -107,6 +107,30 @@ class ClaudeConfig(BaseModel):
     # collide with the main-process refresher (the rotated RT is
     # single-use, so one of the two writers gets invalid_grant).
     restart_interval_seconds: int = 14400  # 4h
+    # Route every turn of one conversation to the same account so
+    # Anthropic's per-account prompt cache stays hot across the turns
+    # (turn N reads what turn N-1 wrote instead of re-creating the whole
+    # prefix on a fresh account). Different conversations still spread
+    # across accounts, so load stays balanced as long as concurrent
+    # conversations outnumber accounts. Falls back to plain round-robin
+    # whenever the affinity account is rate-limited or has no usable
+    # worker, so toggling this off (then /admin/reload) is always safe.
+    session_affinity: bool = True
+    # How long an idle conversation keeps its account binding. Refreshed
+    # on every request, so an active conversation never expires; a
+    # finished one frees its slot after this window.
+    session_affinity_ttl_seconds: int = 600
+    # Exponential backoff for the "bare rate_limit_error, no reset header"
+    # 429 — the shape Anthropic returns on a rolling TPM/RPM spike. These
+    # reset in seconds-to-a-minute upstream, so the FIRST cooldown is
+    # short (base) and a healthy gap resets it; but if the SAME account
+    # keeps re-hitting 429 on each post-cooldown probe, the window
+    # doubles (base, 2*base, 4*base, …) up to the cap so we stop hammering
+    # a genuinely exhausted account. Parsed-reset / weekly / 5-hour 429s
+    # carry an authoritative window and skip this entirely.
+    # Default sequence: 120 → 240 → 480 → 600(cap)  (2/4/8/10 min).
+    rate_limit_base_cooldown_seconds: int = 120
+    rate_limit_max_cooldown_seconds: int = 600
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
 
 
