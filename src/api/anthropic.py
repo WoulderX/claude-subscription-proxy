@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -26,6 +27,22 @@ log = logging.getLogger(__name__)
 #     waiting 10s before hedging means a stuck worker costs the user
 #     ~10s + the backup's response time, not 90s
 _HEDGE_TIMEOUT_SECONDS = 10.0
+
+# Affinity-bound rate-limit wait-and-retry. When a conversation pinned to
+# an account hits a rate limit, we'd rather WAIT for that account's
+# cooldown and retry on the SAME (warm-cache) account than re-route the
+# whole conversation to a cold account — re-creating its cache there
+# spikes the new account's TPM and cascades the limit across the pool.
+#   - Wait only if the remaining cooldown is short enough that the client
+#     won't time out AND the prompt cache (5-min TTL) is still warm —
+#     180s sits under both. Longer cooldown → fail fast with a 429 (the
+#     client retries later); never spread.
+#   - A few attempts cap worst-case latency; in practice the exponential
+#     backoff escalates a still-hot account past the wait cap (→ fail)
+#     after one wait.
+_RL_RETRY_MAX_WAIT_SECONDS = 180.0
+_RL_RETRY_MAX_ATTEMPTS = 3
+_RL_MARKER = b"rate_limit_error"
 
 
 def _extract_litellm_headers(headers) -> dict[str, str]:
@@ -128,6 +145,7 @@ def _session_key_for(body: dict[str, Any]) -> str | None:
 async def _open_with_hedge(
     manager: SessionManager, pool: list[str],
     body: dict[str, Any], request_metadata: dict[str, Any] | None,
+    session_key: str | None,
 ) -> tuple[ClaudeSession, ResponseChannel, bytes | None]:
     """Open up to 2 parallel requests and return the one that produced
     the first byte. The "loser" (if any) gets drained in the background
@@ -146,7 +164,6 @@ async def _open_with_hedge(
     Returns (winning_session, winning_channel, first_chunk_or_None).
     If first_chunk is None the caller is responsible for synthesizing
     an error response — both attempts (or the only attempt) failed."""
-    session_key = _session_key_for(body)
     primary_sess = await manager.pick(pool, session_key=session_key)
     primary_channel = await primary_sess.call(
         body, request_metadata=request_metadata)
@@ -240,6 +257,106 @@ async def _iter_with_prefix(channel: ResponseChannel,
         yield chunk
 
 
+async def _drain_channel(channel: ResponseChannel) -> None:
+    """Consume whatever is left on a channel we're abandoning (e.g. the
+    small 429 body before a wait-and-retry) so the queue/consumer don't
+    dangle. The worker's pending slot is freed independently when the
+    read loop sees the stream's end."""
+    try:
+        async for _ in channel.iter():
+            pass
+    except Exception:
+        pass
+
+
+def _synthetic_rate_limit_channel(remaining: float) -> ResponseChannel:
+    """A pre-loaded channel carrying an Anthropic-shaped rate_limit_error
+    JSON body, used to fail a request WITHOUT making an upstream call
+    (and without spreading to another account) when the pinned account's
+    cooldown is too long to wait out. The handler's normal non-SSE-error
+    synthesis turns this into a clean SSE/JSON error for the client."""
+    ch = ResponseChannel()
+    msg = ("账号限流冷却中，预计 %ds 后恢复。为避免限流扩散到其他账号，"
+           "本会话固定等待原账号而不改派；冷却超过等待上限故直接失败，"
+           "请稍后重试。" % int(remaining))
+    body = json.dumps({
+        "type": "error",
+        "error": {"type": "rate_limit_error", "message": msg},
+    }).encode("utf-8")
+    ch.queue.put_nowait(body)
+    ch.queue.put_nowait(None)
+    return ch
+
+
+async def _open_request(
+    manager: SessionManager, pool: list[str],
+    body: dict[str, Any], request_metadata: dict[str, Any] | None,
+) -> tuple[ClaudeSession | None, ResponseChannel, bytes | None]:
+    """Affinity-aware entry point with rate-limit wait-and-retry.
+
+    A conversation pinned to an account that is (or becomes) rate-limited
+    WAITS for that account's cooldown — up to `_RL_RETRY_MAX_WAIT_SECONDS`
+    — and retries on the SAME account, rather than re-routing to a cold
+    account and cascading the limit. If the cooldown is longer than the
+    cap, it fails fast with a synthetic 429 (no spread). Falls straight
+    through to `_open_with_hedge` when affinity is off / unkeyed."""
+    session_key = _session_key_for(body)
+    affinity_on = (session_key is not None
+                   and manager.config.claude.session_affinity)
+    if not affinity_on:
+        return await _open_with_hedge(
+            manager, pool, body, request_metadata, session_key)
+
+    for attempt in range(1, _RL_RETRY_MAX_ATTEMPTS + 1):
+        last = attempt == _RL_RETRY_MAX_ATTEMPTS
+
+        # (1) Pre-pick: conversation already pinned to a cooling account?
+        bound = manager.affinity_account(session_key)
+        if bound is not None and manager.is_account_rate_limited(bound):
+            remaining = manager.account_cooldown_remaining(bound)
+            if remaining <= _RL_RETRY_MAX_WAIT_SECONDS and not last:
+                wait = remaining + random.uniform(0.5, 2.5)
+                log.info("affinity wait: session pinned to limited "
+                         "account=%s; waiting %.0fs before retry (attempt %d)",
+                         bound, wait, attempt)
+                await asyncio.sleep(wait)
+                continue
+            log.warning("affinity fail-fast: account=%s cooldown %.0fs > "
+                        "%.0fs cap (or out of attempts); returning 429 "
+                        "without spreading", bound, remaining,
+                        _RL_RETRY_MAX_WAIT_SECONDS)
+            return None, _synthetic_rate_limit_channel(remaining), None
+
+        # (2) Pick + hedge (affinity prefers the pinned account).
+        sess, channel, first_chunk = await _open_with_hedge(
+            manager, pool, body, request_metadata, session_key)
+
+        # (3) Did we hit a rate limit? The account is already marked
+        # (detection runs synchronously in the read loop before the
+        # first chunk reaches us), so its cooldown is readable now.
+        if (first_chunk is not None and _RL_MARKER in first_chunk
+                and sess is not None):
+            served = manager.account_name_for(sess.user_id)
+            remaining = (manager.account_cooldown_remaining(served)
+                         if served else 0.0)
+            if (served is not None
+                    and 0 < remaining <= _RL_RETRY_MAX_WAIT_SECONDS
+                    and not last):
+                await _drain_channel(channel)
+                wait = remaining + random.uniform(0.5, 2.5)
+                log.info("affinity rate-limit retry: account=%s hit 429; "
+                         "waiting %.0fs then retrying on same account "
+                         "(attempt %d)", served, wait, attempt)
+                await asyncio.sleep(wait)
+                continue
+            # cooldown too long / out of attempts → pass the real 429 through
+
+        return sess, channel, first_chunk
+
+    # Defensive: attempts exhausted without returning.
+    return None, _synthetic_rate_limit_channel(0.0), None
+
+
 def build_router(manager: SessionManager, auth_dep) -> APIRouter:
     router = APIRouter()
 
@@ -250,7 +367,7 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
         litellm = _extract_litellm_headers(req.headers)
         request_metadata = {"litellm": litellm} if litellm else None
 
-        sess, channel, first_chunk = await _open_with_hedge(
+        sess, channel, first_chunk = await _open_request(
             manager, pool, body, request_metadata)
 
         if wants_stream:

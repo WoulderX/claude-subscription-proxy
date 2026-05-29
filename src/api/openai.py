@@ -14,7 +14,7 @@ from .anthropic import (
     _collapse_stream,
     _extract_litellm_headers,
     _iter_with_prefix,
-    _open_with_hedge,
+    _open_request,
 )
 from .translate import anthropic_sse_to_openai_sse, openai_to_anthropic
 
@@ -33,7 +33,7 @@ def build_router(manager: SessionManager, auth_dep) -> APIRouter:
         request_metadata = {"litellm": litellm} if litellm else None
 
         anth_req = openai_to_anthropic(oi_req)
-        sess, channel, first_chunk = await _open_with_hedge(
+        sess, channel, first_chunk = await _open_request(
             manager, pool, anth_req, request_metadata)
 
         if wants_stream:

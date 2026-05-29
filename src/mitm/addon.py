@@ -451,7 +451,56 @@ class HijackAddon:
             log.debug("user=%s dropped thinking=%s (tool_choice.type=%r forces "
                       "tool use, upstream rejects the combo)",
                       self.session.user_id, json.dumps(dropped), tc.get("type"))
+
+        # Mid-conversation system messages (role:"system" inside messages[])
+        # are an Opus-4.8-only feature; every other model 400s with
+        #   role 'system' is not supported on this model
+        # Claude Code 2.1.154+ emits them (lean-system-prompt strategy) even
+        # when the target model can't accept them. For non-4.8 models, hoist
+        # any such entry out of messages and fold its text into the top-level
+        # `system` (appended AFTER the cc_entrypoint billing block, which stays
+        # at system[0]) so the request succeeds; for opus-4-8 leave it in place.
+        model = merged.get("model") or ""
+        msgs = merged.get("messages")
+        if isinstance(msgs, list) and not model.startswith("claude-opus-4-8"):
+            hoisted = [m.get("content") for m in msgs
+                       if isinstance(m, dict) and m.get("role") == "system"]
+            if hoisted:
+                merged["messages"] = [m for m in msgs
+                                      if not (isinstance(m, dict)
+                                              and m.get("role") == "system")]
+                merged["system"] = self._fold_system_messages(
+                    merged.get("system"), hoisted)
+                log.info("user=%s hoisted %d mid-conversation system message(s) "
+                         "into top-level system (model=%s rejects role:system)",
+                         self.session.user_id, len(hoisted), model or "?")
         return merged
+
+    @staticmethod
+    def _fold_system_messages(system, contents: list) -> list:
+        """Normalise the top-level `system` to a list of blocks and append
+        the text of each hoisted system message after it. Keeps system[0]
+        (the billing block) intact."""
+        if system is None:
+            blocks: list = []
+        elif isinstance(system, str):
+            blocks = [{"type": "text", "text": system}] if system else []
+        elif isinstance(system, list):
+            blocks = list(system)
+        else:
+            blocks = []
+        for content in contents:
+            if isinstance(content, str):
+                if content:
+                    blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        blocks.append({"type": "text",
+                                       "text": part.get("text", "")})
+                    elif isinstance(part, str) and part:
+                        blocks.append({"type": "text", "text": part})
+        return blocks
 
     @staticmethod
     def _merge_system(base_system, user_system) -> list:

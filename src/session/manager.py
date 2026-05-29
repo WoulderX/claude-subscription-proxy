@@ -106,10 +106,47 @@ class SessionManager:
                 return name
         return None
 
+    def account_name_for(self, user_id: str) -> str | None:
+        """Public reverse-lookup of a worker's account name."""
+        return self._account_name_for(user_id)
+
+    def affinity_account(self, session_key: str) -> str | None:
+        """The account a conversation is currently pinned to, IGNORING the
+        account's rate-limit state. Used by the wait-and-retry path, which
+        deliberately stays on the pinned account through a cooldown rather
+        than spreading the limit to a cold-cache account. Honors the TTL
+        (returns None if the binding expired) but does NOT create one."""
+        entry = self._session_affinity.get(session_key)
+        if entry is None:
+            return None
+        acct, ts = entry
+        ttl = self.config.claude.session_affinity_ttl_seconds
+        if (time.monotonic() - ts) > ttl:
+            self._session_affinity.pop(session_key, None)
+            return None
+        return acct
+
+    def account_cooldown_remaining(self, account_name: str) -> float:
+        """Seconds until the account's rate-limit window expires; 0.0 when
+        it is not currently limited (lazily expires the marker on read)."""
+        state = self.account_rate_limit(account_name)
+        if state is None:
+            return 0.0
+        return max(0.0, state.until - time.time())
+
     # Sibling workers on one account can all 429 within a second or two
     # of the same TPM spike. Treat 429s closer together than this as one
     # incident so the streak doesn't jump several steps from a single burst.
     _RL_BURST_DEBOUNCE_SECONDS = 5.0
+
+    # Max workers the scheduled restarter recycles in a single pass. All
+    # workers boot together, so they cross restart_interval in the same
+    # tick; without a cap the restarter tears down + respawns all of them
+    # back-to-back — a thundering herd that spikes fd/CPU use and (under a
+    # low nofile limit) trips socketpair. Capping per pass spreads the
+    # churn; after the first staggered rollout restarts stay desynchronised
+    # because each worker's age now resets at a different tick.
+    _RESTART_MAX_PER_PASS = 4
 
     def mark_account_rate_limited(self, account_name: str, reason: str,
                                   window_seconds: float,
@@ -1073,9 +1110,18 @@ class SessionManager:
         while True:
             try:
                 await asyncio.sleep(check_interval)
+                restarted_this_pass = 0
                 for user_id, sess in list(self.sessions.items()):
                     if sess.age_seconds() <= interval:
                         continue
+                    if restarted_this_pass >= self._RESTART_MAX_PER_PASS:
+                        # Defer the rest to later passes so we don't
+                        # recycle every same-age worker in one burst.
+                        log.info("restarter: hit per-pass cap (%d); deferring "
+                                 "remaining overdue workers to next pass",
+                                 self._RESTART_MAX_PER_PASS)
+                        break
+                    restarted_this_pass += 1
                     log.info("scheduled restart user=%s age=%.0fs",
                              user_id, sess.age_seconds())
                     async with sess.lock:
