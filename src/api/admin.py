@@ -596,9 +596,14 @@ def build_router(
             raise HTTPException(503,
                 usage_disabled_reason or
                 "usage accounting disabled (no reason recorded)")
-        if group_by not in ("account", "worker", "litellm_user"):
+        if group_by not in ("account", "worker", "litellm_user", "pool"):
             raise HTTPException(400,
-                "group_by must be account | worker | litellm_user")
+                "group_by must be account | worker | litellm_user | pool")
+        # "pool" groups by front-door key (config.users). Pools are
+        # account-disjoint, so we run the normal per-account aggregation
+        # (query + by_model + usd + lifecycle) and fold accounts into their
+        # key at the end. effective_group drives the sqlite query.
+        effective_group = "account" if group_by == "pool" else group_by
         valid_ranges = ("lifecycle", "today", "yesterday", "7d", "30d",
                         "this_month", "custom")
         if range not in valid_ranges:
@@ -661,17 +666,17 @@ def build_router(
         # else: client passed since/until for a named range — honor them.
 
         rows = usage_store.query(
-            since=since, until=until, group_by=group_by)
+            since=since, until=until, group_by=effective_group)
 
         if range == "lifecycle":
             filtered = []
             for r in rows:
-                bucket_since = manager.lifecycle_since(group_by, r["key"])
+                bucket_since = manager.lifecycle_since(effective_group, r["key"])
                 # Re-query just this bucket's slice. Cheap — sqlite hits
                 # the (group, ts) index. Avoids materialising the full
                 # event log into Python just to filter.
                 slice_rows = usage_store.query(
-                    since=bucket_since, until=until, group_by=group_by)
+                    since=bucket_since, until=until, group_by=effective_group)
                 for sr in slice_rows:
                     if sr["key"] == r["key"]:
                         sr["lifecycle_since"] = bucket_since
@@ -690,7 +695,7 @@ def build_router(
             models = usage_store.query_by_model(
                 since=since if range != "lifecycle"
                 else r.get("lifecycle_since", since),
-                until=until, group_by=group_by, key=r["key"])
+                until=until, group_by=effective_group, key=r["key"])
             row_usd: float | None = 0.0
             any_known = False
             by_model_out = []
@@ -735,6 +740,66 @@ def build_router(
             if any_known:
                 total["estimated_usd"] += row_usd or 0.0
                 total["usd_known"] = True
+
+        # Fold per-account rows into front-door-key pools (group_by=pool).
+        # Pools are account-disjoint, so summing each account into its key
+        # is exact; the grand `total` is unchanged (sum over accounts ==
+        # sum over pools). Unmapped accounts bucket under "(未分配)".
+        if group_by == "pool":
+            def _mask_key(k: str) -> str:
+                return (k[:16] + "…") if len(k) > 18 else k
+
+            def _acct_name(uid: str) -> str:
+                sep = uid.rfind("-")
+                return uid[:sep] if sep > 0 and uid[sep + 1:].isdigit() else uid
+
+            acct_to_label: dict[str, str] = {}
+            for token, workers in config.users.items():
+                label = _mask_key(token)
+                for uid in workers:
+                    acct_to_label.setdefault(_acct_name(uid), label)
+
+            pooled: dict[str, dict[str, Any]] = {}
+            for r in out:
+                label = acct_to_label.get(r["key"], "(未分配)")
+                p = pooled.get(label)
+                if p is None:
+                    p = {"key": label, "input_tokens": 0, "output_tokens": 0,
+                         "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                         "request_count": 0, "estimated_usd": None,
+                         "lifecycle_since": r.get("lifecycle_since"),
+                         "_by_model": {}}
+                    pooled[label] = p
+                for k in ("input_tokens", "output_tokens",
+                          "cache_creation_tokens", "cache_read_tokens",
+                          "request_count"):
+                    p[k] += r[k]
+                if r["estimated_usd"] is not None:
+                    p["estimated_usd"] = (p["estimated_usd"] or 0.0) + r["estimated_usd"]
+                for m in r["by_model"]:
+                    bm = p["_by_model"].get(m["model"])
+                    if bm is None:
+                        bm = {"model": m["model"], "input_tokens": 0,
+                              "output_tokens": 0, "cache_creation_tokens": 0,
+                              "cache_read_tokens": 0, "request_count": 0,
+                              "estimated_usd": None}
+                        p["_by_model"][m["model"]] = bm
+                    for k in ("input_tokens", "output_tokens",
+                              "cache_creation_tokens", "cache_read_tokens",
+                              "request_count"):
+                        bm[k] += m[k]
+                    if m["estimated_usd"] is not None:
+                        bm["estimated_usd"] = (bm["estimated_usd"] or 0.0) + m["estimated_usd"]
+            out = []
+            for p in pooled.values():
+                bms = list(p.pop("_by_model").values())
+                for bm in bms:
+                    if bm["estimated_usd"] is not None:
+                        bm["estimated_usd"] = round(bm["estimated_usd"], 4)
+                if p["estimated_usd"] is not None:
+                    p["estimated_usd"] = round(p["estimated_usd"], 4)
+                p["by_model"] = bms
+                out.append(p)
 
         return {
             "ok": True,

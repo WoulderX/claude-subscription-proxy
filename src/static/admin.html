@@ -865,7 +865,7 @@
                 <div class="pill-group" id="usageGroupPills">
                   <button data-group="account" class="active">按账号</button>
                   <button data-group="worker">按 worker</button>
-                  <button data-group="litellm_user">按 LiteLLM 用户</button>
+                  <button data-group="pool">按 sk-key</button>
                 </div>
               </div>
             </div>
@@ -878,10 +878,6 @@
                 <input type="date" id="usageCustomUntil" style="background:var(--surface);border:1px solid var(--border-strong);border-radius:6px;color:var(--text);padding:4px 8px;font-family:inherit;font-size:12px;">
                 <span class="text-muted" style="font-size:12px;">（含起止两天，本地时区）</span>
               </div>
-              <label class="toggle-row" id="showNullLitellmRow" style="display:none;">
-                <input type="checkbox" id="showNullLitellm">
-                <span>显示空 LiteLLM 用户的行（prewarm / 内部探针）</span>
-              </label>
             </div>
 
             <div class="table-card">
@@ -926,7 +922,6 @@
                     <th>账号</th>
                     <th>状态</th>
                     <th>模型</th>
-                    <th>LiteLLM 用户</th>
                     <th>运行时长</th>
                     <th>空闲时长</th>
                     <th>累计请求</th>
@@ -936,7 +931,7 @@
                   </tr>
                 </thead>
                 <tbody id="workerBody">
-                  <tr><td colspan="11" class="empty-state">
+                  <tr><td colspan="10" class="empty-state">
                     在左侧填写 API Key 后点击「立即刷新」加载数据
                   </td></tr>
                 </tbody>
@@ -983,8 +978,6 @@
     const savedInterval = localStorage.getItem('autoRefreshInterval');
     if (savedInterval !== null) autoRefreshSel.value = savedInterval;
     let activeView = localStorage.getItem('activeView') || 'home';
-    let showNullLitellm = localStorage.getItem('showNullLitellm') === '1';
-    $('showNullLitellm').checked = showNullLitellm;
 
     apiKeyInput.addEventListener('change', () => {
       localStorage.setItem('apiKey', apiKeyInput.value);
@@ -1173,7 +1166,7 @@
         `busy=${workers.filter(w=>w.in_flight>0).length} · stuck=${workers.filter(w=>w.stuck).length}`;
 
       if (!workers.length) {
-        workerBody.innerHTML = `<tr><td colspan="${showAccount ? 11 : 10}" class="empty-state">暂无 worker</td></tr>`;
+        workerBody.innerHTML = `<tr><td colspan="${showAccount ? 10 : 9}" class="empty-state">暂无 worker</td></tr>`;
         return;
       }
       workerBody.innerHTML = workers.map(w => {
@@ -1181,7 +1174,7 @@
         const details = w.in_flight_detail || [];
         const head = details[0] || null;
         const dash = '<span class="text-muted">—</span>';
-        let modelCell = dash, litellmCell = dash, taskCell = dash;
+        let modelCell = dash, taskCell = dash;
 
         const counts = { active: 0, queued: 0, stuck: 0 };
         details.forEach(d => {
@@ -1193,18 +1186,12 @@
         if (w.in_flight > 0 && head) {
           const model   = head.body && head.body.model       ? head.body.model       : '?';
           const preview = head.body && head.body.last_user_preview ? head.body.last_user_preview : '';
-          const litellm = (head.body && head.body.litellm) || null;
           const isStalled = head.stalled_seconds > 30;
           const stalledLabel = isStalled
             ? `已停滞 ${fmtSeconds(head.stalled_seconds)}`
             : `${fmtSeconds(head.stalled_seconds)}前更新`;
 
           modelCell = `<span class="mono key">${escapeHtml(model)}</span>`;
-
-          if (litellm && litellm.user_api_key_alias) {
-            const fullJson = JSON.stringify(litellm, null, 2);
-            litellmCell = `<span class="key text-blue" title="${escapeHtml(fullJson)}">${escapeHtml(litellm.user_api_key_alias)}</span>`;
-          }
 
           const previewHtml = preview
             ? `<div class="preview" data-full="${escapeHtml(preview)}">${escapeHtml(preview)}</div>`
@@ -1238,7 +1225,6 @@
             ${accountCell}
             <td><span class="badge ${status.cls}">${status.label}</span></td>
             <td>${modelCell}</td>
-            <td>${litellmCell}</td>
             <td>${fmtSeconds(w.age_seconds)}</td>
             <td>${fmtSeconds(w.idle_seconds)}</td>
             <td class="mono">${w.total_requests}</td>
@@ -1741,7 +1727,9 @@
     ]);
     let usageRange = localStorage.getItem('usageRange') || 'today';
     if (!USAGE_RANGES.has(usageRange)) usageRange = 'today';
+    const USAGE_GROUPS = new Set(['account', 'worker', 'pool']);
     let usageGroup = localStorage.getItem('usageGroup') || 'account';
+    if (!USAGE_GROUPS.has(usageGroup)) usageGroup = 'account';
     let usageSort  = JSON.parse(localStorage.getItem('usageSort') || 'null')
                    || { col: 'estimated_usd', dir: 'desc' };
     // Custom-range date strings (YYYY-MM-DD, browser-local). Default
@@ -1775,11 +1763,7 @@
         b.classList.toggle('active', b.dataset.group === usageGroup);
       });
       $('usageKeyHeader').firstChild.textContent =
-        ({account: '账号 ', worker: 'Worker ', litellm_user: 'LiteLLM 用户 '})[usageGroup];
-      // Toggle visibility of the "show null litellm" switch — only
-      // meaningful when grouping by litellm_user.
-      $('showNullLitellmRow').style.display =
-        (usageGroup === 'litellm_user') ? '' : 'none';
+        ({account: '账号 ', worker: 'Worker ', pool: 'sk-key '})[usageGroup];
       // Custom date range row only appears under the "自定义" pill.
       usageCustomRow.style.display =
         (usageRange === 'custom') ? 'inline-flex' : 'none';
@@ -1869,12 +1853,6 @@
         if (lastUsageData) renderUsage(lastUsageData);
       });
     });
-    $('showNullLitellm').addEventListener('change', e => {
-      showNullLitellm = e.target.checked;
-      localStorage.setItem('showNullLitellm', showNullLitellm ? '1' : '0');
-      if (lastUsageData) renderUsage(lastUsageData);
-    });
-
     async function refreshUsage(silent = false) {
       const auth = authHeader();
       if (!auth) return;
@@ -1925,11 +1903,6 @@
     }
     function renderUsage(data) {
       let rows = (data.rows || []).slice();
-      // Hide null-litellm row by default when grouping by litellm_user.
-      // Server reports null key as the literal string "(none)".
-      if (usageGroup === 'litellm_user' && !showNullLitellm) {
-        rows = rows.filter(r => r.key !== '(none)');
-      }
       // Sort by current state. The "key" column sorts as string; other
       // columns are numeric. Nulls in numeric cols sort to the end
       // regardless of direction (so they don't visually dominate).
