@@ -146,9 +146,18 @@ class AccountConfig(BaseModel):
     All workers on the same account share the directory via symlink,
     just like the legacy single-account setup did — the proxy's
     main-process OAuth refresher is the only writer of .credentials.json,
-    so the per-account refresh_token rotation stays single-writer."""
+    so the per-account refresh_token rotation stays single-writer.
+
+    `pool` is the front-door sk-key this account belongs to. It exists
+    so the dashboard's add-account flow can persist the operator's pool
+    choice across container restarts: the wire pass in
+    `_wire_accounts` ensures `users[pool]` includes every worker_id of
+    accounts tagged with that pool. Optional — accounts without a pool
+    tag follow the legacy auto-fill (api_key takes everything unless
+    operator carved out users[] explicitly)."""
     dir: str
     workers: int = Field(ge=1)
+    pool: str | None = None
 
 
 class Config(BaseModel):
@@ -232,6 +241,30 @@ class Config(BaseModel):
             # didn't override users[] for that key explicitly.
             if self.api_key and self.api_key not in self.users:
                 self.users[self.api_key] = sorted(valid_ids)
+
+            # Per-account `pool` tag application. Used by the dashboard
+            # add-account flow to persist "which sk-key does this new
+            # account live under" across restarts, without forcing the
+            # operator to hand-edit config.yaml's users[] every time.
+            # Idempotent: if the pool already lists the account's
+            # worker_ids (operator did it explicitly in config.yaml),
+            # this is a no-op for those entries.
+            for acc_name, acc in self.accounts.items():
+                if not acc.pool:
+                    continue
+                if acc.pool not in self.users:
+                    raise ValueError(
+                        f"accounts[{acc_name}].pool={acc.pool!r} refers to "
+                        f"an sk-key not present in users[]; add the key to "
+                        f"users[] in config.yaml or clear the pool tag")
+                existing = list(self.users[acc.pool])
+                seen = set(existing)
+                for i in range(acc.workers):
+                    uid = f"{acc_name}-{i}"
+                    if uid not in seen:
+                        existing.append(uid)
+                        seen.add(uid)
+                self.users[acc.pool] = existing
 
             # Validate every referenced user_id resolves to an account
             referenced: set[str] = set()
@@ -342,17 +375,22 @@ class Config(BaseModel):
         the FULL accounts dict — load() merges runtime on top of static
         config.yaml, so anything in runtime wins. Operator-edited
         accounts in config.yaml that ALSO appear in runtime would get
-        runtime's values; remove from runtime to fall back to static."""
+        runtime's values; remove from runtime to fall back to static.
+
+        The `pool` field is included only when set; this keeps the
+        overlay diff minimal for accounts that don't carry a pool
+        tag (most pre-existing accounts written by older code)."""
         path = self.runtime_accounts_path()
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "accounts": {
-                name: {"dir": acc.dir, "workers": acc.workers}
-                for name, acc in self.accounts.items()
-            }
-        }
+        accounts_out: dict[str, dict[str, Any]] = {}
+        for name, acc in self.accounts.items():
+            entry: dict[str, Any] = {"dir": acc.dir, "workers": acc.workers}
+            if acc.pool:
+                entry["pool"] = acc.pool
+            accounts_out[name] = entry
+        payload = {"accounts": accounts_out}
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(yaml.safe_dump(payload, allow_unicode=True,
                                        sort_keys=True))

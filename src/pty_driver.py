@@ -112,6 +112,16 @@ class ClaudePtyDriver:
         # query later. Saved once and frozen — we don't want a later
         # screen redraw clobbering our captured evidence.
         self._rate_limit_snippet: bytes = b""
+        # Monotonic deadline during which a /usage quota probe is (or was
+        # just) on screen. The /usage screen renders a weekly "Resets MMM
+        # DD" row that _RL_SCAN matches just like a real rate-limit modal
+        # — freezing it as the snippet once marked claude-2 weekly_limit
+        # for ~6.6 days off a single bogus parse. While this window is
+        # open, _capture_rate_limit_text refuses to freeze a snippet, and
+        # the worker's intercept-timeout handler treats the screen as
+        # /usage. Set by note_usage_probe() right before the probe types
+        # "/usage". 0.0 = no probe in flight.
+        self._usage_probe_until: float = 0.0
 
     async def start(self) -> None:
         env = os.environ.copy()
@@ -555,6 +565,39 @@ class ClaudePtyDriver:
         re.IGNORECASE,
     )
 
+    def note_usage_probe(self, window_seconds: float = 20.0) -> None:
+        """Called by the worker immediately before it types `/usage` for
+        a quota probe. Opens a window during which the resulting quota
+        screen's weekly "Resets MMM DD" row must not be frozen as a
+        rate-limit snippet — it is a quota display, not a modal. Covers
+        the screen render, the 2s probe dwell, the Esc dismiss, and the
+        repaint. See _capture_rate_limit_text and the claude-2
+        weekly_limit false-positive incident (2026-05-29)."""
+        self._usage_probe_until = time.monotonic() + window_seconds
+
+    def in_usage_probe_window(self) -> bool:
+        """True while a recent /usage quota probe may still be on screen."""
+        return time.monotonic() < self._usage_probe_until
+
+    @staticmethod
+    def _looks_like_usage_screen(squeezed: str) -> bool:
+        """True if `squeezed` (ANSI-stripped, all-whitespace-removed TUI
+        text) carries /usage quota-screen chrome rather than a rate-limit
+        modal. The /usage screen shows a 5-hour AND a weekly quota row
+        (two "Resets"), plus "% used" / "Current session" / "Current
+        week" / cost totals / the "Settings Status Config Usage Stats"
+        tab bar. A genuine rate-limit modal is a single line with exactly
+        one "Resets MMM DD" and none of that chrome."""
+        low = squeezed.lower()
+        return (
+            "settingsstatusconfigusagestats" in low
+            or ("currentsession" in low and "currentweek" in low)
+            or "%used" in low
+            or "totalcost" in low
+            or "totalduration" in low
+            or low.count("resets") >= 2
+        )
+
     def _capture_rate_limit_text(self, chunk: bytes) -> None:
         """Cheap per-chunk scan for the rate-limit modal text. Once
         captured the snippet is FROZEN — a later screen redraw won't
@@ -563,8 +606,24 @@ class ClaudePtyDriver:
         (same trick as _dismiss_if_dialog)."""
         if self._rate_limit_snippet:
             return
+        # A /usage quota probe is (or was just) on screen — its weekly
+        # "Resets MMM DD" row is a quota display, not a rate-limit modal.
+        # Freezing it would mark the whole account weekly_limit for days.
+        if self.in_usage_probe_window():
+            return
         m = self._RL_SCAN.search(self._recent_chunks)
         if m is None:
+            return
+        # Even outside a probe window, corroborate against the FULL ~4KB
+        # recent-chunks buffer: if it carries /usage chrome, this match is
+        # the /usage weekly row, not a modal. This buffer has ~8x the
+        # context of the ±512B snippet worker.py inspects later, so the
+        # chrome (% used / Current week / two Resets rows) is far more
+        # likely visible here — which is exactly why the later check
+        # missed it for claude-2 and we re-check at capture time.
+        if self._looks_like_usage_screen(self.dump_recent_chunks_squeezed()):
+            log.info("skipped rate-limit snippet capture — /usage quota "
+                     "screen detected in recent buffer (not a modal)")
             return
         # Save ±512 bytes of context around the match. parse_reset_time
         # only needs the immediate vicinity, but extra context helps

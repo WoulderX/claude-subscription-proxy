@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..config import Config
+from ..rate_limit import classify_rate_limit_reason
 from ..usage import UsageStore
 from .session import ClaudeSession
 
@@ -213,11 +214,14 @@ class SessionManager:
           - Existing `rate_limit`, new `degraded` → keep existing
             (don't downgrade positive evidence with "unknown").
           - Same kind → keep the LONGER `until` (account is blocked
-            until all known limits clear) but ADOPT the new `reason`.
-            A re-detection has fresher info about which window applies
-            — sticking with a stale reason produced a real-world bug
-            where "5hour_limit" wording from a body hint persisted
-            despite a later 4-day reset that obviously meant weekly.
+            until all known limits clear) and recompute `reason` from
+            the SURVIVING window via classify_rate_limit_reason. The
+            stored reason must match the stored until: if a 4-day
+            weekly_limit window is still on the books, a later 5h
+            bare-429 backoff must not relabel it as "rate_limit" —
+            the panel would then show "rate_limit, remaining 3d22h".
+            For rate_limit kind only — degraded reason is opaque
+            text from a caller and we keep it as-is.
           - Existing `degraded`, new `rate_limit` → upgrade outright
             (specific evidence beats unknown, even if new window is
             shorter).
@@ -231,18 +235,24 @@ class SessionManager:
                 existing.set_at = now
                 return
             if existing.kind == kind:
-                # Same kind: take longer until, latest reason. Latest
-                # reason wins because the new detection has more
-                # information (often a more accurate classifier based
-                # on the actual delta).
-                if reason != existing.reason:
+                surviving_until = max(existing.until, new_until)
+                if kind == "rate_limit":
+                    # Reason must reflect the surviving window, not
+                    # whichever event fired last. classify_rate_limit_reason
+                    # is the ground-truth mapping (see rate_limit.py:88).
+                    surviving_reason = classify_rate_limit_reason(
+                        surviving_until - now)
+                else:
+                    # degraded: caller-supplied free-text reason, latest wins.
+                    surviving_reason = reason
+                if surviving_reason != existing.reason:
                     log.info("account=%s reason refined: %s -> %s "
                              "(window now %s)",
-                             account_name, existing.reason, reason,
+                             account_name, existing.reason, surviving_reason,
                              time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                           time.gmtime(max(existing.until, new_until))))
-                existing.reason = reason
-                existing.until = max(existing.until, new_until)
+                                           time.gmtime(surviving_until)))
+                existing.reason = surviving_reason
+                existing.until = surviving_until
                 existing.set_at = now
                 return
             # Different kind (degraded → rate_limit upgrade), fall

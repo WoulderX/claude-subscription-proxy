@@ -337,6 +337,34 @@ def build_router(
                 "(requires multi-account config with `accounts:` block)")
         return {"ok": True, **quota_probe.state_dict()}
 
+    @router.get("/pools")
+    async def list_pools(
+        _pool: list[str] = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """List front-door sk-keys (pool tokens) configured in users[].
+        Used by the dashboard's add-account modal to populate the "pool"
+        dropdown. Each entry includes a masked preview and whether the
+        key is the api_key default.
+
+        Returns the sk-keys themselves (the admin endpoint is already
+        gated by admin_api_key; an operator who can list pools can also
+        read config.yaml, so masking is courtesy not security)."""
+        pools = []
+        for key in sorted(config.users.keys()):
+            worker_count = len(config.users[key])
+            # Mask middle so the dropdown is readable even with long
+            # hex secrets: sk-internal-29f8…ef2c0 (first 12 + last 5).
+            head = key[:12]
+            tail = key[-5:] if len(key) > 17 else ""
+            label = f"{head}…{tail}" if tail else key
+            pools.append({
+                "key": key,
+                "label": label,
+                "worker_count": worker_count,
+                "is_default": key == config.api_key,
+            })
+        return {"ok": True, "pools": pools, "default": config.api_key}
+
     @router.post("/accounts/new")
     async def begin_account_login(
         payload: dict[str, Any] = Body(...),
@@ -359,6 +387,11 @@ def build_router(
                 "wired (legacy single-account mode?)")
         name = payload.get("name")
         workers = payload.get("workers") or 5
+        # `pool` chooses which front-door sk-key the new account joins.
+        # Missing → legacy default (api_key, sk-internal). Empty string
+        # → "skip auto-wire, operator wires manually in config.yaml".
+        # Any other string must already exist in users[].
+        pool = payload.get("pool")
         if not isinstance(name, str) or not name or "/" in name:
             raise HTTPException(400,
                 "name must be a non-empty string with no '/' (e.g. 'claude-4')")
@@ -368,6 +401,15 @@ def build_router(
         if not isinstance(workers, int) or workers < 1 or workers > 20:
             raise HTTPException(400,
                 "workers must be an int in [1, 20]")
+        if pool is not None:
+            if not isinstance(pool, str):
+                raise HTTPException(400,
+                    "pool must be a string (sk-key) or empty string")
+            if pool and pool not in config.users:
+                raise HTTPException(400,
+                    f"pool {pool!r} is not in users[]; pick one of "
+                    f"{sorted(config.users.keys())} or send '' to skip "
+                    f"auto-wire")
         # Reserve the dest directory inside the shared-auth tree so
         # finish() lands at a predictable path. The parent bind mount
         # makes this visible on the host.
@@ -379,7 +421,8 @@ def build_router(
                 f"this account.")
         try:
             url = await login_registry.begin(
-                name, dest_dir, claude_binary=config.claude.binary)
+                name, dest_dir, claude_binary=config.claude.binary,
+                pool=pool)
         except Exception:
             # Detail is server-side only; PTY output may include
             # operator-pasted secrets and must not propagate via 500
@@ -413,6 +456,10 @@ def build_router(
             raise HTTPException(400, "code must be a non-empty string")
         if not isinstance(workers, int) or workers < 1 or workers > 20:
             raise HTTPException(400, "workers must be an int in [1, 20]")
+        # Capture the operator-selected pool BEFORE finish() — finish()
+        # pops the LoginSession on success, so pool_for() would return
+        # None after that point.
+        chosen_pool = login_registry.pool_for(name)
         try:
             installed = await login_registry.finish(name, code)
         except KeyError:
@@ -431,19 +478,38 @@ def build_router(
         # AccountConfig type is imported at module-level; reuse it.
         from ..config import AccountConfig
         dest_dir = str(Path("/data/shared-auth") / name)
-        config.accounts[name] = AccountConfig(dir=dest_dir, workers=workers)
-        # Extend the auto-populated api_key pool if it exists (mirrors
-        # Config._wire_accounts behavior on cold start). If the operator
-        # is running with explicit per-account `users:` pools, they have
-        # to wire the new account themselves — we don't know which key
-        # should map to it.
+        # Resolve the effective pool:
+        #   - explicit operator choice (chosen_pool) wins;
+        #   - empty string from the modal means "don't auto-wire" — the
+        #     operator wires manually in config.yaml later;
+        #   - missing/None falls back to api_key (legacy behavior, kept
+        #     so older clients of this endpoint keep working).
+        if chosen_pool == "":
+            effective_pool: str | None = None
+        elif chosen_pool:
+            if chosen_pool not in config.users:
+                raise HTTPException(400,
+                    f"pool {chosen_pool!r} is not in users[]; pick one of "
+                    f"{sorted(config.users.keys())} or pass pool='' to skip "
+                    f"auto-wire")
+            effective_pool = chosen_pool
+        else:
+            effective_pool = config.api_key if (
+                config.api_key and config.api_key in config.users) else None
+        config.accounts[name] = AccountConfig(
+            dir=dest_dir, workers=workers, pool=effective_pool)
+        # Extend the chosen pool live so routing picks up the new
+        # workers without waiting for a restart. Persisting the `pool`
+        # tag via write_runtime_accounts (below) covers the cold-start
+        # path: _wire_accounts replays this same extension from the
+        # tag at startup.
         new_user_ids = [f"{name}-{i}" for i in range(workers)]
-        if config.api_key and config.api_key in config.users:
-            existing = list(config.users[config.api_key])
+        if effective_pool is not None:
+            existing = list(config.users[effective_pool])
             for uid in new_user_ids:
                 if uid not in existing:
                     existing.append(uid)
-            config.users[config.api_key] = existing
+            config.users[effective_pool] = existing
         # Persist to the runtime overlay so the account survives
         # container restarts without manual config.yaml edits.
         try:

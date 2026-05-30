@@ -202,9 +202,10 @@ class QuotaProbeService:
                     self._consecutive_429s[name] = 1
                 self._errors[name] = QuotaAttemptError(
                     attempted_at_unix=now_wall,
-                    error=(f"已持久化的 429 冷却（连续第 "
-                           f"{self._consecutive_429s[name]} 次），仍剩 "
-                           f"{int(remaining)}s — 下一次成功探测会清除"),
+                    error=(f"/api/oauth/usage 探针端点冷却中（连续第 "
+                           f"{self._consecutive_429s[name]} 次 429，仍剩 "
+                           f"{int(remaining)}s）。仅影响 dashboard 用量百分比"
+                           f"显示，不影响 /v1/messages 调用。"),
                     cooldown_until_unix=float(until_wall),
                     consecutive_429s=self._consecutive_429s[name],
                 )
@@ -459,9 +460,11 @@ class QuotaProbeService:
         self._cooldown_until_wall[account_name] = fetched_at_unix + backoff
         self._errors[account_name] = QuotaAttemptError(
             attempted_at_unix=fetched_at_unix,
-            error=(f"Anthropic 限速 HTTP 429（连续第 {n} 次） — 已 backoff "
-                   f"{int(backoff)} 秒（基线 {int(base)} 秒 × {multiplier}，"
-                   f"上限 {int(MAX_429_BACKOFF_SECONDS)} 秒）"),
+            error=(f"/api/oauth/usage 探针端点限速 HTTP 429（连续第 {n} 次） — "
+                   f"已 backoff {int(backoff)} 秒（基线 {int(base)} 秒 × "
+                   f"{multiplier}，上限 {int(MAX_429_BACKOFF_SECONDS)} 秒）。"
+                   f"该端点限流独立（实测 ~1 req/h/账号），仅影响 dashboard "
+                   f"用量百分比读取，不代表账号 chat 受限。"),
             cooldown_until_unix=fetched_at_unix + backoff,
             consecutive_429s=n,
         )

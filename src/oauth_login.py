@@ -102,10 +102,16 @@ class LoginSession:
     """One in-progress `claude auth login` flow."""
 
     def __init__(self, account_name: str, dest_dir: Path,
-                 claude_binary: str = "claude") -> None:
+                 claude_binary: str = "claude",
+                 pool: str | None = None) -> None:
         self.account_name = account_name
         self.dest_dir = dest_dir
         self.claude_binary = claude_binary
+        # Operator-selected front-door sk-key. Persisted through to the
+        # finish endpoint so dashboard-added accounts land in the
+        # operator's chosen pool (sk-internal, sk-dev, …) rather than
+        # always defaulting to api_key.
+        self.pool = pool
         # tempfile.mkdtemp owns the dir; cleanup happens in finish/abort.
         # Prefix makes orphan dirs easy to spot if something crashes
         # between mkdtemp and cleanup.
@@ -356,14 +362,16 @@ class LoginRegistry:
         return account_name in self._sessions
 
     async def begin(self, account_name: str, dest_dir: Path,
-                     claude_binary: str = "claude") -> str:
+                     claude_binary: str = "claude",
+                     pool: str | None = None) -> str:
         async with self._lock:
             if account_name in self._sessions:
                 raise RuntimeError(
                     f"a login flow for account {account_name!r} is "
                     f"already in progress; abort it first or pick a "
                     f"different name")
-            sess = LoginSession(account_name, dest_dir, claude_binary)
+            sess = LoginSession(account_name, dest_dir, claude_binary,
+                                pool=pool)
             try:
                 url = await sess.begin()
             except Exception:
@@ -371,6 +379,13 @@ class LoginRegistry:
                 raise
             self._sessions[account_name] = sess
             return url
+
+    def pool_for(self, account_name: str) -> str | None:
+        """Return the operator-selected sk-key for an in-progress login.
+        Used by the finish endpoint so the pool choice survives the
+        round-trip without the dashboard needing to echo it back."""
+        sess = self._sessions.get(account_name)
+        return sess.pool if sess is not None else None
 
     async def finish(self, account_name: str, code: str) -> dict[str, Any]:
         async with self._lock:

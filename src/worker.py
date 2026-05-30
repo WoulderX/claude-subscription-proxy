@@ -186,7 +186,10 @@ class WorkerSession:
                                 + (rl_snippet or ""))
                 squeezed = screen_blob.replace(" ", "")
                 is_usage_screen = (
-                    "SettingsStatusConfigUsageStats" in screen_blob
+                    # Ground truth: this worker just ran a /usage probe,
+                    # so any "Resets" on screen is a quota row, not a modal.
+                    self.pty.in_usage_probe_window()
+                    or "SettingsStatusConfigUsageStats" in screen_blob
                     or ("Currentsession" in squeezed
                         and "Currentweek" in squeezed)
                     or "%used" in squeezed
@@ -369,6 +372,11 @@ async def amain() -> None:
                 # auto-dismiss rule (debounce shared across rules can
                 # occasionally swallow the Esc keystroke).
                 try:
+                    # Open the /usage window BEFORE typing the command so
+                    # the quota screen's weekly "Resets MMM DD" row is not
+                    # frozen as a rate-limit snippet (the claude-2
+                    # weekly_limit false-positive). See note_usage_probe.
+                    session.pty.note_usage_probe()
                     await session.pty.send_slash_command("/usage")
                     log.info("probe_quota: sent /usage to TUI")
                     # 2s: enough for the HTTP call to land + screen to

@@ -800,12 +800,17 @@
               <button class="modal-close" id="addAccountClose">×</button>
             </div>
             <div class="modal-body" id="addAccountBody">
-              <!-- Step 1: enter name + workers -->
+              <!-- Step 1: enter name + workers + pool -->
               <div data-step="1">
                 <label class="form-label">账号名（数据目录名，建议 <code>claude-N</code>）</label>
                 <input type="text" id="newAcctName" placeholder="claude-4" autocomplete="off">
                 <label class="form-label">Worker 数量</label>
                 <input type="number" id="newAcctWorkers" value="5" min="1" max="20">
+                <label class="form-label">归属 sk-key（前门 pool）</label>
+                <select id="newAcctPool"></select>
+                <div class="form-help" style="margin-top:6px;">
+                  选「不自动归属」时，新账号 worker 不会被加入任何 sk-key 池——需要稍后手动修改 config.yaml 把它接入路由，否则该账号的 worker 不可达。
+                </div>
                 <div class="form-actions">
                   <button class="btn-primary" id="newAcctBegin">开始登录</button>
                 </div>
@@ -1519,6 +1524,40 @@
         el.style.display = (parseInt(el.dataset.step, 10) === n) ? '' : 'none';
       });
     }
+    async function loadAddAccountPools() {
+      // Populate the pool dropdown from /admin/pools. Called every
+      // time the modal opens so a hot-reload that changed users[]
+      // is reflected immediately, not just on next page load.
+      const sel = $('newAcctPool');
+      sel.innerHTML = '<option value="" disabled selected>加载中…</option>';
+      const auth = authHeader();
+      if (!auth) {
+        sel.innerHTML = '<option value="">请先填写 API Key</option>';
+        return;
+      }
+      try {
+        const resp = await fetch('/admin/pools', { headers: auth });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        const pools = data.pools || [];
+        const defaultKey = data.default || '';
+        sel.innerHTML = '';
+        pools.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.key;
+          opt.textContent = `${p.label}  (${p.worker_count} workers`
+            + (p.is_default ? ', 默认' : '') + ')';
+          if (p.key === defaultKey) opt.selected = true;
+          sel.appendChild(opt);
+        });
+        const skipOpt = document.createElement('option');
+        skipOpt.value = '';
+        skipOpt.textContent = '— 不自动归属（稍后手动配置）—';
+        sel.appendChild(skipOpt);
+      } catch (e) {
+        sel.innerHTML = `<option value="">加载失败：${e.message}</option>`;
+      }
+    }
     function openAddAccountModal() {
       pendingAcctName = null; pendingAcctWorkers = 5;
       $('newAcctName').value  = '';
@@ -1527,6 +1566,7 @@
       $('newAcctCode').value  = '';
       showAcctStep(1);
       addAccountModal.style.display = '';
+      loadAddAccountPools();
       setTimeout(() => $('newAcctName').focus(), 50);
     }
     function closeAddAccountModal() {
@@ -1559,6 +1599,7 @@
       if (!auth) { showToast('请先填写 API Key', 'error'); return; }
       const name = $('newAcctName').value.trim();
       const workers = parseInt($('newAcctWorkers').value, 10);
+      const pool = $('newAcctPool').value;
       if (!name) { showToast('请填写账号名', 'error'); return; }
       if (!Number.isInteger(workers) || workers < 1 || workers > 20) {
         showToast('Worker 数量必须是 1-20 的整数', 'error'); return;
@@ -1568,7 +1609,7 @@
         const resp = await fetch('/admin/accounts/new', {
           method: 'POST',
           headers: { ...auth, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, workers }),
+          body: JSON.stringify({ name, workers, pool }),
         });
         const data = await resp.json();
         if (!resp.ok) {

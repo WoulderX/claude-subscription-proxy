@@ -186,8 +186,10 @@ class AccountQuotaService:
             self._cooldown_until_monotonic = time.monotonic() + backoff
             self._record_error(QuotaAttemptError(
                 attempted_at_unix=now_unix,
-                error=(f"Anthropic 限速 HTTP 429——已 backoff "
+                error=(f"/api/oauth/usage 探针端点限速 HTTP 429——已 backoff "
                        f"{int(backoff)} 秒（{'按 Retry-After' if retry_after else '默认'}）。"
+                       f"该端点限流独立（~1 req/h/账号），仅影响 dashboard "
+                       f"用量百分比读取，不代表账号 chat 受限。"
                        f"原始响应：{resp.text[:200]}"),
                 credential_status="valid",
                 http_status=429,
