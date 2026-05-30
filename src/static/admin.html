@@ -1487,12 +1487,14 @@
         const cd = err && err.cooldown_until_unix;
         const streak = (err && err.consecutive_429s) || 0;
         let errHtml = '';
-        if (err && cd && streak >= 3) {
+        if (err && cd) {
+          // /api/oauth/usage probe endpoint is independent of
+          // /v1/messages, so its 429 cooldown is informational only —
+          // no "sustained-throttle" red-flag branch, even at high
+          // streak counts. Backend error string (with backoff math)
+          // is in the title attribute on hover.
           const mins = Math.ceil(cdRem / 60);
-          errHtml = `<div class="err warn-strong">⚠ 连续 ${streak} 次被 Anthropic 限速，已退避至 ${mins} 分钟后再试（建议检查该账号是否被官方惩罚）</div>`;
-        } else if (err && cd) {
-          const mins = Math.ceil(cdRem / 60);
-          errHtml = `<div class="err cooldown">上游 429 冷却中，${mins} 分钟后才会重试${streak > 1 ? `（连续第 ${streak} 次）` : ''}</div>`;
+          errHtml = `<div class="err cooldown" title="${escapeHtml(err.error || '')}">/usage 探针冷却中，${mins} 分钟后重试${streak > 1 ? ` ×${streak}` : ''}</div>`;
         } else if (err) {
           errHtml = `<div class="err">最近一次失败：${escapeHtml(err.error || '')}</div>`;
         }

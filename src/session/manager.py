@@ -206,6 +206,21 @@ class SessionManager:
             account_name, kind="degraded", reason=reason,
             window_seconds=window_seconds)
 
+    # Cycle-length ordering of rate_limit reasons. Used as a one-way
+    # ratchet on merge: a re-detection can PROMOTE the stored reason
+    # to a longer-cycle bucket but never demote it. Without this,
+    # claude-1's `reason="rate_limit"` (bare-429 exponential backoff,
+    # 10min window) would be relabeled "5hour_limit" by the classifier
+    # just because 10min < 6h — even though the 5h quota is actually
+    # at 20%. The window-size classifier is correct only when the
+    # window came from an authoritative reset header; for self-imposed
+    # backoff windows it overreads. Promotion-only sidesteps both.
+    _REASON_LEVEL = {
+        "5hour_limit": 0,   # < 6h    ← Anthropic-stated 5h quota
+        "rate_limit":  1,   # 6h–36h  ← middle band OR proxy backoff
+        "weekly_limit": 2,  # > 36h   ← 7-day usage cap
+    }
+
     def _mark_account_issue(self, account_name: str, *, kind: str,
                             reason: str, window_seconds: float) -> None:
         """Common path for both kinds. Merge rules:
@@ -214,14 +229,19 @@ class SessionManager:
           - Existing `rate_limit`, new `degraded` → keep existing
             (don't downgrade positive evidence with "unknown").
           - Same kind → keep the LONGER `until` (account is blocked
-            until all known limits clear) and recompute `reason` from
-            the SURVIVING window via classify_rate_limit_reason. The
-            stored reason must match the stored until: if a 4-day
-            weekly_limit window is still on the books, a later 5h
-            bare-429 backoff must not relabel it as "rate_limit" —
-            the panel would then show "rate_limit, remaining 3d22h".
-            For rate_limit kind only — degraded reason is opaque
-            text from a caller and we keep it as-is.
+            until all known limits clear). For rate_limit kind, the
+            reason follows a PROMOTE-ONLY rule: relabel only when the
+            classifier on the surviving window picks a STRICTLY
+            longer-cycle bucket (5hour < rate < weekly). Existing
+            label stays otherwise. This fixes both directions:
+              - "rate_limit, 4d remaining" gets promoted to
+                "weekly_limit" once the longer window survives.
+              - "rate_limit, 10min remaining from backoff" does NOT
+                get demoted to "5hour_limit" — the 5h quota probably
+                isn't actually exhausted, only the proxy's own
+                exponential backoff timer is.
+            For degraded kind the reason is caller-supplied free text;
+            latest wins.
           - Existing `degraded`, new `rate_limit` → upgrade outright
             (specific evidence beats unknown, even if new window is
             shorter).
@@ -237,11 +257,17 @@ class SessionManager:
             if existing.kind == kind:
                 surviving_until = max(existing.until, new_until)
                 if kind == "rate_limit":
-                    # Reason must reflect the surviving window, not
-                    # whichever event fired last. classify_rate_limit_reason
-                    # is the ground-truth mapping (see rate_limit.py:88).
-                    surviving_reason = classify_rate_limit_reason(
+                    candidate_reason = classify_rate_limit_reason(
                         surviving_until - now)
+                    existing_level = self._REASON_LEVEL.get(
+                        existing.reason, 1)
+                    candidate_level = self._REASON_LEVEL.get(
+                        candidate_reason, 1)
+                    # Promote-only ratchet.
+                    if candidate_level > existing_level:
+                        surviving_reason = candidate_reason
+                    else:
+                        surviving_reason = existing.reason
                 else:
                     # degraded: caller-supplied free-text reason, latest wins.
                     surviving_reason = reason
