@@ -344,8 +344,19 @@ class QuotaProbeService:
         # Mapping of snapshot key → reason token the UI knows how to
         # label (REASON_LABEL in admin.html). Order is informational —
         # we pick the LATEST timestamp regardless.
+        # `seven_day_sonnet` sub-quota caps the sonnet lane BEFORE the
+        # unified `seven_day` window does — an account at sonnet=100%
+        # / seven_day=85% will 429 every sonnet chat request, but
+        # auto-block wouldn't trigger without this entry. Reset epoch
+        # comes from the sub-window's own `resets_at`. Labelled as
+        # weekly_limit since it shares the 7-day horizon.
+        #
+        # `seven_day_opus` is omitted: Anthropic returns null for it
+        # on our plan tier — opus has no dedicated bucket and spends
+        # against `seven_day` directly, which is already covered.
         WINDOWS = (("five_hour", "5hour_limit"),
-                   ("seven_day", "weekly_limit"))
+                   ("seven_day", "weekly_limit"),
+                   ("seven_day_sonnet", "weekly_limit"))
         for key, reason in WINDOWS:
             tier = tiers.get(key)
             if not isinstance(tier, dict):

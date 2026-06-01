@@ -46,6 +46,12 @@ class AccountIssue:
     reason: str         # human-readable subtype within `kind`
     set_at: float       # epoch seconds (wall-clock, for UI display)
     until: float        # epoch seconds
+    # True iff the mark came from an authoritative source — quota_probe
+    # (real /api/oauth/usage snapshot showed a saturated window) or
+    # operator override. Inferred marks from a single 429 reset header
+    # set pinned=False so the success-demote path can clear them on
+    # the next 200; pinned marks survive incidental successes.
+    pinned: bool = False
 
 
 class SessionManager:
@@ -149,6 +155,18 @@ class SessionManager:
     # because each worker's age now resets at a different tick.
     _RESTART_MAX_PER_PASS = 4
 
+    # Cap on the initial `until` for a weekly_limit inferred from a
+    # single 429's reset header. Anthropic's 429 sometimes carries a
+    # reset epoch pointing 4–7 days out even when the cap isn't truly
+    # exhausted (soft-throttle / advisory signal). Trusting the header
+    # verbatim locks the account for days; instead we hold for this
+    # cap and let real traffic re-validate — if still 429ing, the next
+    # detection re-marks. Sub-quota windows (rate_limit mid-band,
+    # 5hour_limit) are short enough to need no cap. Authoritative
+    # marks from quota_probe go through mark_account_rate_limited_until
+    # (pinned=True) and bypass this entirely.
+    _WEEKLY_INFERENCE_CAP_SECONDS = 2 * 3600
+
     def mark_account_rate_limited(self, account_name: str, reason: str,
                                   window_seconds: float,
                                   escalate: bool = False) -> None:
@@ -162,9 +180,24 @@ class SessionManager:
         TPM/RPM spike), the cooldown is computed by exponential backoff
         per account instead of using `window_seconds`. Authoritative
         windows (parsed reset / weekly / 5-hour) pass escalate=False so
-        their real reset time is honored verbatim."""
+        their real reset time is honored verbatim — except weekly_limit
+        which is capped (see _WEEKLY_INFERENCE_CAP_SECONDS)."""
         if escalate:
             window_seconds = self._next_rl_backoff(account_name)
+        elif (reason == "weekly_limit"
+              and window_seconds > self._WEEKLY_INFERENCE_CAP_SECONDS):
+            # Cap kicked in: we DON'T actually believe this is a 7-day
+            # block (just the next 2h, then we re-validate). Demote the
+            # label too so the dashboard shows "限流 (推断)" rather than
+            # "7天限额 (推断) · 还剩 2h" — the latter is misleading because
+            # the user reads "weekly" as "we expect 7 days of blocking",
+            # but our actual blocking horizon is 2h. Promotion-only
+            # ratchet still works: a subsequent quota_probe with real
+            # weekly evidence (pinned) overwrites this entry outright,
+            # and a stronger inferred reset window simply re-marks with
+            # the longer cap-bounded duration.
+            window_seconds = self._WEEKLY_INFERENCE_CAP_SECONDS
+            reason = "rate_limit"
         self._mark_account_issue(
             account_name, kind="rate_limit", reason=reason,
             window_seconds=window_seconds)
@@ -327,11 +360,37 @@ class SessionManager:
             return
         self._account_rl[account_name] = AccountIssue(
             kind="rate_limit", reason=reason,
-            set_at=now, until=until_epoch)
+            set_at=now, until=until_epoch, pinned=True)
         log.warning("account=%s rate-limited (%s, manual) until %s",
                     account_name, reason,
                     time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                   time.gmtime(until_epoch)))
+
+    def demote_on_success(self, account_name: str) -> bool:
+        """Clear a stale rate_limit mark after a successful chat
+        response. Pinned weekly_limit marks (quota_probe sees 7d=100%
+        or sub-quota=100%) are ground truth — 7-day horizon is long
+        and authoritative; survive incidental successes. Pinned
+        5hour_limit / mid-band rate_limit ARE demote-able because the
+        5h sliding window often releases before its captured reset_at,
+        leaving the pin as a zombie that blocks an actually-usable
+        account; if the cap is real, the next 429 re-marks.
+
+        Returns True iff a marker was cleared. The streak counter is
+        left intact so back-to-back failures still escalate correctly."""
+        state = self._account_rl.get(account_name)
+        if state is None:
+            return False
+        if state.kind != "rate_limit":
+            return False
+        if state.pinned and state.reason == "weekly_limit":
+            return False
+        self._account_rl.pop(account_name, None)
+        log.info("account=%s rate-limit cleared by success-demote "
+                 "(was reason=%s, %.0fs remaining)",
+                 account_name, state.reason,
+                 max(0.0, state.until - time.time()))
+        return True
 
     def account_rate_limit(self, account_name: str) -> AccountIssue | None:
         """Snapshot accessor for /status. Garbage-collects expired
@@ -348,14 +407,26 @@ class SessionManager:
     def _on_worker_usage(self, user_id: str, payload: dict) -> None:
         """Callback wired into every ClaudeSession; receives token-usage
         events parsed off Anthropic SSE responses. Resolves the worker
-        to its account name and writes one row to UsageStore.
+        to its account name, writes one row to UsageStore, and clears
+        any non-pinned rate-limit mark on the owning account (the 200
+        response proves the inferred mark was stale or spurious).
 
         Best-effort: any exception is logged but never propagates — the
         usage log is observability, the request was already served."""
+        try:
+            account = self._account_name_for(user_id)
+        except Exception:
+            account = None
+        # Success-demote runs even when usage_store is disabled — the
+        # logic is about routing fitness, not observability.
+        if account is not None and int(payload.get("output_tokens") or 0) > 0:
+            try:
+                self.demote_on_success(account)
+            except Exception:
+                log.exception("demote_on_success failed user=%s", user_id)
         if self.usage_store is None:
             return
         try:
-            account = self._account_name_for(user_id)
             self.usage_store.record(
                 ts=time.time(),
                 account=account,
@@ -580,9 +651,15 @@ class SessionManager:
              was last routed to, so Anthropic's per-account prompt cache
              stays warm across turns. Transparent fallback to the full
              usable set when that account is rate-limited / absent.
-          3. Cool idle — _channels empty AND last close > cooldown.
-          4. Warm idle — _channels empty but in cooldown window.
-          5. Fewest-in-flight, RR-tied so the load spreads instead of
+          3. Account priority tier: when usable candidates span multiple
+             priorities (e.g. Max=0 + Pro=200 under one front-door
+             sk-key), prefer the lowest number. Spill to the next tier
+             only when the current tier has no cool-idle worker. This
+             ranks BELOW affinity — once a conversation is pinned to a
+             specific account, prompt-cache warmth beats tier ordering.
+          4. Cool idle — _channels empty AND last close > cooldown.
+          5. Warm idle — _channels empty but in cooldown window.
+          6. Fewest-in-flight, RR-tied so the load spreads instead of
              piling on whichever worker won the min() comparison first.
         """
         if len(pool) == 1:
@@ -615,13 +692,90 @@ class SessionManager:
                 if same_acct:
                     candidates = same_acct
 
-        chosen = self._select_within(candidates)
+        chosen = self._select_with_priority(candidates)
 
         if use_affinity:
             acct = self._account_name_for(chosen.user_id)
             if acct is not None:
                 self._record_affinity(session_key, acct)
         return chosen
+
+    def _account_priority(self, session: "ClaudeSession") -> int:
+        """Priority of the account a worker belongs to. Lower = preferred.
+        Workers with no resolvable account (legacy single-account mode)
+        or no priority tag fall to the default 100 — same tier as any
+        un-tagged account, so the priority path is a no-op."""
+        acct_name = self._account_name_for(session.user_id)
+        if acct_name is None:
+            return 100
+        acc = self.config.accounts.get(acct_name)
+        if acc is None:
+            return 100
+        return acc.priority
+
+    def _select_with_priority(
+        self, candidates: list["ClaudeSession"]
+    ) -> "ClaudeSession":
+        """Tier-aware wrapper around _select_within. Groups candidates by
+        account priority and walks tiers ascending: if the highest-
+        priority tier has a cool-idle worker, use it; otherwise check
+        the next tier for one. Spilling only on "no cool-idle" — a
+        cool-idle Pro is preferred over a warm-idle Max, since the warm
+        worker's TUI is still settling and a cool one can start
+        immediately. If NO tier has a cool-idle worker, fall back to
+        running _select_within over the top tier only — that's where
+        warm-idle / fewest-in-flight selection happens, and we'd rather
+        queue on the preferred tier than spill to a busy lower tier."""
+        if not candidates:
+            # Defensive — pick() above always passes a non-empty list,
+            # but guard anyway so a future refactor can't silently OOB.
+            raise RuntimeError("_select_with_priority got empty candidates")
+
+        # Bucket by priority. dict preserves insertion order so an
+        # operator that lists Max first in config.yaml sees the same
+        # tier ordering in routing decisions when priorities are equal.
+        by_tier: dict[int, list["ClaudeSession"]] = {}
+        for s in candidates:
+            by_tier.setdefault(self._account_priority(s), []).append(s)
+
+        if len(by_tier) == 1:
+            # All candidates same tier — bypass spill logic entirely.
+            return self._select_within(candidates)
+
+        tiers_sorted = sorted(by_tier.keys())
+
+        # First pass: take the highest-priority tier that has a cool-idle.
+        for tier in tiers_sorted:
+            tier_workers = by_tier[tier]
+            if self._has_cool_idle(tier_workers):
+                return self._select_within(tier_workers)
+
+        # No tier has cool-idle: stay on the preferred tier and let
+        # _select_within fall through to warm-idle / fewest-in-flight.
+        top_tier = by_tier[tiers_sorted[0]]
+        return self._select_within(top_tier)
+
+    def _has_cool_idle(self, sessions: list["ClaudeSession"]) -> bool:
+        """Cheap probe used by tier spill. Mirrors _is_cool_idle in
+        _select_within but inlined here so we don't pay the cost of the
+        full selection when the tier has nothing cool to offer."""
+        now = time.monotonic()
+        cooldown = self._PICK_TUI_COOLDOWN_SECONDS
+        for s in sessions:
+            if s._channels:
+                continue
+            t = s._last_channel_close_at
+            if t is not None and (now - t) < cooldown:
+                continue
+            pty = getattr(s, "pty", None)
+            if pty is not None:
+                try:
+                    if pty.is_tui_busy():
+                        continue
+                except Exception:
+                    pass
+            return True
+        return False
 
     def _select_within(self, usable: list[ClaudeSession]) -> ClaudeSession:
         """Apply the idle/busy selection tiers to a candidate set and

@@ -154,10 +154,19 @@ class AccountConfig(BaseModel):
     `_wire_accounts` ensures `users[pool]` includes every worker_id of
     accounts tagged with that pool. Optional — accounts without a pool
     tag follow the legacy auto-fill (api_key takes everything unless
-    operator carved out users[] explicitly)."""
+    operator carved out users[] explicitly).
+
+    `priority` is the tier ordering used by SessionManager.pick(): when
+    a pool spans accounts at multiple priorities, requests fill the
+    LOWER-numbered tier first and spill to higher numbers only when the
+    preferred tier has no cool-idle worker (or every account in it is
+    rate-limited). 0 = highest. Default 100 leaves all legacy accounts
+    in one tier — set a lower number on Max accounts and a higher
+    number on Pro accounts to express "prefer Max, fall back to Pro"."""
     dir: str
     workers: int = Field(ge=1)
     pool: str | None = None
+    priority: int = 100
 
 
 class Config(BaseModel):
@@ -389,6 +398,10 @@ class Config(BaseModel):
             entry: dict[str, Any] = {"dir": acc.dir, "workers": acc.workers}
             if acc.pool:
                 entry["pool"] = acc.pool
+            # Only emit priority when non-default — keeps the overlay
+            # diff minimal for accounts that don't carry tier hints.
+            if acc.priority != 100:
+                entry["priority"] = acc.priority
             accounts_out[name] = entry
         payload = {"accounts": accounts_out}
         tmp = path.with_suffix(path.suffix + ".tmp")

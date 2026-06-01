@@ -374,27 +374,124 @@
     }
 
     /* ── Account routing rows ───────────────────────────────── */
+    /* Filter chips above the list — same look as .pill-group but
+       lighter so they don't compete with the section heading. */
+    .filter-chips {
+      display: inline-flex; gap: 4px;
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 3px;
+      margin-right: 10px;
+    }
+    .filter-chips button {
+      background: transparent; border: none;
+      color: var(--text-dim); font-size: 12px;
+      padding: 4px 10px; border-radius: 6px; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .filter-chips button:hover { color: var(--text); }
+    .filter-chips button.active {
+      background: var(--surface); color: var(--text);
+      box-shadow: 0 0 0 1px var(--border-strong);
+    }
+    .filter-chips .count {
+      font-variant-numeric: tabular-nums;
+      color: var(--text-faint); margin-left: 4px;
+    }
+    .filter-chips button.active .count { color: var(--text-dim); }
+    /* Collapsible group container — one per priority tier. */
+    .account-group { margin-bottom: 10px; }
+    .account-group:last-child { margin-bottom: 0; }
+    .account-group-head {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px 8px 0 0;
+      cursor: pointer; user-select: none;
+      font-size: 13px;
+    }
+    .account-group-head:hover { background: var(--surface); }
+    .account-group.collapsed .account-group-head {
+      border-radius: 8px;
+    }
+    .account-group-head .caret {
+      color: var(--text-faint); font-size: 10px;
+      transition: transform 0.15s;
+    }
+    .account-group.collapsed .account-group-head .caret {
+      transform: rotate(-90deg);
+    }
+    .account-group-head .title {
+      font-weight: 600; color: var(--text);
+    }
+    .account-group-head .stats {
+      margin-left: auto;
+      font-size: 12px; color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .account-group-head .stats .ok  { color: var(--green); }
+    .account-group-head .stats .rl  { color: var(--yellow); }
+    .account-group-head .stats .bad { color: var(--red); }
+    .account-group-body {
+      background: var(--surface);
+      border: 1px solid var(--border); border-top: none;
+      border-radius: 0 0 8px 8px;
+      overflow: hidden;
+    }
+    .account-group.collapsed .account-group-body { display: none; }
+    /* Compact row: status dot · name · priority · status pill ·
+       lane pills · meta · actions. Stays single-line at typical
+       widths; lane pills wrap to a second line on narrow viewports. */
     .account-list .account-row {
       display: flex;
-      align-items: center; gap: 14px;
-      padding: 11px 16px;
+      align-items: center; gap: 10px;
+      padding: 8px 14px;
       border-bottom: 1px solid var(--border);
+      font-size: 13px;
     }
     .account-list .account-row:last-child { border-bottom: none; }
+    .account-list .account-row .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--green); flex-shrink: 0;
+      box-shadow: 0 0 6px rgba(52,211,153,0.40);
+    }
+    .account-list .account-row.limited .dot {
+      background: var(--yellow); box-shadow: 0 0 6px rgba(251,191,36,0.50);
+    }
+    .account-list .account-row.degraded .dot {
+      background: var(--red); box-shadow: 0 0 6px rgba(239,68,68,0.50);
+    }
     .account-list .account-row .account-name {
       font-weight: 600;
-      min-width: 130px;            /* keep column-like alignment across rows */
+      min-width: 120px;
       font-variant-numeric: tabular-nums;
     }
     .account-list .account-row .badge {
-      min-width: 80px;             /* badges line up regardless of label length */
+      min-width: 80px;
       justify-content: center;
     }
+    /* Mini-pills for 5h / 7d / sonnet / opus inline next to the row. */
+    .lane-pills {
+      display: inline-flex; gap: 4px; flex-wrap: wrap;
+    }
+    .lane-pill {
+      font-size: 11px; font-variant-numeric: tabular-nums;
+      padding: 1px 7px; border-radius: 4px;
+      background: var(--surface-2); color: var(--text-dim);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .lane-pill .k { color: var(--text-faint); margin-right: 3px; }
+    .lane-pill.warn   { color: #fbbf24; border-color: rgba(251,191,36,0.30); }
+    .lane-pill.danger { color: #f87171; border-color: rgba(239,68,68,0.40);
+                         background: rgba(239,68,68,0.06); }
+    .lane-pill.dim    { color: var(--text-faint); opacity: 0.55; }
     .account-list .account-row .account-meta {
       font-size: 12px; color: var(--text-dim);
-      flex: 1;                     /* takes the slack so actions hug right edge */
-      min-width: 0;                /* allow ellipsis if text overflows */
+      flex: 1;
+      min-width: 0;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      text-align: right;
     }
     .account-list .account-row.limited { background: rgba(251,191,36,0.04); }
     .account-list .account-row.degraded { background: rgba(239,68,68,0.05); }
@@ -774,7 +871,7 @@
               <div class="section-title">订阅配额</div>
               <div class="section-meta">前端每 60 秒读取一次缓存；服务端通过 worker /usage 探测，上游限速 ~1 次/小时/账号</div>
             </div>
-            <div class="quota-grid" id="quotaGrid"></div>
+            <div id="quotaGrid"></div>
           </div>
 
           <!-- 账号路由状态 -->
@@ -784,10 +881,15 @@
               <div class="section-meta">达到限额的账号会被路由跳过；窗口到期自动恢复</div>
               <div class="spacer"></div>
               <div class="section-controls">
+                <div class="filter-chips" id="accountFilterChips">
+                  <button data-filter="all"     class="active">全部 <span class="count" id="acctChipCountAll">0</span></button>
+                  <button data-filter="limited">限流中 <span class="count" id="acctChipCountLimited">0</span></button>
+                  <button data-filter="ok">健康 <span class="count" id="acctChipCountOk">0</span></button>
+                </div>
                 <button class="btn-ghost" id="addAccountBtn">+ 添加账号</button>
               </div>
             </div>
-            <div class="card account-list" id="accountList"></div>
+            <div class="account-list" id="accountList"></div>
           </div>
 
         </section>
@@ -810,6 +912,11 @@
                 <select id="newAcctPool"></select>
                 <div class="form-help" style="margin-top:6px;">
                   选「不自动归属」时，新账号 worker 不会被加入任何 sk-key 池——需要稍后手动修改 config.yaml 把它接入路由，否则该账号的 worker 不可达。
+                </div>
+                <label class="form-label">路由优先级（数字越小越优先）</label>
+                <input type="number" id="newAcctPriority" value="100" min="0" max="1000">
+                <div class="form-help" style="margin-top:6px;">
+                  同一 sk-key 池内多 tier 时，请求优先打到数字更小的账号；前一档无 cool-idle worker 时才溢出到下一档。建议：Max 账号 <code>0</code>、Pro 账号 <code>200</code>，留 <code>100</code> 给中间档（默认）。
                 </div>
                 <div class="form-actions">
                   <button class="btn-primary" id="newAcctBegin">开始登录</button>
@@ -973,6 +1080,22 @@
     // refetch) still have the data to render workers + overview.
     let lastStatus = null;
     let lastUsageData = null;
+    // Cache the latest /admin/quotas payload so renderAccounts can
+    // look up sub-quota utilization (sonnet/opus) to label which
+    // lane is actually blocking — without it the row would just say
+    // "7天限额 (推断)" when the truth is "sonnet 子配额满, opus 可用".
+    let lastQuotaData = null;
+    // Selected accounts-section filter: 'all' | 'limited' | 'ok'.
+    // Persisted to localStorage so view switches don't lose context.
+    let accountFilter = localStorage.getItem('accountFilter') || 'all';
+    // Group collapse state, keyed by tier label (e.g. "P100"). Default
+    // open; toggled by clicking the group header.
+    const accountGroupCollapsed = JSON.parse(
+      localStorage.getItem('accountGroupCollapsed') || '{}');
+    function persistGroupCollapsed() {
+      localStorage.setItem('accountGroupCollapsed',
+        JSON.stringify(accountGroupCollapsed));
+    }
     // Overview USD cache — we hit /admin/usage twice (today + 7d) to
     // populate the home cards; cache so view switches are instant.
     let lastUsdToday = null;
@@ -1260,6 +1383,44 @@
       });
       return `${abs}（${utc} UTC）`;
     }
+    // Natural comparator so "claude-2" < "claude-10" instead of the
+    // lexical "claude-10" < "claude-2" that .sort() defaults to.
+    const naturalNameCmp = (a, b) =>
+      a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+    const REASON_LABEL = {
+      weekly_limit:  '7天限额',
+      '5hour_limit': '5小时限额',
+      rate_limit:    '限流',
+      manual:        '手动设置',
+      'prewarm-failed': 'prewarm 失败',
+    };
+    const reasonLabelFor = r => REASON_LABEL[r] || (r || '未知');
+    // Render one mini-pill for a single lane's utilization. Threshold
+    // logic mirrors quotaBarCls (warn at 60, danger at 85+).
+    function renderLanePill(key, label, u) {
+      if (u == null) {
+        return `<span class="lane-pill dim"><span class="k">${label}</span>—</span>`;
+      }
+      let cls = '';
+      if (u >= 85) cls = 'danger';
+      else if (u >= 60) cls = 'warn';
+      return `<span class="lane-pill ${cls}"><span class="k">${label}</span>${Math.floor(u)}%</span>`;
+    }
+    function laneSnapshotFor(name) {
+      const accts = (lastQuotaData && lastQuotaData.accounts) || {};
+      const snap = (accts[name] || {}).snapshot;
+      if (!snap) return null;
+      const u = (k) => {
+        const t = snap[k];
+        return (t && typeof t === 'object' && t.utilization != null)
+          ? t.utilization : null;
+      };
+      return {
+        five_hour:        u('five_hour'),
+        seven_day:        u('seven_day'),
+        seven_day_sonnet: u('seven_day_sonnet'),
+      };
+    }
     function renderAccounts(accounts) {
       if (!accounts || accounts.length === 0) {
         accountsSection.style.display = 'none';
@@ -1267,45 +1428,144 @@
         return;
       }
       accountsSection.style.display = '';
-      const REASON_LABEL = {
-        weekly_limit:  '7天限额',
-        '5hour_limit': '5小时限额',
-        rate_limit:    '限流',
-        manual:        '手动设置',
-        'prewarm-failed': 'prewarm 失败',
-      };
-      const labelFor = r => REASON_LABEL[r] || (r || '未知');
-      accountList.innerHTML = accounts.map(a => {
-        const kind = a.issue_kind;
-        let cls = 'account-row', status, meta;
-        if (kind === 'rate_limit') {
-          cls += ' limited';
-          status = `<span class="badge limited">${escapeHtml(labelFor(a.rate_limit_reason))}</span>`;
-          const reset = fmtResetTime(a.rate_limited_until);
-          meta = `${a.worker_count} worker 已限流 · 恢复于 ${reset} · 还剩 ${fmtSeconds(a.rate_limited_seconds_remaining)}`;
-        } else if (kind === 'degraded') {
-          cls += ' degraded';
-          status = `<span class="badge degraded">不可用 (${escapeHtml(labelFor(a.rate_limit_reason))})</span>`;
-          meta = `${a.worker_count} worker 不可用 · ${fmtSeconds(a.rate_limited_seconds_remaining)}后自动重试 · 检查 docker logs 找根因`;
-        } else {
-          status = `<span class="badge idle">正常</span>`;
-          meta = `${a.worker_count} worker 可用`;
-        }
+      // Filter chip counts (always based on the FULL list so users can
+      // see what's hidden behind a filter).
+      const counts = { all: accounts.length, limited: 0, ok: 0 };
+      accounts.forEach(a => {
+        if (a.issue_kind) counts.limited += 1;
+        else counts.ok += 1;
+      });
+      $('acctChipCountAll').textContent     = counts.all;
+      $('acctChipCountLimited').textContent = counts.limited;
+      $('acctChipCountOk').textContent      = counts.ok;
+      // Sync chip active state from the persisted accountFilter var.
+      document.querySelectorAll('#accountFilterChips button').forEach(b => {
+        b.classList.toggle('active', b.dataset.filter === accountFilter);
+      });
+      // Apply filter.
+      let visible = accounts;
+      if (accountFilter === 'limited') {
+        visible = accounts.filter(a => a.issue_kind);
+      } else if (accountFilter === 'ok') {
+        visible = accounts.filter(a => !a.issue_kind);
+      }
+      // Group by priority tier. The router uses numeric priority for
+      // routing decisions, so that's the right axis here too — within
+      // a tier accounts are interchangeable from the picker's POV.
+      const groups = new Map();
+      visible.forEach(a => {
+        const prio = (typeof a.priority === 'number') ? a.priority : 100;
+        if (!groups.has(prio)) groups.set(prio, []);
+        groups.get(prio).push(a);
+      });
+      const sortedTiers = [...groups.keys()].sort((a, b) => a - b);
+      if (!sortedTiers.length) {
+        accountList.innerHTML = `<div class="empty-state" style="padding:18px;">没有符合筛选条件的账号</div>`;
+        return;
+      }
+      accountList.innerHTML = sortedTiers.map(tier => {
+        const rows = groups.get(tier).slice().sort((a, b) =>
+          naturalNameCmp(a.name, b.name));
+        const tierKey = `P${tier}`;
+        const collapsed = !!accountGroupCollapsed[tierKey];
+        // Group-level stats: count by status across the FULL group
+        // (not the filtered view), so the header reflects the actual
+        // tier health even when a filter hides some rows.
+        const tierAll = accounts.filter(a =>
+          ((typeof a.priority === 'number') ? a.priority : 100) === tier);
+        const okN = tierAll.filter(a => !a.issue_kind).length;
+        const rlN = tierAll.filter(a => a.issue_kind === 'rate_limit').length;
+        const badN = tierAll.filter(a => a.issue_kind === 'degraded').length;
+        const statsHtml = [
+          `${tierAll.length} 个`,
+          okN  ? `<span class="ok">${okN} 健康</span>` : '',
+          rlN  ? `<span class="rl">${rlN} 限流</span>` : '',
+          badN ? `<span class="bad">${badN} 异常</span>` : '',
+        ].filter(Boolean).join(' · ');
+        const rowsHtml = rows.map(a => renderAccountRow(a)).join('');
         return `
-          <div class="${cls}">
-            <span class="account-name">${escapeHtml(a.name)}</span>
-            ${status}
-            <span class="account-meta">${meta}</span>
-            <span class="account-actions">
-              <button data-acct-del="${escapeHtml(a.name)}" title="删除账号">删除</button>
-            </span>
+          <div class="account-group ${collapsed ? 'collapsed' : ''}" data-tier="${tier}">
+            <div class="account-group-head" data-tier="${tier}">
+              <span class="caret">▼</span>
+              <span class="title">P${tier}</span>
+              <span class="stats">${statsHtml}</span>
+            </div>
+            <div class="account-group-body">${rowsHtml}</div>
           </div>
         `;
       }).join('');
+      // Group toggle handlers.
+      accountList.querySelectorAll('.account-group-head').forEach(head => {
+        head.addEventListener('click', () => {
+          const tier = head.dataset.tier;
+          const key = `P${tier}`;
+          accountGroupCollapsed[key] = !accountGroupCollapsed[key];
+          persistGroupCollapsed();
+          head.parentElement.classList.toggle('collapsed');
+        });
+      });
       accountList.querySelectorAll('button[data-acct-del]').forEach(btn => {
-        btn.addEventListener('click', () => deleteAccount(btn.dataset.acctDel));
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteAccount(btn.dataset.acctDel);
+        });
       });
     }
+    function renderAccountRow(a) {
+      const kind = a.issue_kind;
+      let cls = 'account-row', statusBadge, metaText;
+      if (kind === 'rate_limit') {
+        cls += ' limited';
+        const pinTag = a.rate_limit_pinned ? '' : ' (推断)';
+        // If we have quota_probe data, replace the generic reason with
+        // the lane label (e.g. "sonnet 限流") — that's the real blocker.
+        const laneInfo = classifyBlockingLane(a.name);
+        const headline = laneInfo.label || reasonLabelFor(a.rate_limit_reason);
+        statusBadge = `<span class="badge limited">${escapeHtml(headline)}${pinTag}</span>`;
+        const reset = fmtResetTime(a.rate_limited_until);
+        metaText = `${a.worker_count} worker · 剩 ${fmtSeconds(a.rate_limited_seconds_remaining)} · 恢复于 ${reset}`;
+      } else if (kind === 'degraded') {
+        cls += ' degraded';
+        statusBadge = `<span class="badge degraded">不可用 (${escapeHtml(reasonLabelFor(a.rate_limit_reason))})</span>`;
+        metaText = `${a.worker_count} worker 不可用 · ${fmtSeconds(a.rate_limited_seconds_remaining)}后重试`;
+      } else {
+        statusBadge = `<span class="badge idle">正常</span>`;
+        metaText = `${a.worker_count} worker 可用`;
+      }
+      // Lane pills inline next to the status badge. If quota data hasn't
+      // loaded yet, the dim "—" pills act as visual placeholders so
+      // the row layout doesn't jump when data arrives. Opus is omitted
+      // because Anthropic doesn't expose a dedicated opus sub-quota
+      // on our plan — opus drains seven_day, which is already the 7d pill.
+      const lanes = laneSnapshotFor(a.name) || {};
+      const lanesHtml = `
+        <span class="lane-pills">
+          ${renderLanePill('5h',   '5h',   lanes.five_hour)}
+          ${renderLanePill('7d',   '7d',   lanes.seven_day)}
+          ${renderLanePill('snt',  'snt',  lanes.seven_day_sonnet)}
+        </span>
+      `;
+      return `
+        <div class="${cls}">
+          <span class="dot"></span>
+          <span class="account-name">${escapeHtml(a.name)}</span>
+          ${statusBadge}
+          ${lanesHtml}
+          <span class="account-meta">${escapeHtml(metaText)}</span>
+          <span class="account-actions">
+            <button data-acct-del="${escapeHtml(a.name)}" title="删除账号">删除</button>
+          </span>
+        </div>
+      `;
+    }
+    // Filter chip wire-up (one-time, since the chips are static HTML).
+    document.querySelectorAll('#accountFilterChips button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        accountFilter = btn.dataset.filter;
+        localStorage.setItem('accountFilter', accountFilter);
+        if (lastStatus) renderAccounts(lastStatus.accounts || []);
+      });
+    });
 
     async function restartWorker(userId) {
       const auth = authHeader();
@@ -1396,18 +1656,57 @@
           if (!silent) showToast(`配额加载失败：HTTP ${resp.status}`, 'error');
           return;
         }
-        renderQuotas(await resp.json());
+        const payload = await resp.json();
+        lastQuotaData = payload;
+        renderQuotas(payload);
+        // Re-render the account list so lane-aware status labels pick
+        // up the fresh sub-quota signals (sonnet/opus). Cheap: same
+        // accounts array, just relabels.
+        if (lastStatus) renderAccounts(lastStatus.accounts || []);
       } catch (e) {
         if (!silent) showToast('配额加载失败：' + e.message, 'error');
       }
     }
-    // Only 5h and 7d total — the per-model 7d breakdowns (opus/sonnet)
-    // and the dynamic extra_tiers payload don't carry information
-    // operators look at day-to-day. Keep the panel scannable.
+    // 5h + 7d unified + sonnet sub-quota. Opus is intentionally NOT
+    // included: Anthropic's /api/oauth/usage returns
+    // `seven_day_opus: null` for our plan tier — opus has no dedicated
+    // sub-bucket; it spends directly against `seven_day`. Showing an
+    // always-empty "ops —" pill made the panel look broken; the
+    // unified 7d row is the right ceiling for opus capacity.
     const QUOTA_TIERS = [
-      { key: 'five_hour', label: '5 小时窗口' },
-      { key: 'seven_day', label: '7 天总额度' },
+      { key: 'five_hour',         label: '5 小时窗口' },
+      { key: 'seven_day',         label: '7 天 · 合计' },
+      { key: 'seven_day_sonnet',  label: '7 天 · sonnet' },
     ];
+    // ── Lane-aware status classification ─────────────────────
+    // Translate a probed snapshot into "which lane is the actual
+    // blocker", so the account row can say "sonnet 限流" instead of
+    // a generic "7天限额 (推断)". Returns one of:
+    //   {lane: 'sonnet'|'unified'|'5h'|null, label: string}
+    // Opus has no dedicated sub-quota on our plan (Anthropic returns
+    // `seven_day_opus: null`); opus calls drain `seven_day` unified,
+    // so an "opus 限流" lane never gets surfaced separately — it's
+    // either unified-full (全部限流) or fine.
+    function classifyBlockingLane(name) {
+      const accts = (lastQuotaData && lastQuotaData.accounts) || {};
+      const snap = (accts[name] || {}).snapshot;
+      if (!snap) return { lane: null, label: '' };
+      const u = (k) => {
+        const t = snap[k];
+        return (t && typeof t === 'object') ? t.utilization : null;
+      };
+      if (u('five_hour') != null && u('five_hour') >= 100) {
+        return { lane: '5h', label: '5h 限流' };
+      }
+      if (u('seven_day') != null && u('seven_day') >= 100) {
+        return { lane: 'unified', label: '全部限流' };
+      }
+      const snnt = u('seven_day_sonnet');
+      if (snnt != null && snnt >= 100) {
+        return { lane: 'sonnet', label: 'sonnet 限流' };
+      }
+      return { lane: null, label: '' };
+    }
     function renderQuotaTier(label, tier) {
       const u = tier ? (tier.utilization ?? tier.utilizationPercent) : null;
       const reset = tier ? (tier.resets_at || tier.resetsAt
@@ -1428,19 +1727,21 @@
         </div>
       `;
     }
-    function renderQuotas(data) {
-      const accounts = data.accounts || {};
-      const names = Object.keys(accounts).sort();
-      if (!names.length) { $('quotaSection').style.display = 'none'; return; }
-      $('quotaSection').style.display = '';
-      const grid = $('quotaGrid');
-      grid.innerHTML = names.map(name => {
-        const a = accounts[name];
+    // Independent collapse state for quota groups (reuses the same
+    // localStorage map shape as accounts, but a separate key so the
+    // two panels collapse independently).
+    const quotaGroupCollapsed = JSON.parse(
+      localStorage.getItem('quotaGroupCollapsed') || '{}');
+    function persistQuotaGroupCollapsed() {
+      localStorage.setItem('quotaGroupCollapsed',
+        JSON.stringify(quotaGroupCollapsed));
+    }
+    function renderQuotaCard(name, a, tickSeconds) {
         const snap = a.snapshot;
         const err = a.last_error;
         const cdRem = a.cooldown_seconds_remaining || 0;
         const ageS = a.age_seconds;
-        const stale = (ageS != null && ageS > (data.tick_seconds || 300) * 2);
+        const stale = (ageS != null && ageS > (tickSeconds || 300) * 2);
         let ageLabel;
         if (ageS == null) {
           ageLabel = cdRem > 0
@@ -1461,9 +1762,6 @@
           tiersHtml = QUOTA_TIERS.map(t =>
             renderQuotaTier(t.label, snap[t.key])).join('');
         } else {
-          // Same slot as before but with the cooldown case spelled out
-          // (used to lump into "探针失败" which made an expected wait
-          // look like a fault).
           let emptyText;
           if (cdRem > 0) {
             emptyText = `Anthropic 429 冷却中，${Math.ceil(cdRem/60)} 分钟后才会重试`;
@@ -1476,23 +1774,10 @@
             ${escapeHtml(emptyText)}
           </div>`;
         }
-        // Three classes of footer notice, in priority order:
-        //   1. Sustained-throttle warning (≥3 consecutive 429s) — red,
-        //      because the operator should probably investigate the
-        //      account rather than wait it out.
-        //   2. Active cooldown — yellow, just informational ("we're
-        //      waiting, no probes going out, sit tight").
-        //   3. Real failure (no cooldown_until_unix) — red, current
-        //      behavior.
         const cd = err && err.cooldown_until_unix;
         const streak = (err && err.consecutive_429s) || 0;
         let errHtml = '';
         if (err && cd) {
-          // /api/oauth/usage probe endpoint is independent of
-          // /v1/messages, so its 429 cooldown is informational only —
-          // no "sustained-throttle" red-flag branch, even at high
-          // streak counts. Backend error string (with backoff math)
-          // is in the title attribute on hover.
           const mins = Math.ceil(cdRem / 60);
           errHtml = `<div class="err cooldown" title="${escapeHtml(err.error || '')}">/usage 探针冷却中，${mins} 分钟后重试${streak > 1 ? ` ×${streak}` : ''}</div>`;
         } else if (err) {
@@ -1508,7 +1793,55 @@
             ${errHtml}
           </div>
         `;
+    }
+    function renderQuotas(data) {
+      const accounts = data.accounts || {};
+      const names = Object.keys(accounts).sort(naturalNameCmp);
+      if (!names.length) { $('quotaSection').style.display = 'none'; return; }
+      $('quotaSection').style.display = '';
+      const grid = $('quotaGrid');
+      // Join with /status to recover priority — quota_probe doesn't
+      // know about routing tiers. Fallback to 100 if /status hasn't
+      // loaded yet (first render race).
+      const prioOf = {};
+      ((lastStatus && lastStatus.accounts) || []).forEach(a => {
+        prioOf[a.name] = (typeof a.priority === 'number') ? a.priority : 100;
+      });
+      const groups = new Map();
+      names.forEach(n => {
+        const p = prioOf[n] != null ? prioOf[n] : 100;
+        if (!groups.has(p)) groups.set(p, []);
+        groups.get(p).push(n);
+      });
+      const sortedTiers = [...groups.keys()].sort((a, b) => a - b);
+      grid.innerHTML = sortedTiers.map(tier => {
+        const tierNames = groups.get(tier);
+        const tierKey = `Q-P${tier}`;
+        const collapsed = !!quotaGroupCollapsed[tierKey];
+        const cardsHtml = tierNames.map(n =>
+          renderQuotaCard(n, accounts[n], data.tick_seconds)).join('');
+        return `
+          <div class="account-group ${collapsed ? 'collapsed' : ''}" data-quota-tier="${tier}">
+            <div class="account-group-head" data-quota-tier="${tier}">
+              <span class="caret">▼</span>
+              <span class="title">P${tier}</span>
+              <span class="stats">${tierNames.length} 个账号</span>
+            </div>
+            <div class="account-group-body" style="padding:12px;">
+              <div class="quota-grid">${cardsHtml}</div>
+            </div>
+          </div>
+        `;
       }).join('');
+      grid.querySelectorAll('.account-group-head').forEach(head => {
+        head.addEventListener('click', () => {
+          const tier = head.dataset.quotaTier;
+          const key = `Q-P${tier}`;
+          quotaGroupCollapsed[key] = !quotaGroupCollapsed[key];
+          persistQuotaGroupCollapsed();
+          head.parentElement.classList.toggle('collapsed');
+        });
+      });
     }
     function startQuotaPolling() {
       if (quotaTimer) clearInterval(quotaTimer);
@@ -1602,16 +1935,20 @@
       const name = $('newAcctName').value.trim();
       const workers = parseInt($('newAcctWorkers').value, 10);
       const pool = $('newAcctPool').value;
+      const priority = parseInt($('newAcctPriority').value, 10);
       if (!name) { showToast('请填写账号名', 'error'); return; }
       if (!Number.isInteger(workers) || workers < 1 || workers > 20) {
         showToast('Worker 数量必须是 1-20 的整数', 'error'); return;
+      }
+      if (!Number.isInteger(priority) || priority < 0 || priority > 1000) {
+        showToast('优先级必须是 0-1000 的整数', 'error'); return;
       }
       $('newAcctBegin').disabled = true;
       try {
         const resp = await fetch('/admin/accounts/new', {
           method: 'POST',
           headers: { ...auth, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, workers, pool }),
+          body: JSON.stringify({ name, workers, pool, priority }),
         });
         const data = await resp.json();
         if (!resp.ok) {

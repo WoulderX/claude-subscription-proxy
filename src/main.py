@@ -364,8 +364,14 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
         if config.accounts:
             for name in sorted(config.accounts.keys()):
                 state = manager.account_rate_limit(name)
+                acc_cfg = config.accounts.get(name)
                 accounts_out.append({
                     "name": name,
+                    # Routing tier the operator assigned to this account
+                    # (lower = preferred). Lets the dashboard surface
+                    # "Max" vs "Pro" badges without re-encoding the
+                    # threshold logic on the JS side.
+                    "priority": acc_cfg.priority if acc_cfg else 100,
                     # `kind` distinguishes positive rate-limit signals
                     # ("rate_limit") from unknown-cause failures
                     # ("degraded"). Both block routing; UI shows them
@@ -377,6 +383,12 @@ def create_app(config: Config, config_path: str | None = None) -> FastAPI:
                     "degraded": (
                         state.kind == "degraded" if state else False),
                     "rate_limit_reason": state.reason if state else None,
+                    # True iff the mark came from an authoritative source
+                    # (quota_probe snapshot, operator override). Inferred
+                    # marks from a single 429 are cleared on next success.
+                    "rate_limit_pinned": (
+                        bool(getattr(state, "pinned", False))
+                        if state else False),
                     "rate_limited_since": (
                         round(state.set_at) if state else None),
                     "rate_limited_until": (

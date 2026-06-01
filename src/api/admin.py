@@ -410,6 +410,15 @@ def build_router(
                     f"pool {pool!r} is not in users[]; pick one of "
                     f"{sorted(config.users.keys())} or send '' to skip "
                     f"auto-wire")
+        # `priority` is the tier ordering used by SessionManager.pick();
+        # lower wins. Missing → 100 (default tier). Validated here so a
+        # garbage value (string, negative) fails at begin rather than at
+        # finish after credentials are installed.
+        priority = payload.get("priority")
+        if priority is not None:
+            if not isinstance(priority, int) or priority < 0 or priority > 1000:
+                raise HTTPException(400,
+                    "priority must be an int in [0, 1000] (lower = preferred)")
         # Reserve the dest directory inside the shared-auth tree so
         # finish() lands at a predictable path. The parent bind mount
         # makes this visible on the host.
@@ -422,7 +431,7 @@ def build_router(
         try:
             url = await login_registry.begin(
                 name, dest_dir, claude_binary=config.claude.binary,
-                pool=pool)
+                pool=pool, priority=priority)
         except Exception:
             # Detail is server-side only; PTY output may include
             # operator-pasted secrets and must not propagate via 500
@@ -458,8 +467,9 @@ def build_router(
             raise HTTPException(400, "workers must be an int in [1, 20]")
         # Capture the operator-selected pool BEFORE finish() — finish()
         # pops the LoginSession on success, so pool_for() would return
-        # None after that point.
+        # None after that point. Same applies to priority_for().
         chosen_pool = login_registry.pool_for(name)
+        chosen_priority = login_registry.priority_for(name)
         try:
             installed = await login_registry.finish(name, code)
         except KeyError:
@@ -496,8 +506,14 @@ def build_router(
         else:
             effective_pool = config.api_key if (
                 config.api_key and config.api_key in config.users) else None
-        config.accounts[name] = AccountConfig(
-            dir=dest_dir, workers=workers, pool=effective_pool)
+        # Operator-set priority survives the round-trip via the
+        # registry; if None, AccountConfig's default (100) applies.
+        acc_kwargs: dict[str, Any] = {
+            "dir": dest_dir, "workers": workers, "pool": effective_pool,
+        }
+        if chosen_priority is not None:
+            acc_kwargs["priority"] = chosen_priority
+        config.accounts[name] = AccountConfig(**acc_kwargs)
         # Extend the chosen pool live so routing picks up the new
         # workers without waiting for a restart. Persisting the `pool`
         # tag via write_runtime_accounts (below) covers the cold-start

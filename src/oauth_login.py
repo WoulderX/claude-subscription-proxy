@@ -103,7 +103,8 @@ class LoginSession:
 
     def __init__(self, account_name: str, dest_dir: Path,
                  claude_binary: str = "claude",
-                 pool: str | None = None) -> None:
+                 pool: str | None = None,
+                 priority: int | None = None) -> None:
         self.account_name = account_name
         self.dest_dir = dest_dir
         self.claude_binary = claude_binary
@@ -112,6 +113,11 @@ class LoginSession:
         # operator's chosen pool (sk-internal, sk-dev, …) rather than
         # always defaulting to api_key.
         self.pool = pool
+        # Operator-selected routing tier (lower = preferred). None →
+        # AccountConfig's default (100). Persisted same way as `pool`,
+        # so the dashboard's add-account flow can drop a new account
+        # straight into the Pro tier under the same front-door key.
+        self.priority = priority
         # tempfile.mkdtemp owns the dir; cleanup happens in finish/abort.
         # Prefix makes orphan dirs easy to spot if something crashes
         # between mkdtemp and cleanup.
@@ -363,7 +369,8 @@ class LoginRegistry:
 
     async def begin(self, account_name: str, dest_dir: Path,
                      claude_binary: str = "claude",
-                     pool: str | None = None) -> str:
+                     pool: str | None = None,
+                     priority: int | None = None) -> str:
         async with self._lock:
             if account_name in self._sessions:
                 raise RuntimeError(
@@ -371,7 +378,7 @@ class LoginRegistry:
                     f"already in progress; abort it first or pick a "
                     f"different name")
             sess = LoginSession(account_name, dest_dir, claude_binary,
-                                pool=pool)
+                                pool=pool, priority=priority)
             try:
                 url = await sess.begin()
             except Exception:
@@ -386,6 +393,13 @@ class LoginRegistry:
         round-trip without the dashboard needing to echo it back."""
         sess = self._sessions.get(account_name)
         return sess.pool if sess is not None else None
+
+    def priority_for(self, account_name: str) -> int | None:
+        """Return the operator-selected routing tier for an in-progress
+        login. Same round-trip pattern as pool_for. None means "use the
+        AccountConfig default" (100)."""
+        sess = self._sessions.get(account_name)
+        return sess.priority if sess is not None else None
 
     async def finish(self, account_name: str, code: str) -> dict[str, Any]:
         async with self._lock:
