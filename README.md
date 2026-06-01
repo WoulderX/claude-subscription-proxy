@@ -1,801 +1,123 @@
 # claude-subscription-proxy
 
-把 **Claude Code 订阅账号（Max / Pro）** 包装成一个本地的
-**Anthropic / OpenAI 兼容 HTTP API**，让脚本 / IDE 插件 / LiteLLM
-通过标准 API 调用 Claude，而 Anthropic 把这些请求当作 **Claude
-Code CLI 的交互式调用**，按订阅配额计费 —— 不走 API/SDK 配额。
+把 **Claude Code 订阅账号（Max / Pro）** 包装成本地的 **Anthropic / OpenAI 兼容 HTTP API**——脚本、IDE 插件、LiteLLM 都按标准 API 调用，Anthropic 把请求计入订阅配额而不是 API 配额。
 
 ```
-你的应用 / LiteLLM / SDK                    本服务                          Anthropic
-──────────────────────                     ─────                          ─────────
-  curl ────┐                              ┌──────────────┐
-  Anthropic SDK ──────► HTTP/JSON ───────►│  FastAPI     │
-  OpenAI SDK ───┘                         │  :8787       │
-  LiteLLM ─────►                          └──────┬───────┘
-                                                 │ JSON-lines IPC
-                                                 ▼
-                                          ┌──────────────────────┐
-                                          │ per-user worker      │
-                                          │  · mitmproxy 18000+N │  劫持 + 改写
-                                          │  · PTY → claude code │──► HTTPS ──► api.anthropic.com
-                                          │  (独立 asyncio loop)  │   (cc_entrypoint=cli)
-                                          └──────────────────────┘
+你的应用 / LiteLLM / SDK         本服务            Anthropic
+──────────────────────          ─────            ─────────
+  curl ─┐                    ┌───────────┐
+  SDK ──┼──► HTTP/JSON ────►│  FastAPI   │──► HTTPS ──► api.anthropic.com
+  LiteLLM ┘                  │   :8787   │    （挂着真 claude CLI 作"身份代笔"）
+                             └───────────┘
 ```
+
+核心点：每个账号跑一个或多个 worker，worker 里运行真实的 `claude` CLI；用户请求通过 mitmproxy 注入到 CLI 即将发出的 `/v1/messages` 请求体中，让 Anthropic 看到的是带完整订阅指纹的真 CLI 调用。
 
 ---
 
 ## 目录
 
-1. [实现原理](#1-实现原理)
-2. [Docker 部署](#2-docker-部署)
-3. [配置说明](#3-配置说明)
-4. [API 使用](#4-api-使用)
+1. [快速开始](#1-快速开始)
+2. [配置](#2-配置)
+3. [API 使用](#3-api-使用)
+4. [运维与监控](#4-运维与监控)
+5. [工作原理（简版）](#5-工作原理简版)
+6. [常见问题](#6-常见问题)
 
 ---
 
-## 1. 实现原理
+## 1. 快速开始
 
-### 1.1 为什么不能直接拼请求
+### 前置
 
-Anthropic 服务器用一组**请求级身份指纹**判定本次调用是订阅配额还是 API
-配额。最关键的几类：
-
-| 指纹 | 内容 |
-|---|---|
-| `system[0]` 文本块 | `x-anthropic-billing-header: cc_entrypoint=cli; cc_version=2.1.x; ...` |
-| `User-Agent` | `claude-cli/2.1.x (external, cli)` |
-| 请求头 | `anthropic-beta` / `x-stainless-*` / `x-app` 等十多项 |
-| 请求体其它字段 | 完整 `tools` 列表（11 个内建工具）、`metadata`、`anthropic_version` 等 |
-
-任意一项缺失或不匹配就会被路由到 API 配额。手工拼请求难以保证全套指纹
-长期稳定（CLI 升级常改 beta token、header 组合、tools schema），所以本
-项目的核心思路是：
-
-> **让真实的 `claude` CLI 在受控环境里发请求，用 mitm 在它出门前把 body
-> 里业务字段换成 API 调用方发来的内容**。
-
-### 1.2 整体数据流
-
-```
-        ┌─────────────────────── 主进程：FastAPI ──────────────────────┐
-        │  /v1/messages   /v1/chat/completions   SessionManager       │
-        └────┬─────────────────────────────────────────────────┬──────┘
-             │ stdin JSON 行（请求 body）           stdout JSON 行 │
-             ▼                                                  ▲
-        ┌─────────────────── 子进程：worker（每用户一个）─────────────┐
-        │                                                            │
-        │   ┌──────────┐                       ┌──────────────────┐  │
-        │   │ claude   │  HTTPS_PROXY=18000+N  │   mitmproxy      │  │
-        │   │  TUI     │ ─────────────────────►│   HijackAddon    │  │
-        │   │  (PTY)   │   trust mitm CA       │                  │  │
-        │   └────▲─────┘                       └────┬─────────────┘  │
-        │        │ ① 占位符 "say hi\r"               │ ② 改写 body     │
-        │   trigger()                                 │ ③ tap 响应     │
-        │                                             ▼               │
-        └─────────────────────────────────────────────│───────────────┘
-                                                      ▼ HTTPS
-                                                api.anthropic.com
-```
-
-一次调用的步骤：
-
-1. HTTP 请求落到 FastAPI，鉴权后从 user 池里挑一个空闲 worker
-2. 主进程把请求 body 以 JSON 行写给 worker 的 stdin
-3. worker 把 body 挂在 `session.pending` 槽位上，然后往 claude PTY 写
-   `say hi\r`，触发 claude 发出一个真实的 `POST /v1/messages?beta=true`
-4. mitm 拦截这个出站请求，识别出是用户触发的那一个（看 pending 槽位），
-   按白名单合并 body（§1.5）后转发
-5. Anthropic 用 SSE 流回应，mitm 的 `_tap` 回调把每个 chunk **同时**
-   forward 给 claude（保持 TUI 状态机一致）和塞进 `ResponseChannel`
-6. worker 把 channel 里的字节 base64 后写 stdout，主进程读出来转发给
-   FastAPI 的 `StreamingResponse`
-
-### 1.3 mitm 怎么物理上拦下 HTTPS
-
-claude CLI 直发 `https://api.anthropic.com/v1/messages` 时，普通 HTTPS
-握手有一道防护：客户端只信任系统 / 受信 CA 签的证书，任何中间人冒充
-api.anthropic.com 都签不出能验证通过的证书。
-
-mitmproxy 的做法是**让客户端事先信任 mitmproxy 自己的 CA**：
-
-1. mitmproxy 首次运行生成 CA 私钥 + 自签证书 `mitmproxy-ca-cert.pem`
-2. 通过环境变量告诉 claude（Node 应用）信任这个 CA：
-
-```python
-# src/pty_driver.py:37-42
-env["HTTPS_PROXY"]         = f"http://127.0.0.1:{port}"   # 流量物理上走代理
-env["HTTP_PROXY"]          = f"http://127.0.0.1:{port}"
-env["NODE_EXTRA_CA_CERTS"] = str(ca_cert)                 # 信任 mitm 自签 CA
-```
-
-Node 看到 `NODE_EXTRA_CA_CERTS` 后把 mitm CA 加进可信列表 —— 跟
-DigiCert / Let's Encrypt **平起平坐**。流量经过 mitm 的物理路径是 HTTP
-标准的 `CONNECT` 隧道：
-
-```
-1. claude 跟 mitm 建明文 TCP 连接
-2. claude 发 → CONNECT api.anthropic.com:443 HTTP/1.1
-3. mitm  答 → HTTP/1.1 200 Connection Established
-4. 之后这条 TCP 通道按规范应当是"裸 TCP 隧道"
-```
-
-但 mitmproxy 不按规矩走 —— 它从 ClientHello 里读出 SNI =
-`api.anthropic.com`，现场用自己 CA 私钥**签一张假证书**塞回去：
-
-```
-claude  ←TLS(假证书)→  mitmproxy  ←TLS(真证书)→  api.anthropic.com
-         明文给 mitm                明文给 mitm
-                       mitm 持两端密钥
-                       双向都能看明文 / 改字节
-```
-
-mitmproxy 是**两端独立 TLS 会话的端点**（不是字节转发），所以能解明文、
-改 body、tap 响应字节。整套机制依赖四件事齐全：
-
-```
-1. HTTPS_PROXY → 让流量物理上经过 mitm
-2. NODE_EXTRA_CA_CERTS → 让 Node 信任 mitm 假证书
-3. mitm 持 CA 私钥 → 能现场签任意域名证书
-4. mitmproxy 的 request / responseheaders hook → 在两端中间改字节
-```
-
-每一环单独看都很无聊，**凑齐这四个，TLS 加密的安全前提就被打破了**。
-注意这套机制**只对设了上述环境变量的客户端有效**：同机器上其它
-HTTPS 程序（系统 curl 等）连 anthropic.com 仍然会拒绝 mitm 假证书 ——
-hijack 只在 worker 内 claude 这条特定路径上发生。
-
-### 1.4 worker 怎么"借身份"发请求
-
-worker 进程里跑着 mitmproxy + claude PTY + 一个 IPC 读循环。它对外提供
-的接口（`src/worker.py:79-90`）很简单：
-
-```python
-async def call(self, body):
-    async with self.lock:
-        self.response = ResponseChannel()        # 给 mitm 准备的响应字节 queue
-        self.pending  = PendingRequest(body=body)# 待替换的用户 body 挂在槽位上
-        await self.pty.trigger()                 # 写 "say hi\r" 给 claude PTY
-        await pending.consumed.wait()            # 等 mitm 来认领（最多 30s）
-        return self.response
-```
-
-`session.pending` 是 worker 和 mitm addon 之间的**共享内存信号**。addon
-持有 session 反向引用（`src/mitm/addon.py:66`），随时能读这个槽位。
-
-`pty.trigger()` 往 claude TUI 的伪终端写入 7 个字节 `"say hi\r"`
-（`src/pty_driver.py:106-119`）。claude 不知道这是程序写的，它把它当
-"用户在键盘上敲了一句话"处理 —— 走自己的代码路径，生成一个
-**完整的、带订阅身份指纹的** `POST /v1/messages?beta=true` 包，准备发
-给 api.anthropic.com。
-
-这个包穿过 `HTTPS_PROXY` 落到本进程的 mitm。
-
-### 1.5 mitm 怎么"掉包"业务字段
-
-mitmproxy 11 在请求 body 已经收齐、还没转发去 anthropic 之前，调用所有
-addon 的 `request(flow)` 钩子。我们的 `HijackAddon.request`
-（`src/mitm/addon.py:73-134`）做这些事：
-
-```python
-def request(self, flow):
-    # ① host/path 过滤
-    if flow.request.host not in ANTHROPIC_HOSTS: return        # 不是 anthropic
-    if bare_path != "/v1/messages":              return        # 不是模型调用
-
-    # ② 槽位检查
-    pending = self.session.pending
-    if pending is None:
-        return  # 没人挂便签 = claude bootstrap 自己发的杂请求，原样放行
-
-    # ③ 合并 body（白名单覆盖，详见 1.6）
-    merged = self._merge_body(flow.request.get_text() or "{}", pending.body)
-    merged["stream"] = True                       # 强制流式才能 tap
-    flow.request.set_text(json.dumps(merged))
-    flow.request.headers["accept-encoding"] = "identity"   # 关 gzip 简化 tap
-
-    # ④ 剥掉 context-1m beta（订阅不覆盖长上下文 pay-as-you-go）
-    beta = flow.request.headers.get("anthropic-beta")
-    kept = [t for t in beta.split(",") if not t.strip().startswith("context-1m")]
-    flow.request.headers["anthropic-beta"] = ",".join(kept)
-
-    # ⑤ 认领 flow，唤醒 worker
-    self._active_flow_id = flow.id
-    pending.consumed.set()           # ← §1.4 里的 wait() 在这里被唤醒
-    self.session.pending = None      # ← 关闭槽位，避免 claude 后续请求被误劫持
-```
-
-**三个关键设计**：
-
-**(a) "槽位认领"区分用户请求和噪音流量。** worker 进程里 mitm 同时
-能看到几十个 flow：claude 自己的 telemetry、npm registry、mcp-registry、
-datadog 心跳……单靠 host/path 过滤都会误伤。pending 槽位是用户请求的
-显式信号 —— pending=None 就放行不动，pending≠None 才是"等我们替换内容
-的那一封信"。槽位用一次清一次，避免后续杂请求被错误识别。
-
-**(b) `_active_flow_id` 跟踪同一 flow 的请求/响应两阶段。** 请求阶段记下
-`flow.id`，响应阶段（§1.7）只对 `flow.id == _active_flow_id` 的那个流挂
-tap。其它响应原样放行。
-
-**(c) 强制 `stream=true`。** mitmproxy 的 `flow.response.stream` 机制
-只对流式响应有 chunk 级回调；非流响应到 mitm 时已经是完整 body 了，没法
-在 chunk 级 tap。所以无论客户端要不要流式，对邮局**强制声明流式**。
-最终用户拿到的格式由 FastAPI 层决定 —— 客户端要非流式，FastAPI 把流式
-字节攒齐重组成 JSON（§1.8）。
-
-### 1.6 body 合并的规则表
-
-`_merge_body`（`src/mitm/addon.py:136-187`）从 claude 原始 body 开始，
-按"白名单"覆盖字段：
-
-| 字段类别 | 谁说了算 | 原因 |
-|---|---|---|
-| `messages` / `model` / `max_tokens` / `temperature` / `top_p` / `top_k` / `stop_sequences` / `tool_choice` / `tools` / `stream` | 用户 | 业务输入 |
-| `system` | **混合** | 见下文 `_merge_system` |
-| `metadata` / `anthropic_version` / `thinking` / `output_config` / `context_management` / ...其它所有 | claude 原值 | identity 指纹 |
-| 所有 `User-Agent` / `anthropic-*` / `x-stainless-*` / `x-app` 等 header | claude 原值 | identity 指纹 |
-
-> 注：客户端**没传** `tools` 时，claude 内置的 11 个工具（Bash/Read/Edit/...）
-> 会原样留在请求里 —— 模型可能去调它们。要彻底禁工具：传
-> `"tool_choice": {"type": "none"}`，或传你自己的 `tools: [...]` 覆盖。
-
-`system` 字段的特殊处理（`_merge_system`，`src/mitm/addon.py:189-227`）：
-
-claude 原始 `system` 是个数组，长这样：
-
-```
-system: [
-  ★ 块 0: "x-anthropic-billing-header: cc_entrypoint=cli; cc_version=2.1.x; ..."
-    块 1: "You are Claude Code, Anthropic's official CLI..."
-    块 2: "<persona / instructions / 内置工具说明>"
-    ...
-]
-```
-
-两层角色完全不同：
-
-| | 块 0（计费头） | 块 1+（人设） |
-|---|---|---|
-| 给谁看 | Anthropic 计费系统 | **模型本身**（影响生成） |
-| 内容形式 | 机器可读元数据 | 自然语言指令 |
-| 撤掉的后果 | 账单从订阅切到 API 配额 | 模型不再扮演 Claude Code |
-
-合并逻辑：
-
-```
-保留块 0（计费指纹）+ 丢弃块 1+（人设）+ 追加用户的 system 块
-            ↓
-[ 块 0: "cc_entrypoint=cli; ..."           ,
-  块 N: <user_system>, "cache_control":{"type":"ephemeral"} ]
-```
-
-效果：
-
-- 计费头还在 → Anthropic 看到 VIP → 计费走订阅 ✓
-- claude 人设被丢 → 模型不会以为自己在做编程 ✓
-- 用户 system 加进去 → 用户指令真正生效 ✓
-- 用户 system 带 `cache_control` → Anthropic 把它缓存起来，后续同
-  system 的调用 `cache_read_input_tokens` 增长，便宜 10 倍
-
-> 客户端**没传** `system` 时，claude 原 system（全部块）原样保留 ——
-> 模型会按 Claude Code 人设回答（爱用 Bash/Read/Edit 等）。
-
-合并里还有一段**模型耦合参数清理**：claude CLI 会塞 `output_config`
-`thinking` `context_management` 这类跟它当前 model 绑定的字段（例如
-`output_config={"effort":"xhigh"}` 是 opus 级、sonnet 拒绝接受）。
-当用户覆盖 model 时，这些字段会被丢掉让新 model 用自己的默认，避免
-"sonnet 收到 opus 专用参数"导致 400 错误。
-
-### 1.7 响应回程：双向喂字节
-
-mitmproxy 11 在响应头到达时调用 `responseheaders(flow)` 钩子
-（`src/mitm/addon.py:231-264`）：
-
-```python
-def responseheaders(self, flow):
-    if flow.id != self._active_flow_id:
-        return    # 不是我们认领的那个 flow，不挂 tap
-
-    channel = self.session.response   # §1.4 worker 挂的那个 queue
-
-    def _tap(data: bytes) -> bytes:
-        if data:
-            channel.queue.put_nowait(bytes(data))  # ← 塞进 worker channel
-            return data                            # ← 同时让 mitm 继续转发给 claude
-        # data == b"" → 流结束
-        channel.queue.put_nowait(None)             # ← 哨兵
-        return b""
-
-    flow.response.stream = _tap   # mitmproxy 每个 chunk 调用一次
-```
-
-`flow.response.stream = callable` 是 mitmproxy 11 的契约：mitm 每收到
-一个响应 chunk 都调用一次 `_tap(data)`，传 `b""` 表示流结束。
-
-**为什么字节要双向喂？**
-
-- **给 channel.queue**：这是流向用户的路径（worker → 主进程 → FastAPI）
-- **return data 给 mitm**：让 mitm 继续把这个 chunk **转发给 claude TUI**
-
-claude TUI 内部有完整会话状态机：它发了一次请求，期望看到完整 SSE 响应
-（`message_start` → 多个 `content_block_delta` → `message_stop`）。如果
-它"瞎了"，下一次 keystroke 处理会触发错误恢复路径，可能阻塞或重连。
-让它看见响应字节是最简单的同步方式 —— 字节透传给它内部消化，但 TUI 输出
-渲染我们用 `_drain` 全部丢弃（`src/pty_driver.py:121-148`），不读不看。
-
-### 1.8 IPC：worker → 主进程 → 客户端
-
-worker 子进程拿到响应字节后，按 `src/worker.py:100-118` `_handle`
-处理：
-
-```python
-async def _handle(session, req_id, body):
-    channel = await session.call(body)
-    async for chunk in channel.iter():    # 从 _tap 塞进来的字节里循环
-        await _send({"type": "chunk", "id": req_id,
-                     "data": base64.b64encode(chunk).decode("ascii")})
-    await _send({"type": "end", "id": req_id})
-```
-
-`_send` 写一行 JSON 到 stdout。base64 是因为 SSE 字节有换行 / 控制字符，
-JSON 字符串包不住。完整 IPC 协议（worker.py 文件头注释）：
-
-```
-─→ {"type":"request","id":N,"body":{...}}            主进程 → worker stdin
-←─ {"type":"chunk","id":N,"data":"<base64 SSE>"}     worker stdout → 主进程
-←─ {"type":"end","id":N}
-←─ {"type":"error","id":N,"msg":"..."}
-启动时：
-←─ {"type":"ready"}
-```
-
-主进程的 `ClaudeSession` spawn 出 worker 时启动一个常驻协程读 worker
-stdout（`src/session/session.py:187-228`）：
-
-```python
-async def _read_loop(self):
-    while True:
-        line = await self.proc.stdout.readline()
-        msg  = json.loads(line)
-        req_id = msg.get("id")
-        channel = self._channels.get(req_id)   # 主进程侧 channel
-        if msg["type"] == "chunk":
-            channel.queue.put_nowait(base64.b64decode(msg["data"]))
-        elif msg["type"] == "end":
-            channel.queue.put_nowait(None)
-            self._channels.pop(req_id, None)
-```
-
-注意：**worker 里有一个 ResponseChannel，主进程也有一个 ResponseChannel**
-—— 两边都是同一个 `asyncio.Queue` 包装，但实例不同。worker 那个被 mitm
-`_tap` 喂；主进程那个被 `_read_loop` 喂。中间靠 JSON 行 IPC 连起来。
-
-FastAPI handler 把主进程 channel 的字节转 HTTP 响应
-（`src/api/anthropic.py:18-36`）：
-
-```python
-@router.post("/v1/messages")
-async def messages(req, pool: list[str] = Depends(auth_dep)):
-    body = await req.json()
-    sess = await manager.pick(pool)
-    channel = await sess.call(body)
-
-    if body.get("stream"):
-        # 流式：StreamingResponse 直接 yield 字节
-        async def gen():
-            async for chunk in channel.iter(): yield chunk
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    # 非流式：_collapse_stream 把 SSE 事件重组回单个 Message JSON
-    return JSONResponse(await _collapse_stream(channel))
-```
-
-`_collapse_stream`（`src/api/anthropic.py:41-153`）顺序消费 SSE 事件
-（`message_start` / `content_block_delta` / `message_delta` / `message_stop` /
-`error`），合并 `content_block_delta` 的 text 增量，保留 `usage`，捕获
-`error` 事件转成 `stop_reason: "error"` 的合法 Message，让客户端不会因
-为空响应而崩。
-
-### 1.9 多 worker pool：单 key 服务端负载均衡
-
-一个 token 可以映射到一个 user_id **池**（`src/session/manager.py`
-`SessionManager.pick()`）：
-
-```yaml
-users:
-  sk-internal-xxx:                 # 一个 key
-    - litellm-0                    # 三个 worker 并行
-    - litellm-1
-    - litellm-2
-```
-
-LiteLLM / 客户端只配一个 key，本服务收到请求后从池里挑一个 worker。
-`pick()` 的选址分层（最优先在前）：
-
-1. **过滤限流账号**：跳过当前处在冷却窗口内的账号的 worker；只有当池里
-   全部账号都在冷却时才放行（让请求去 Anthropic 重新确认限制是否还在）
-2. **会话亲和**（`claude.session_affinity`，默认开）：带 `session_key`
-   的请求优先落到该对话上次路由到的**账号**，命中上游 prompt cache。亲
-   和账号被限流 / TTL 过期时透明退回下面的均衡逻辑（见下）
-3. **空闲优先**：cool-idle（无 in-flight 且过了 TUI 冷却）优先于
-   warm-idle（无 in-flight 但仍在 TUI 冷却窗内 / PTY 忙）
-4. **同层 round-robin**：候选之间轮转，避免总集中到 pool[0]
-5. **全忙 fallback**：选 in-flight 最少的；同 min 时 RR
-
-**会话亲和怎么定 key**（`src/api/anthropic.py` `_session_key_for`）：
-对 `model + system + tools + messages[0]` 取 hash。后续轮次的 `messages[0]`
-不变，所以同一对话每轮都映射到同一个 key → 钉在同一账号；不同对话
-（首条消息不同）散到不同账号 → 负载仍然均衡。**适用前提**：并发对话数
-> 账号数。若是少数巨型对话，亲和会把负载挤到少数账号、反而更容易撞
-per-account TPM 上限 —— 这种工作负载建议 `session_affinity: false` 回到
-纯 round-robin 均摊（可 `/admin/reload` 热切换 A/B 对比）。
-
-亲和是按对话锁**账号**而非锁单个 worker：同账号 N 个 worker 共享同一份
-上游 cache（§1.10 凭据共享），所以账号内仍然并行选 worker，不损失并行度。
-
-容器启动时所有池成员都会预热：**账号间并行，账号内串行**（每账号约
-N × 10s），见 §1.11 中的 `bootstrap prewarm` 条目。
-
-### 1.10 凭据共享：账号级 .claude/ 共享，worker 共用
-
-每个 worker 有自己的 HOME `/data/users/<user_id>`，避免 claude CLI 写
-`.claude.json` 时互相冲突。OAuth 凭据按账号共享 —— `_seed_home`
-（`src/session/session.py`）把同账号下 N 个 worker 的 `$HOME/.claude`
-**整个目录**软链接到该账号的目录：
-
-```
-acc claude-1 (workers=5):
-  /data/users/claude-1-0/.claude → /data/shared-auth/claude-1   (symlink)
-  /data/users/claude-1-1/.claude → /data/shared-auth/claude-1
-  ... (5 个共享同一个目录)
-
-acc claude-2 (workers=5):
-  /data/users/claude-2-0/.claude → /data/shared-auth/claude-2
-  ... (与 claude-1 完全隔离)
-```
-
-为什么是**目录级**而不是文件级 symlink：claude CLI 刷新 token 用的是
-"写 tmp + rename" 的原子写法，文件级 symlink 会被 rename 直接覆盖成
-真文件，导致 refresh 写不回源。目录级 symlink 让 rename 发生在共享目
-录内部，新 token 直接落到 `/data/shared-auth/<账号>/.credentials.json`，
-同账号的所有 worker 立即看到新 token，容器重启也还在。
-
-不同账号互不影响 —— 主进程 `OAuthRefresher` 每个 tick 独立检查每个
-账号的 `.credentials.json` 并独立刷新。
-
-> **Legacy 单账号模式**：如果 `accounts:` 未配置，`_seed_home` 退回
-> 旧行为，所有 worker 都 symlink 到容器的 `~/.claude`（即宿主
-> `/data/shared-auth/claude` 直接 bind 到 `/home/coder/.claude` 的旧
-> compose 写法）。
-
-per-user transcripts / sessions 仍然天然隔离 —— claude 把 sessions 存在
-`.claude/projects/<encoded-cwd>/sessions/<id>.jsonl`，每个 worker 的 cwd
-是自己 HOME，encoded-cwd 不同，子目录就分开。
-
-**OAuth refresh_token 轮换竞态** —— claude CLI 自己拿 in-memory RT 去刷
-新 token 时，多 worker 撞同一秒过期会产生竞争：A 用 RT0 刷成功拿 RT1，
-B 用 RT0 去刷收 `invalid_grant`，B 此后所有请求 401。本服务用
-**主进程集中刷新**（`src/oauth_refresh.py` `OAuthRefresher`）解决：
-
-- 主进程后台任务每 5 分钟检查 `.credentials.json` 的 `expiresAt`
-- 距离过期 < 1 小时就发 `POST https://api.anthropic.com/v1/oauth/token`
-  （CLIENT_ID 是 claude code 公开的 `9d1c250a-…`，从 CLI binary 里反编
-  译出来），原子写回共享目录
-- worker 的 `claude.restart_interval_seconds` 默认 4 小时（< 8 小时
-  token 寿命），保证 worker 内存里 token 一定还没过期就被替换 ——
-  worker 永远不需要自己刷
-- **唯一 /v1/oauth/token 写入者就是主进程** → 物理上不可能撞 RT 轮换
-
-`oauth_refresh.enabled` 默认 true。设为 false 后 worker 回退到自刷新，
-竞态会重现 —— 仅用于排障，生产不应关闭。
-
-详见 §3.7。
-
-### 1.11 可靠性 / 自愈机制
-
-claude TUI + 订阅 OAuth 这条路径有一组反复出现的失败模式：TUI 卡错误屏
-吞了 keystroke，上游 429 给了小错误信封但 TCP 不关，账号被限流让
-请求悄悄挂起永不回，等等。Proxy 不能假设每发请求都健康完成，必须能自
-己接住。当前的兜底层：
-
-| 层 | 触发条件 | 行为 |
-|---|---|---|
-| **mitm intercept timeout**<br>（`worker.py` `WorkerSession.call`） | PTY 触发后 90s 内 mitm 没拦到 `/v1/messages` | 关闭 channel + 清 pending 槽位 + dump PTY 屏幕快照到日志（screen tail + matcher view）。覆盖故障 A：TUI 卡 modal/错误屏吞了 keystroke |
-| **auto-dismiss permission dialog**<br>（`pty_driver.py` `_dismiss_if_dialog`） | drain loop 在 PTY 输出里检测到 `Esc to cancel · Tab to amend` footer | 自动写 `\x1b` (Esc) 到 PTY，dismiss 当前 tool permission 对话框（500ms debounce 防重复发）。覆盖最常见的卡住根因：CC 调用 Bash/Read 等工具时，claude TUI 弹「1. Yes / 2. Yes always / 3. No」对话框吞掉后续 keystroke |
-| **synthetic SSE on empty/non-SSE response**<br>（`api/anthropic.py` `gen`） | 流式 `/v1/messages` 上游返回 0 byte / JSON 错误体 / SSE 半截截断 | 合成完整合法的 Anthropic SSE 序列（含 `usage.input_tokens=0`），错误信息作为 assistant 文本返回。防止下游严格客户端（Claude Code）在 `usage.input_tokens` undefined 时崩 |
-| **drop conflicting `thinking` field**<br>（`mitm/addon.py` `_merge_body`） | merged body 里 `tool_choice.type ∈ {tool, any}` 且 `thinking` 启用 | 自动剔除 `thinking`。Anthropic 拒绝这个组合（400 invalid_request_error），CC sub-agent dispatch 路径上很常见 |
-| **stall watchdog**<br>（`mitm/addon.py` `_FlowState`） | hijack 成功后 90s 内没有任何上游 chunk（或两个 chunk 间隔 > 90s） | 强制给 channel 发 None，唤醒 worker 的 `_handle`。覆盖故障 B：上游沉默不回 response headers；故障 C：上游回了小错误信封后挂起 |
-| **error hook**<br>（`mitm/addon.py` `error`） | mitm 检测到 flow 级错误（TLS 失败、连接 reset、服务端早期 hangup） | 立即关闭 channel，不等 watchdog |
-| **bootstrap prewarm**<br>（`session/manager.py` `_prewarm_bootstrap`） | worker 启动 / 重启 / revive 后立刻 | 发一发 haiku/max_tokens=1 假请求，把 claude CLI 的 lazy bootstrap（eval/grove/penguin_mode/mcp-registry 等 6 个 sibling HTTP 调用）打完。否则首发用户请求会跟 bootstrap 一起在 ~30ms 内发 7+ 个调用，触发 OAuth per-account 限速。**启动阶段**：账号间并行、账号内串行 —— 不同账号 OAuth 独立可并行，同账号多 worker 必须排队避免对同一 OAuth 打 6×N 次突发 |
-| **auto-revive dead worker**<br>（`session/manager.py` `get_or_create`） | 下一发请求到来时检测到 `proc.returncode is not None` | 复用同 mitm 端口就地 restart + prewarm。覆盖 claude CLI crash / OOM kill / mitm 故障 |
-| **scheduled restart**<br>（`session/manager.py` `_restarter`） | worker age > `restart_interval_seconds`（默认 4h） | 等 in-flight 排空（最多 60s）→ restart → prewarm。清掉 Ink 缓冲、内存 transcript、缓存的访问 token |
-| **OAuthRefresher**<br>（`oauth_refresh.py`） | 主进程后台任务，每 5 min 检查 token 寿命 < 1h | 集中刷新写回共享 .credentials.json。详见 §1.10 |
-| **`/admin/workers/{id}/restart`**<br>（`api/admin.py`） | 运维手动调用 | drain in-flight → restart → prewarm，单 worker 立即恢复 |
-| **hedged retry**<br>（`api/anthropic.py` `_open_with_hedge`） | primary worker 10s 内没吐出首字节 | 并发起一个 backup worker（`pick_excluding`，避开 primary），谁先出首字节用谁，loser 后台 drain。把"卡死 worker"对用户的延迟从 90s 砍到 ~10s + backup 响应时间。loser 若 0 字节则计一次 intercept 失败 |
-| **keepalive ping**<br>（`session/session.py` `_keepalive_loop`） | worker 空闲超过 ~15min | 自动发一发 haiku/max_tokens=1 保活，防止 worker 长时间空闲后 V8/PTY 卡死、首发真实请求吃满 90s intercept timeout |
-| **consecutive-failure force-restart**<br>（`session/session.py`） | 同 worker 连续 N 次（默认 2）intercept 失败 | 强制重启该 worker 自愈，不等 4h 定时。一次成功响应清零计数 |
-| **account rate-limit cooldown + 指数退避**<br>（`session/manager.py`） | worker 收到 `rate_limit_error` | 把整个账号标进冷却表，`pick()` 在窗口内跳过；裸无-reset-头的 TPM 尖峰用 per-account 指数退避（120→…→600 封顶），权威 reset 用真实窗口。详见 §3.4 |
-
-**关键认知**：watchdog 只**解开当前那一发卡住的请求**，让 worker 重新
-显示 IDLE，**不重启 worker 进程**。如果 claude TUI 卡在 error state，
-下一发请求过来 PTY 触发可能再 stall 一次 —— 真正修 TUI 状态要靠定时
-restart（4h）或手动 `POST /admin/workers/{id}/restart`。
-
-**根因 vs 兜底**：这些机制是兜底，不是根因修复。多数 stuck 的根因是
-**单 OAuth 账号被多 worker 打超并发限**（订阅大约 2-3 并发上限），或
-**单用户高 TPM 流量打满 per-account 限速**。如果你 pool 配 10 worker 跑
-一个账号，大部分请求会被 429，watchdog 让代理不死但请求实际是空响应。
-彻底解决方向：降单账号 worker 数、加多账号池摊开负载（`accounts:` 已
-支持，见 §3.2），或在上游（LiteLLM）给高 TPM 用户加限速削峰。路由层
-只能重新分配固定的总需求，创造不了容量。
-
-### 1.12 几个关键设计决策
-
-**为什么 worker 要独立子进程？**
-mitmproxy 11 的 DumpMaster + ptyprocess 跟 FastAPI 主循环放一起会出现
-`flow.response.stream` 回调调度异常 + PTY 写字节静默丢失。每个用户一个
-独立 `asyncio.run()` 子进程绕开，副作用是顺带获得崩溃隔离。
-
-**为什么用 PTY 而不是直接拼请求？**
-让真 CLI 跑一遍能保证十几类身份指纹都是它当前版本会发的真值，CLI 升级
-后自动跟上，proxy 代码不用动。
-
-**为什么不直接在 mitm 里造响应、跳过 claude？**
-claude TUI 内部有完整状态机（会话历史、tool 调用栈），如果它发了请求
-却没收到响应，下一次 keystroke 会触发错误恢复路径，可能阻塞或重连。
-让它"看见"响应字节是最简单的同步方式。
-
-**双重 lock 串行化**
-- 主进程 `ClaudeSession.lock`（session.py）：只在 stdin 提交那一瞬间
-  持有，保证 IPC 写入不交错
-- worker `WorkerSession.lock`（worker.py）：从 trigger 一直持到
-  pending.consumed 触发，保证同一 claude PTY 一次只挂一个 PendingRequest
-
-### 1.13 关键代码索引
-
-| 想看什么 | 文件 |
-|---|---|
-| body 合并规则（含 thinking + forced tool_choice 冲突剔除） | `src/mitm/addon.py` `_merge_body` |
-| system 字段合并 | `src/mitm/addon.py` `_merge_system` |
-| 响应流 tap + stall watchdog | `src/mitm/addon.py` `_FlowState` / `responseheaders` / `_tap` / `error` |
-| 用户可覆盖的 body 字段白名单 | `src/mitm/addon.py` `USER_OWNED_BODY_FIELDS` |
-| 流式 `/v1/messages` 上游异常时合成 SSE 错误（防客户端崩） | `src/api/anthropic.py` `gen` / `_synthetic_error_sse` |
-| worker 主循环 + IPC 协议 | `src/worker.py` |
-| mitm intercept 超时时 dump PTY screen tail + matcher view | `src/worker.py` `WorkerSession.call` timeout 分支 |
-| claude TUI 启动 + 等 `❯` | `src/pty_driver.py` `_wait_until_ready` |
-| PTY 输出 ring buffer + ANSI strip + tool permission dialog 自动 Esc | `src/pty_driver.py` `_drain` / `_dismiss_if_dialog` / `dump_screen_tail` |
-| 触发占位符让 claude 发请求 | `src/pty_driver.py` `trigger` |
-| 每用户 HOME seed（共享 `.claude/` 目录） | `src/session/session.py` `_seed_home` |
-| 主进程 session：spawn worker + 读 stdout + 拆 `_submit`/`call` | `src/session/session.py` |
-| user 池负载均衡 + 自动 revive + scheduled restart | `src/session/manager.py` `pick` / `get_or_create` / `_restarter` |
-| bootstrap prewarm（启动 / revive / restart 三处都跑） | `src/session/manager.py` `_safe_prewarm` / `_prewarm_bootstrap` |
-| 集中 OAuth refresh | `src/oauth_refresh.py` `OAuthRefresher` |
-| SSE → 完整 Message 重组（含 error 兜底） | `src/api/anthropic.py` `_collapse_stream` |
-| OpenAI ↔ Anthropic 字段转换（含 usage 终态 chunk） | `src/api/translate.py` `anthropic_sse_to_openai_sse` |
-| `/healthz` `/status` `/admin/*` `/ui` | `src/main.py` + `src/api/admin.py` |
-| 监控面板（dark theme HTML/JS dashboard） | `src/static/admin.html` |
-| token → user 池 + 头部解析 | `src/auth.py` + `src/config.py` |
-| 所有 timeout 配置项 | `src/config.py` `TimeoutConfig` + `OAuthRefreshConfig` |
-
----
-
-## 2. Docker 部署
-
-部署后的关键事实：
-
-| 项 | 值 |
-|---|---|
-| 对外端口 | **`18787`**（宿主机）→ 容器内 `8787` |
-| 容器运行用户 | `coder`，**uid/gid 1000**（compose 里 `user: "1000:1000"`） |
-| 凭据来源 | 宿主机 `/data/shared-auth/` → bind 到容器 `/data/shared-auth/`（**读写**，token 刷新要写回）；子目录如 `claude-1` / `claude-2` 各代表一个账号 |
-| per-user 状态 | 项目目录下 `./users/` → bind 到容器 `/data/users` |
-| mitm CA | 具名卷 `mitm-ca` → 容器 `/home/coder/.mitmproxy`，重启保留 |
-| 配置文件 | 项目目录下 `./config.yaml` → bind 到容器 `/data/config.yaml`（只读） |
-
-### 2.1 前置条件
-
-部署机器：
-
-- Docker 24+ 和 Docker Compose v2
+- Docker 24+，Docker Compose v2
+- 至少一台已经 `claude /login` 完成的机器（拷贝凭据用）
 - 宿主机端口 `18787` 可用
-- 容器内端口段 `18000..18000+N`（N = 用户数）保留给 mitm，不对外暴露
 
-另需一台已经 `claude /login` 完成 OAuth 的机器（凭据可以拷过去）。
+### Step 1 — 准备账号凭据
 
-### 2.2 准备账号凭据目录
+每个 Claude 账号一个目录，含**两个文件**：
 
-每个 Claude 订阅账号准备一个**自包含目录**放进 `/data/shared-auth/`，
-里面必须有两个文件：
-
-| 文件 | 来源 | 作用 |
-|---|---|---|
-| `<dir>/.credentials.json` | `claude /login` 后的 `~/.claude/.credentials.json` | OAuth token + 订阅信息 |
-| `<dir>/.claude.json` | 同次 login 的 `~/.claude.json`（sibling 文件，不在 `.claude/` 里面） | `oauthAccount` 身份块；缺了 TUI 会显示 `Not logged in`，prewarm 永久 timeout |
+| 文件 | 来源 |
+|---|---|
+| `.credentials.json` | `~/.claude/.credentials.json`（login 后生成） |
+| `.claude.json` | `~/.claude.json`（**`.claude/` 的兄弟文件，不在里面**） |
 
 ```bash
-# 在源机器（已经 claude /login 完成的）上拷出两件
-ssh <账号 1 源机器> '
-  tar -C ~ -cf - .claude .claude.json
-' > /tmp/acc1.tar
+# 在已登录的机器上打包
+tar -C ~ -cf /tmp/acc1.tar .claude .claude.json
 
-# 在部署机上摆好位置 —— 目录名就叫 claude-1
+# 在部署机上摆好（目录名约定为 claude-N）
 sudo mkdir -p /data/shared-auth/claude-1
-sudo tar -C /tmp -xf /tmp/acc1.tar
-sudo mv /tmp/.claude/*           /data/shared-auth/claude-1/    # .claude 内容
-sudo mv /tmp/.claude/.[!.]*      /data/shared-auth/claude-1/ 2>/dev/null  # 隐藏文件
-sudo mv /tmp/.claude.json        /data/shared-auth/claude-1/.claude.json
-sudo rmdir /tmp/.claude
-
-# 账号 2 同理（命名为 claude-2）
-...
-
+sudo tar -C /data/shared-auth/claude-1 -xf /tmp/acc1.tar --strip-components=1
+sudo mv /data/shared-auth/claude-1/.claude/* /data/shared-auth/claude-1/
+sudo mv /data/shared-auth/claude-1/.claude/.[!.]* /data/shared-auth/claude-1/ 2>/dev/null
+sudo rmdir /data/shared-auth/claude-1/.claude
 sudo chown -R 1000:1000 /data/shared-auth
-
-# 验证每个账号都齐全
-for d in /data/shared-auth/claude-*; do
-  [ -f "$d/.credentials.json" ] && [ -f "$d/.claude.json" ] \
-      && echo "✓ $d" || echo "✗ $d 缺东西"
-done
 ```
 
-> **⚠️ 用 `cp -r ~/.claude X` 时 `.claude.json` 不会被一起带走** ——
-> `.claude.json` 是 `~/.claude/` 的**兄弟文件**，不在它里面。必须单独拷。
-> 完成后，每个账号目录都是一个自包含的 unit，docker-compose 里一行
-> bind mount 就能挂进去。
+> `cp -r ~/.claude X` 不会带上 `.claude.json`——它是兄弟文件，必须单独拷。少了它 TUI 显示 `Not logged in`，worker 永远 prewarm 失败。
 
-> **凭据共享机制（多账号）**：每个账号目录被 symlink 给该账号下的所有
-> worker（`accounts:` 中 `workers: N` 决定数量）。同账号的 N 个 worker
-> 共享同一份 OAuth；不同账号互不影响。主进程 `OAuthRefresher` 是每个
-> `.credentials.json` 的**唯一写者**，遍历所有账号定期检查并刷新 —— 没
-> 有跨 worker 抢 refresh_token 轮换的竞态。
->
-> claude CLI 刷新 token 时（写 tmp + rename）原子地写回各自的账号目录，
-> 同账号 worker 立即看到新 token；容器重启也还在。
-
-**只有一个账号**？直接命名 `/data/shared-auth/claude-1` 也行 ——
-`accounts:` 写一个就够了。或者沿用旧的单账号布局（见 §3.2 末尾）。
-
-如果你在源头**重新登录**（refresh token 被轮换作废），需要把新的
-`.claude/` 重新同步到对应的 `claude-N` 子目录。
-
-### 2.3 写 config.yaml
+### Step 2 — 写 `config.yaml`
 
 ```bash
 cp config.example.yaml config.yaml
-# 或者 cp docker/config.example.yaml config.yaml
-# 两个 example 都已经是容器内绝对路径，可以直接 cp 后只改 users 字段
+echo "sk-internal-$(openssl rand -hex 24)"   # 生成对外 key
 ```
 
-生成 API key：
-
-```bash
-echo "sk-internal-$(openssl rand -hex 24)"
-```
-
-最终 `config.yaml`（**Docker 部署必须用绝对路径**）：
+最小可用配置：
 
 ```yaml
 listen_host: 0.0.0.0
 listen_port: 8787
-
 mitm:
   port_base: 18000
   ca_cert: /home/coder/.mitmproxy/mitmproxy-ca-cert.pem
-
 claude:
   binary: claude
   home_template: /data/users/{user_id}
-  # 4h: worker 周期性就地重启清掉 CLI 状态。必须 < OAuth token 寿命
-  # (~8h)，否则 worker 内存里 token 过期会尝试自刷新跟主进程 refresher
-  # 撞 RT 轮换（详见 §1.10 / §3.7）。
-  restart_interval_seconds: 14400
+  restart_interval_seconds: 14400        # 4h，必须 < OAuth 寿命（~8h）
 
-  # 所有 timeout 都有合理默认；只在确实看到对应失败时再调（详见 §3.6）
-  # timeouts:
-  #   mitm_intercept_seconds: 90
-  #   status_stall_seconds: 30
-  #   response_stall_seconds: 90
-  #   restart_drain_seconds: 60
-  #   worker_ready_seconds: 60
-  #   prewarm_seconds: 60
-  #   restart_check_interval_seconds: 60
-
-# 集中 OAuth 刷新；多账号模式下遍历每个账号的 .credentials.json
-# oauth_refresh:
-#   enabled: true
-#   check_interval_seconds: 300
-#   refresh_when_expires_within_seconds: 3600
-
-# 多账号：每个账号 N 个 worker，user_id 自动生成为 <账号>-0..<账号>-(N-1)
 accounts:
   claude-1:
     dir: /data/shared-auth/claude-1
-    workers: 5
+    workers: 5                            # 单账号 5 worker 是经验上限
   claude-2:
     dir: /data/shared-auth/claude-2
     workers: 5
 
-# 对外只有一个 key，pool 包含所有账号的全部 worker。SessionManager.pick
-# 在跨账号 + 跨 worker 上做空闲优先 + RR 调度。
-api_key: sk-internal-abc...
+api_key: sk-internal-...                 # 对外单 key，pool 所有 worker
 ```
 
-> `ca_cert` 和 `home_template` **必须是绝对路径**。写成 `./` 或 `~`
-> 开头，entrypoint 会拒绝启动 —— worker 子进程的 CWD 是 `/app`
-> （root 所有、不可写），相对路径会被解析到那里然后崩。
+> 路径必须**绝对**——worker 子进程 CWD 是 `/app`，相对路径会解析错位置。
 
-> **pool 大小要保守**：Anthropic 订阅有 per-OAuth 隐含并发限制（约 2-3
-> 并发）。pool 配 10 个 worker 共用一个账号 = 7-8 倍超限，大部分请求
-> 会被 429 而 stuck。建议单账号 pool ≤ 3。
+### Step 3 — 改 docker-compose 的 volumes
 
-### 2.4 宿主机目录权限
+每个账号一行 bind mount（漏了会启动时报 `Missing: /data/shared-auth/claude-N/.credentials.json`）：
 
-compose 里 `user: "1000:1000"` 让容器**直接以 uid 1000 启动** ——
-所以容器要写的 bind 目录必须在宿主机侧就归 uid 1000：
-
-```bash
-cd claude-subscription-proxy
-
-# per-user 状态目录
-mkdir -p ./users
-sudo chown -R 1000:1000 ./users
-
-# 账号凭据目录：claude CLI 刷新 token 要写回每个账号
-sudo chown -R 1000:1000 /data/shared-auth
+```yaml
+volumes:
+  - ./config.yaml:/data/config.yaml:ro
+  - /data/shared-auth/claude-1:/data/shared-auth/claude-1
+  - /data/shared-auth/claude-2:/data/shared-auth/claude-2
+  - mitm-ca:/home/coder/.mitmproxy
+  - ./users:/data/users
+  - ./data:/data/proxy                   # usage.db 落这里
 ```
 
-| 宿主机目录 | 容器内路径 | 权限要求 |
-|---|---|---|
-| `./users` | `/data/users` | uid 1000 **可写** |
-| `/data/shared-auth/` | `/data/shared-auth/` | uid 1000 **可读写**（每个 `claude-N` 子目录是一个账号） |
-| `mitm-ca`（具名卷） | `/home/coder/.mitmproxy` | 首次自动从镜像填充 |
-| `./config.yaml` | `/data/config.yaml` | uid 1000 可读即可 |
-
-> Docker bind mount **不做 uid 翻译**：宿主机文件的数字 uid 原样出现在
-> 容器里。容器内的 `coder` 是 uid 1000，所以宿主机目录必须也归 1000。
-
-不想管这些权限：去掉 compose 里 `user: "1000:1000"` 那行，让容器以
-root 启动；entrypoint 会自动 `chown` 好后 `gosu` 降权到 `coder`。
-
-### 2.5 构建并启动
+### Step 4 — 启动
 
 ```bash
+sudo mkdir -p ./users ./data
+sudo chown -R 1000:1000 ./users ./data
+
 docker compose up --build -d
 docker compose logs -f proxy
 ```
 
-首次构建 4–6 分钟（下载 Node 20 + claude code npm + python 包）。
-之后 `docker compose up -d` 秒级启动。
+启动需要 ~30s（账号间并行 bootstrap，账号内串行预热每个 worker）。`bootstrap prewarm complete` 出现就可以打了。
 
-健康检查：
-
-```bash
-curl -s http://127.0.0.1:18787/healthz
-# → {"ok":true,"sessions":["litellm-0","litellm-1","litellm-2"],
-#    "claude_version":"2.1.139 (Claude Code)"}
-```
-
-启动后容器会**并行预热所有账号**（每账号链内串行，每个 worker ~10s），
-日志里能看到：
-
-```
-oauth refresher started accounts=2 check_interval=300s refresh_when_expires_within=3600s
-session up user=claude-1-0 worker_pid=N mitm_port=18000
-session up user=claude-2-0 worker_pid=M mitm_port=18005
-bootstrap prewarm starting user=claude-1-0
-bootstrap prewarm starting user=claude-2-0
-bootstrap prewarm complete user=claude-1-0
-bootstrap prewarm complete user=claude-2-0
-prewarmed user=claude-1-0
-prewarmed user=claude-2-0
-session up user=claude-1-1 worker_pid=... mitm_port=18001
-...
-```
-
-`bootstrap prewarm` 这一步会发一发 haiku/max_tokens=1 假请求，让 claude
-CLI 把 lazy bootstrap（6+ 个 sibling HTTP 调用）打完，避免首发真实请求
-跟它们撞同一秒触发 OAuth per-account 限速（详见 §1.11）。
-
-### 2.6 发第一个请求
+### Step 5 — 第一发请求
 
 ```bash
 KEY=sk-internal-...
@@ -809,536 +131,107 @@ curl -sS -X POST http://127.0.0.1:18787/v1/messages \
   }'
 ```
 
-**预期**：
+响应里 `usage.cache_read_input_tokens > 0` 说明走的是订阅配额（CLI 系统 prompt 命中缓存）。
 
-- 首次请求 ~7s（worker 冷启动：mitm + claude TUI + Ink 稳定 2.5s）
-- 后续请求 1–2s TTFB
-- 响应 JSON 含 `"stop_reason": "end_turn"` 和 `cache_read_input_tokens > 0`
-  （命中 CLI 系统 prompt 缓存的证据，说明走的是订阅配额）
-
-### 2.7 验证 user 池负载均衡
-
-并发打三发，看哪几个 worker 接到：
-
-```bash
-KEY=sk-internal-...
-for i in 1 2 3; do
-  curl -sS -X POST http://127.0.0.1:18787/v1/messages \
-    -H "Authorization: Bearer $KEY" \
-    -d '{"model":"claude-sonnet-4-6","max_tokens":16,
-         "messages":[{"role":"user","content":"hi"}]}' >/dev/null &
-done
-wait
-docker compose logs --tail=300 proxy | grep -E "submitted req|hijacked outbound"
-```
-
-期望看到三行不同 user：
-
-```
-INFO src.session.session   user=litellm-0 submitted req id=N
-INFO src.session.session   user=litellm-1 submitted req id=M
-INFO src.session.session   user=litellm-2 submitted req id=K
-INFO worker:src.mitm.addon user=litellm-0 hijacked outbound /v1/messages flow=...
-INFO worker:src.mitm.addon user=litellm-1 hijacked outbound /v1/messages flow=...
-INFO worker:src.mitm.addon user=litellm-2 hijacked outbound /v1/messages flow=...
-```
-
-### 2.8 停止 / 重启 / 加账号 / 加用户
-
-```bash
-docker compose down              # 停止；./users/ 里的 per-user 状态保留
-docker compose restart proxy     # 改了 config.yaml 后热重启
-docker compose down -v           # 同时清除 mitm CA 卷（下次重新生成）
-```
-
-**加账号**（multi-account 模式）—— **三处必须同时改**：
-
-1. **宿主机准备目录**：把已登录的 `.claude/` + `.claude.json` 放到
-   `/data/shared-auth/claude-N/`（参考 §2.2），`chown -R 1000:1000`
-2. **`docker-compose.yml`** 的 `volumes:` 段加一行 bind mount：
-
-   ```yaml
-   - /data/shared-auth/claude-3:/data/shared-auth/claude-3
-   ```
-
-   **漏这步**会导致 entrypoint 报 `Missing: /data/shared-auth/claude-3/.credentials.json`，因为容器里看不到目录。
-3. **`config.yaml`** 的 `accounts:` 段加一段：
-
-   ```yaml
-   claude-3:
-     dir: /data/shared-auth/claude-3
-     workers: 5
-   ```
-
-然后 `docker compose up -d --force-recreate`（不能只 restart，新挂载需要重建容器）。
-
-**加用户 / 改 API key 路由**：legacy 模式或多账号 + 显式 `users:`
-时，在 `config.yaml` 的 `users:` 下加一行 / 加进 list，然后
-`docker compose restart proxy`。新 user 首次请求时 `./users/<id>/`
-自动创建。
-
-### 2.9 暴露给其他主机
-
-`docker-compose.yml` 默认把 `18787` 绑到 `0.0.0.0`，**局域网内其他主机
-可以直接访问**（用来接 LiteLLM 等）。强烈建议：
-
-- 仅在受信任的内网开放
-- 或前置一层反向代理（nginx / caddy）做 TLS + IP 白名单
-- **绝不要暴露到公网** —— 项目无速率限制，且违反 ToS
-
-仅本机访问：把 `ports` 改成 `"127.0.0.1:18787:8787"`。
-换端口：改 `ports` 左边的 `18787`，容器内的 `8787` 保持不动。
-
-### 2.10 运维：`/status` 和 `/admin/*`
-
-`/healthz` 保持开放（给 docker / k8s liveness probe 用）。`/status` 和
-所有 `/admin/*` **需要鉴权** —— 复用 §3.2 配置的任何一个 API key。
-
-**`/status`** —— 每 worker 实时状态，区分 IDLE / WORKING / STUCK：
-
-```bash
-KEY=sk-internal-...
-curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/status | jq -r '
-  .workers[] |
-  if .in_flight == 0 then
-    "🟢 IDLE     \(.user_id)  idle=\(.idle_seconds)s  total=\(.total_requests)"
-  elif .stuck then
-    "🔴 STUCK    \(.user_id)  busy=\(.in_flight)  stalled=\(.in_flight_detail[0].stalled_seconds)s  bytes=\(.in_flight_detail[0].bytes_received)"
-  else
-    "🟡 WORKING  \(.user_id)  busy=\(.in_flight)  age=\(.in_flight_detail[0].age_seconds)s  bytes=\(.in_flight_detail[0].bytes_received)"
-  end
-'
-```
-
-关键字段：
-
-| 字段 | 含义 |
-|---|---|
-| `worker_count` / `alive_count` / `busy_count` / `stuck_count` | 顶层汇总。**真在干活 = busy_count - stuck_count** |
-| `claude_version` | 启动时 `claude --version` 的输出（升级后第一时间核对版本是否真的 pin 上了） |
-| `workers[].in_flight` / `stuck` | 当前挂了几个请求 / 任一 stalled > status_stall_seconds |
-| `workers[].in_flight_detail[].bytes_received` | 已收到上游字节数；0 = 上游还没回过；150-170 = 典型错误信封大小 |
-| `workers[].in_flight_detail[].stalled_seconds` | 距上次收到字节多久；> 30s 标 stuck，> 90s watchdog 自动回收 |
-| `workers[].in_flight_detail[].body.last_user_preview` | 当前请求 last user message 前 2000 字符（便于定位"所有 worker 卡同一个 prompt"的模式；`/ui` hover 显完整） |
-| `workers[].in_flight_detail[].body.litellm` | LiteLLM 透传的 `x-litellm-user-api-key-*` 头部（user_id/alias/team_id/spend 等），用于归属来自 LiteLLM 的请求到原始 virtual key 用户。需 LiteLLM ≥ v1.85.0 + `add_user_information_to_llm_headers: true`，详见 §4.4 |
-
-**`/admin/*`** —— 运维不重启容器做配置和 worker 控制：
-
-```bash
-KEY=sk-internal-...
-
-# 改 config.yaml 后热重载（详见 §3.5）
-curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/admin/reload
-
-# 单独重启一个 worker（不用等 4h 定时；drain in-flight → restart → prewarm）
-curl -X POST -H "Authorization: Bearer $KEY" \
-  http://127.0.0.1:18787/admin/workers/litellm-0/restart
-
-# 立即强刷一次 OAuth token（跳过 5min 周期）
-curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/admin/refresh-now
-
-# 查询 token 用量统计（按账号/worker/litellm 用户聚合，详见 §2.12 / §3.8）
-curl -s -H "Authorization: Bearer $KEY" \
-  "http://127.0.0.1:18787/admin/usage?range=today&group_by=account" | jq
-
-# 手动设置某账号已限流 / 解除限流标记（自动检测足够时一般用不到）
-curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"reset_at":"May 27, 12am UTC","reason":"weekly_limit"}' \
-  http://127.0.0.1:18787/admin/accounts/claude-1/set-rate-limit
-curl -X POST -H "Authorization: Bearer $KEY" \
-  http://127.0.0.1:18787/admin/accounts/claude-1/clear-rate-limit
-```
-
-返回示例：
-
-```json
-// /admin/reload
-{
-  "ok": true,
-  "changes": [
-    "claude.timeouts.status_stall_seconds: 30.0 -> 60.0",
-    "users tokens: +1 -0",
-    "users added (prewarmed): [\"litellm-3\"]"
-  ],
-  "warnings": [
-    "listen_port: 8787 -> 9000 (ignored — requires container restart)"
-  ]
-}
-
-// /admin/refresh-now
-{"ok": true, "result": "refreshed"}    // 或 "not_needed" / "failed"
-```
-
-> 早期版本曾内置过订阅配额查询（`/api/oauth/usage` 拉取 5h / 7d 用量），后来移除——这个 endpoint 限速极严，被 429 一次就要 cooldown 至少 1 小时，且 cooldown 状态会让 claude CLI 自身的状态查询失败、间接影响 TUI 行为，性价比太低。订阅用量可以直接登录 claude.ai 查看。
+监控面板：`http://YOUR-HOST:18787/ui`，输入 API key 即可。
 
 ---
 
-### 2.11 监控面板 `/ui`
+## 2. 配置
 
-浏览器打开 `http://YOUR-HOST:18787/ui` —— 一个内嵌的深色单页面板，分三个区块：
+### 2.1 字段总览
 
-| 区块 | 内容 |
-|---|---|
-| **顶部 app bar** | brand + API Key 输入 + 全局动作（重新加载 config / 刷新 OAuth 凭据） |
-| **系统概览** | CLI 版本、存活 worker、活跃数、异常数；多账号模式额外显示已限流账号数 / 不可用账号数 |
-| **账号配额状态** | 多账号模式才显示。每个账号一行 + 当前 issue 徽章（已限流 / 不可用 / 正常）+ 恢复时间。已限流 = 路由跳过 |
-| **用量统计** | 按账号 / worker / LiteLLM 用户聚合的 token 消耗 + 估算 USD；范围切换：当前生命周期 / 今天 (UTC) / 最近 7 天。行可展开看 by_model 拆分。详见 §2.12 |
-| **Worker 运行状态** | 每个 worker 一行：用户 / 账号 / 状态徽章 / 模型 / LiteLLM 用户 / 运行+空闲时长 / 累计请求 / 进行中 / 当前任务（preview hover 显完整文本）/ 重启按钮 |
+| 字段 | 默认 | 热重载 | 说明 |
+|---|---|---|---|
+| `listen_port` | 8787 | ❌ | FastAPI 端口；Docker 里固定 8787，宿主映射到 18787 |
+| `mitm.port_base` | 18000 | ❌ | mitm 端口起点，user N 用 `port_base + N` |
+| `mitm.ca_cert` | — | ❌ | mitm CA 路径；首次启动自动生成 |
+| `claude.restart_interval_seconds` | 14400 | ✅ | worker 定时重启间隔；必须 < OAuth 寿命（~8h） |
+| `claude.session_affinity` | true | ✅ | 同一会话路由到同一账号，保 prompt cache |
+| `claude.session_affinity_ttl_seconds` | 600 | ✅ | 空闲会话绑定的 TTL |
+| `claude.rate_limit_base_cooldown_seconds` | 120 | ✅ | 裸 429（无 reset 头）首次冷却 |
+| `claude.rate_limit_max_cooldown_seconds` | 600 | ✅ | 指数退避封顶 |
+| `claude.timeouts.*` | 见下 | ✅ | 7 个细分 timeout |
+| `oauth_refresh.enabled` | true | ✅ | 主进程集中刷 OAuth；关掉只用于排障 |
+| `oauth_refresh.check_interval_seconds` | 300 | ✅ | 刷新检查周期 |
+| `oauth_refresh.refresh_when_expires_within_seconds` | 3600 | ✅ | 距过期 < 此值就刷 |
+| `usage.enabled` | true | ❌ | token 用量记录（sqlite + /admin/usage + UI 面板） |
+| `usage.db_path` | `/data/proxy/usage.db` | ❌ | sqlite 文件路径，务必落在 bind 挂载内 |
+| `accounts` | — | ❌ | 账号 → `{dir, workers, priority}` 映射 |
+| `api_key` | — | ❌ | 对外单 key，pool 所有 worker |
+| `users` | — | ✅ | `token → user_id` 映射；可替代 `api_key` 做细粒度路由 |
 
-**鉴权**：HTML 本身不要 auth（浏览器初次 GET 无法带 header），但 JS 调的 `/status`、`/admin/*` 全部走 Bearer auth。API Key 输入后存在 `localStorage`，刷新页面会自动恢复。
+**timeouts 子项**（默认值，仅在确实看到对应失败时调）：
 
-**Worker 状态徽章**：
-
-- 🟢 空闲 — `in_flight == 0`
-- 🟡 处理中 — `in_flight > 0` 且 stalled ≤ status_stall_seconds
-- 🔴 异常 — 任一请求 stalled > status_stall_seconds（30s 默认）
-- 🟠 已限流 — 所属账号撞了 Anthropic 5h / 7day 限额（`issue_kind = rate_limit`），路由跳过；窗口到期自动恢复
-- 🔴 不可用 — 所属账号 prewarm 失败或状态未知（`issue_kind = degraded`），路由跳过；多为权限 / 凭据问题，查 docker logs
-- ⚫ 已停止 — 进程已退出
-
-**当前任务**列含三类计数（多请求时显示）：
-
-- **处理中 N** — `bytes_received > 0`（正在接收 SSE）
-- **排队中 N** — `bytes_received == 0` 且 age < 30s（在 worker 内部等 PTY 锁）
-- **卡死 N** — `stalled_seconds > 30s`
-
-注意 `in_flight = 处理中 + 排队中 + 卡死`。一个 worker 的 PTY 一次只能服务一个模型调用，所以"处理中"通常是 1；其它都是排队等 PTY 锁。
-
-**消息预览 hover**：last user message 服务端截断到 2000 字符，鼠标悬停在 preview pill 上时弹出完整内容浮层（`position: fixed`，自动避让视口边缘）。
-
-**自动刷新**：默认 1 分钟，下拉可选 5s / 10s / 30s / 1min / 5min / 关。选择持久化到 `localStorage`。
-
----
-
-### 2.12 用量统计
-
-每次完成的 `/v1/messages` 都会被 mitm 流式解析（`message_start` + `message_delta`），抓出 input / output / cache_creation / cache_read 四组 token 数，按账号 + worker + LiteLLM 用户 + 模型写一行 sqlite。`/ui` 的「用量统计」面板和 `/admin/usage` 端点都基于这张表。
-
-**特性**：
-
-- **持久化** — sqlite 文件 bind 到宿主机（`./data/usage.db`），容器重建后 7 天历史还在
-- **零侵入** — 解析在 SSE tap 里完成，跳过 `"usage"` 子串不存在的 chunk；正常 traffic 看不出 CPU 抖动
-- **范围切换** — 当前 worker 生命周期 / 今天 (UTC) / 最近 7 天三种
-- **维度切换** — 按账号 / 按 worker / 按 LiteLLM 用户三种聚合
-- **估算 USD** — 按 Anthropic 公开 API 价目表换算；订阅账号实际按月计费，**金额仅供参考**
-
-`/admin/usage` 直接调用：
-
-```bash
-KEY=sk-internal-...
-
-# 今天，按账号
-curl -s -H "Authorization: Bearer $KEY" \
-  "http://127.0.0.1:18787/admin/usage?range=today&group_by=account" | jq
-
-# 最近 7 天，按 LiteLLM 用户
-curl -s -H "Authorization: Bearer $KEY" \
-  "http://127.0.0.1:18787/admin/usage?range=7d&group_by=litellm_user" | jq
-
-# 当前活着的 worker 生命周期内（按 worker 拆）
-curl -s -H "Authorization: Bearer $KEY" \
-  "http://127.0.0.1:18787/admin/usage?range=lifecycle&group_by=worker" | jq
-```
-
-**LiteLLM 用户识别**：从转发头 `x-litellm-user-api-key-alias`（优先）→ `x-litellm-user-id` → `x-litellm-user-api-key-hash` 里第一个非空。要在 LiteLLM 端 enable `add_user_information_to_llm_headers: true` 才会有这些头（见 §4.4）。没有该头的请求，`litellm_user` 列为 `(none)`。
-
-**关掉**：`config.yaml` 设 `usage.enabled: false`（worker 仍会发送 IPC 但主进程不写盘）。**重置历史**：`docker compose down && rm ./data/usage.db && docker compose up -d`。
-
----
-
-## 3. 配置说明
-
-### 3.1 config.yaml 字段总览
-
-| 字段 | 含义 | 热重载？ |
+| 字段 | 默认 | 说明 |
 |---|---|---|
-| `listen_host` | FastAPI 绑定地址。Docker 内固定 `0.0.0.0` | ❌ 需重启容器 |
-| `listen_port` | FastAPI 容器内端口；固定 `8787` | ❌ 需重启容器 |
-| `mitm.port_base` | 第一个 mitm 监听端口；user 1→18000，user 2→18001… | ❌ 需重启容器 |
-| `mitm.ca_cert` | mitm CA PEM 路径；首次启动自动生成。Docker 里 `/home/coder/.mitmproxy/mitmproxy-ca-cert.pem` | ❌ 需重启容器 |
-| `claude.binary` | `claude` 二进制；镜像里已在 `$PATH` | ❌ 需重启容器 |
-| `claude.home_template` | 每用户隔离 `$HOME` 路径模板。Docker 里 `/data/users/{user_id}` | ❌ 需重启容器 |
-| `claude.restart_interval_seconds` | 定时重启间隔。默认 14400（4h）。必须 < OAuth token 寿命 (~8h)（详见 §3.7） | ✅ `/admin/reload` |
-| `claude.session_affinity` | 会话亲和路由：同一对话固定到同一账号，保持上游 prompt cache 命中。默认 `true`；账号被限流 / 无可用 worker 时自动退回 round-robin（详见 §1.9） | ✅ `/admin/reload` |
-| `claude.session_affinity_ttl_seconds` | 空闲对话保留账号绑定的时长，默认 600；每次请求刷新，活跃对话不过期 | ✅ `/admin/reload` |
-| `claude.rate_limit_base_cooldown_seconds` | 裸 `rate_limit_error`（无 reset 头 = 滚动 TPM/RPM 尖峰）的首次冷却，默认 120；指数退避基数（详见 §3.4） | ✅ `/admin/reload` |
-| `claude.rate_limit_max_cooldown_seconds` | 上述退避的封顶冷却，默认 600（10min） | ✅ `/admin/reload` |
-| `claude.timeouts.*` | 7 个 timeout 微调（详见 §3.6） | ✅ 部分立即生效，部分下次 spawn 才生效 |
-| `oauth_refresh.*` | 主进程集中刷每个账号的 OAuth token（详见 §3.7） | ✅ `enabled` 切换会立即起/停后台任务 |
-| `usage.*` | token 用量记录（sqlite + `/admin/usage` + `/ui` 用量统计面板，详见 §3.8） | ❌ 需重启容器（enabled 切换不热重载） |
-| `accounts` | `账号名 → {dir, workers}` 映射；每个账号生成 `workers` 个 worker，user_id 自动取名 `<账号>-0..<账号>-(N-1)` | ❌ 需重启容器 |
-| `api_key` | 多账号模式下的对外单 key，自动 pool 所有 worker | ❌ 需重启容器（要修改 pool 拓扑） |
-| `users` | `bearer_token → user_id` 映射；可以替代 `api_key` 做细粒度路由。值可以是字符串（单 worker）或字符串列表（pool） | ✅ 新增自动 prewarm，删除自动 stop worker |
+| `mitm_intercept_seconds` | 90 | PTY 触发后 mitm 多久没拦到 `/v1/messages` 就放弃 |
+| `status_stall_seconds` | 30 | `/status` 标 `stuck` 的阈值 |
+| `response_stall_seconds` | 90 | mitm watchdog 强制关闭 channel 的阈值 |
+| `restart_drain_seconds` | 60 | 重启时等 in-flight 排空的最长时间 |
+| `worker_ready_seconds` | 60 | 新 worker `{"type":"ready"}` 超时 |
+| `prewarm_seconds` | 60 | bootstrap prewarm 上限 |
+| `restart_check_interval_seconds` | 60 | `_restarter` 巡检间隔 |
 
-### 3.2 多账号 schema 与 users 字段
+### 2.2 账号路由优先级
 
-**多账号模式（推荐）**：
+`accounts.<name>.priority`（默认 100，**越小越优先**）。picker 在同 tier 内空闲优先 + 最低 burn + 防扎堆；只有当上层 tier 全部 cool-idle 都没有时才下沉到下层。
 
 ```yaml
 accounts:
-  claude-1:                              # 账号名
-    dir: /data/shared-auth/claude-1      # 容器内路径，对应宿主机同名目录
-    workers: 5                           # 该账号 worker 数；user_id 自动生成
-  claude-2:
-    dir: /data/shared-auth/claude-2
-    workers: 5
-
-api_key: sk-internal-master              # 单一对外 key，pool 全部 worker
+  claude-max-1: { dir: /data/shared-auth/claude-max-1, workers: 5, priority: 100 }
+  claude-max-2: { dir: /data/shared-auth/claude-max-2, workers: 5, priority: 100 }
+  claude-pro-1: { dir: /data/shared-auth/claude-pro-1, workers: 3, priority: 200 }
 ```
 
-校验时自动展开成等价的 `users:`：
+Max 满了才溢出到 Pro，避免低单价账号被过早烧。
 
-```yaml
-users:
-  sk-internal-master: [claude-1-0, claude-1-1, ..., claude-2-4]
-```
+### 2.3 限流与并发
 
-**多 key 路由（少数场景）**：`accounts:` + `users:` 同时存在，
-`users:` 里的 user_id 必须能匹配自动生成的集合：
+- **单账号 worker 数建议 ≤ 5**——Anthropic 订阅有 per-OAuth 并发限制（实测 2-3），再多撞 429
+- **配额按车道分离**：sonnet 子配额 / 5h / 7d unified 各自独立；某账号 sonnet 满了，opus 仍可路由到同账号（lane-aware routing）
+- **会话亲和优先**：默认开。同会话固定到同账号保持 prompt cache 命中（cache miss = 重新写 50k+ tokens，比限流损失更大）
+- **冷却策略**：
+  - 有权威 reset header → 用真实窗口
+  - 裸 429 无 reset → per-account 指数退避（120 → 240 → 480 → 600 封顶）
+  - 推断的 weekly_limit 上限 2h（防止单次 429 锁死账号一周）
+  - 5h pinned 标记允许 success-demote（5h 滑动窗常常比 reset_at 提前释放）
+
+### 2.4 多 key 路由（少数场景）
+
+`accounts:` + `users:` 同时存在，`users:` 把自动生成的 user_id 分成几组：
 
 ```yaml
 accounts:
   claude-1: { dir: /data/shared-auth/claude-1, workers: 5 }
   claude-2: { dir: /data/shared-auth/claude-2, workers: 5 }
-
 users:
   sk-team-a: [claude-1-0, claude-1-1, claude-1-2, claude-1-3, claude-1-4]
   sk-team-b: [claude-2-0, claude-2-1, claude-2-2, claude-2-3, claude-2-4]
 ```
 
-**Legacy 单账号模式（兼容旧部署）**：不写 `accounts:`、不写 `api_key:`，
-只用 `users:`。每个 worker symlink 到容器的 `~/.claude`（旧 compose
-还把 `/data/shared-auth/claude` bind 到那里时才会成立）：
-
-```yaml
-users:
-  sk-internal-abc: alice                    # 单 worker
-  sk-internal-def:                          # 3 worker 池
-    - litellm-0
-    - litellm-1
-    - litellm-2
-```
-
-调度逻辑（适用所有模式，完整分层见 §1.9）：
-
-1. 客户端用某个 token 发请求 → 鉴权拿到对应的 user 列表
-2. 过滤掉处在限流冷却窗口内的账号（除非全部都在冷却）
-3. 会话亲和（默认开）：同一对话优先回到上次的账号（命中 cache）
-4. 空闲优先（cool-idle > warm-idle），同层 round-robin
-5. 全忙时挑 in-flight 最少的；同 min 时 RR
-
-每个 user_id 都会占一个 mitm 端口（`port_base + N`），所以 2 账号 × 5
-worker 占 10 个端口；预热时间约 5 × 10s（账号间并行，账号内串行 ——
-见 §1.11）。
-
-### 3.3 docker-compose.yml 关键项
-
-| 项 | 当前值 | 说明 |
-|---|---|---|
-| `user` | `"1000:1000"` | 容器直接以 uid 1000 启动；宿主机 bind 目录需归 1000（§2.4） |
-| `ports` | `"0.0.0.0:18787:8787"` | 宿主 18787 → 容器 8787 |
-| `volumes` | `./config.yaml:/data/config.yaml:ro` | 配置，只读 |
-| | `/data/shared-auth/claude-N:/data/shared-auth/claude-N` | 每个账号一行；自包含目录，含 `.credentials.json` + `.claude.json`。**读写**（token 刷新写回） |
-| | `mitm-ca:/home/coder/.mitmproxy` | mitm CA 具名卷 |
-| | `./users:/data/users` | per-user 隔离 HOME |
-
-### 3.4 配额与并发
-
-- **同一个 user 的请求串行执行**（claude TUI worker 一次只跑一个）
-- **同一个 token 可以挂一个 user 池**（§3.2），服务端自动负载均衡
-- **同一账号的 worker 共享该账号的订阅配额**；不同账号配额独立
-- Anthropic 订阅有 per-OAuth 隐含并发限制（约 2-3 并发）；**单账号 pool
-  建议 ≤ 5**（实测可以撑，再大会撞 429 / 上游沉默）。多账号模式下
-  `accounts:` 里每个账号的 `workers` 都遵守这条上限
-- 跨账号请求由 `SessionManager.pick` 自动调度（限流过滤 + 会话亲和 +
-  空闲优先 + RR，见 §1.9），客户端无感
-- **账号限流追踪 + 摘除**：worker 收到 `rate_limit_error`（SSE 错误体 /
-  TUI modal）时，`SessionManager` 把整个**账号**标进冷却表，`pick()`
-  在窗口内跳过它，到期后下一发请求作为 recheck 探针。`/status` /
-  `/ui` 的"账号"列显示剩余冷却时间
-- **冷却时长**分两类来源：
-  - **有权威 reset**（解析到 SSE/modal 的 reset 时间，或命中 weekly /
-    5-hour 文案）→ 用真实窗口（weekly 默认 3600s、5-hour 1800s）
-  - **裸 `rate_limit_error` 无 reset 头**（= 滚动 TPM/RPM 尖峰，几十秒就
-    在上游 reset）→ **per-account 指数退避**：首次只冷却
-    `rate_limit_base_cooldown_seconds`（默认 120s），同账号在恢复间隔内
-    每次 recheck 又被打回就翻倍（120→240→480→…），封顶
-    `rate_limit_max_cooldown_seconds`（默认 600s）；账号恢复（出现一段
-    健康间隔）后自动重置回基数。同账号多 worker 在 5s 内一起 429 算同
-    一次（burst 去重），streak 不会跳级
-- 这样设计避免了"固定长冷却把刚恢复的账号继续 park 导致池子骤缩→级联
-  限流"，同时对真·持续过载的账号又能逐步拉长冷却、不反复 hammer 上游
-
-### 3.5 热重载 `/admin/reload`
-
-改完 `config.yaml` 后**不用重启容器**：
+### 2.5 热重载
 
 ```bash
 curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/admin/reload
 ```
 
-服务会重读 `config.yaml`，diff 后应用所有**可热重载**的字段，对**需要
-重启**的字段输出 warning 不去碰。可热重载字段见 §3.1 表格的"热重载？"
-列。
-
-`users` 字段的热增删特殊处理：
-
-- **新增 user_id** → 自动 spawn + prewarm
-- **删除 user_id** → 立即 stop 该 worker（in-flight 请求被 None 哨兵关掉），从 manager.sessions 弹出
-- **改 pool 成员** → 按差集处理（新增的 prewarm，移除的 stop）
-
-返回示例：
-
-```json
-{
-  "ok": true,
-  "changes": [
-    "claude.timeouts.status_stall_seconds: 30.0 -> 60.0",
-    "claude.restart_interval_seconds: 14400 -> 10800",
-    "users tokens: +1 -0",
-    "users added (prewarmed): [\"litellm-3\"]"
-  ],
-  "warnings": [
-    "listen_port: 8787 -> 9000 (ignored — requires container restart)"
-  ]
-}
-```
-
-某些 timeout（`mitm_intercept_seconds` / `response_stall_seconds`）是
-worker subprocess 启动时通过 CLI argv 注入的，热重载后**只对新 spawn
-的 worker 生效**。要让立刻生效，对每个 worker 跑一次
-`POST /admin/workers/{id}/restart`。
-
-### 3.6 `claude.timeouts.*` 微调项
-
-7 个 timeout 都有合理默认；只在确实看到对应失败时再调。
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `mitm_intercept_seconds` | 90 | PTY 触发后 mitm 多久没拦到 `/v1/messages` 就放弃。CC sub-agent 触发的 tool permission dialog cascade 在 dismiss 期间不发上游请求——90s 留出足够余量。worker 启动时通过 argv 注入，**reload 只对新 spawn 生效** |
-| `status_stall_seconds` | 30 | `/status` 把 in-flight 标为 `stuck` 的阈值（没收到字节多久）。仅显示用，不触发动作 |
-| `response_stall_seconds` | 90 | mitm watchdog 触发阈值。hijack 完后多久没收到 chunk 就强制关闭 channel。覆盖故障 B（上游沉默不回 headers）+ 故障 C（上游回了错误信封后挂起）。**reload 只对新 spawn 生效** |
-| `restart_drain_seconds` | 60 | 定时重启 / admin restart 时等 in-flight 排空的最长时间 |
-| `worker_ready_seconds` | 60 | 新 worker 多久没在 stdout 喊 `{"type":"ready"}` 就 kill 重来 |
-| `prewarm_seconds` | 60 | bootstrap prewarm 上限。超时不致命（worker 仍可用，首发请求可能要重试一次） |
-| `restart_check_interval_seconds` | 60 | `_restarter` 巡检间隔 |
-
-### 3.7 `oauth_refresh.*` 集中刷新
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `enabled` | true | 关掉的话 worker 回退到自刷新，多 worker 撞 RT 轮换的 race 会重现（详见 §1.10）。**仅用于排障** |
-| `check_interval_seconds` | 300 | 主进程后台任务每多久检查一次 `.credentials.json` 的 `expiresAt` |
-| `refresh_when_expires_within_seconds` | 3600 | token 距离过期 < 这个窗口就主动刷 |
-
-设计要点（详见 §1.10）：
-
-- 主进程是 `/v1/oauth/token` 的**唯一写入者** → 物理上不可能撞 RT 轮换
-- worker 内存里 token 在 `claude.restart_interval_seconds`（默认 4h）
-  内一定被替换，**worker 永远不需要自刷新**
-- `enabled=false` 时启动 log 会喊 warning；通过 `/admin/reload` 改成
-  true 会立即起后台任务并跑一次 initial check
-
-强制立即刷一次（不等 5 分钟周期）：
-
-```bash
-curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/admin/refresh-now
-# {"ok":true,"result":"refreshed"}  // 或 "not_needed" / "failed"
-```
-
-### 3.8 用量统计 `usage.*`
-
-```yaml
-usage:
-  enabled: true
-  # 容器内路径。Docker 部署里把宿主机 ./data 挂到 /data/proxy（见 docker-compose.yml）
-  # —— 默认路径 /data/proxy/usage.db 正好落在挂载点里，重建容器后历史还在。
-  db_path: /data/proxy/usage.db
-```
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `enabled` | `true` | 关掉后 worker 仍会发 usage IPC（成本可忽略），主进程不写盘；`/admin/usage` 返回 503，UI 用量面板显示原因 |
-| `db_path` | `./data/usage.db` (容器 `/data/proxy/usage.db`) | sqlite 文件路径。父目录会自动 mkdir。Docker 部署务必落在 bind 挂载内 |
-
-**数据库 schema**：`usage_events(id, ts, account, worker, litellm_user, model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)` —— event-stream 形态，不预聚合，方便以后改维度不影响历史。索引在 `ts`、`(account, ts)`、`(worker, ts)`。
-
-**估算 USD 的价格表**写死在 `src/usage.py` 的 `PRICING`：
-
-| 模型族 | input $/MTok | output $/MTok | cache_write $/MTok | cache_read $/MTok |
-|---|---|---|---|---|
-| `claude-opus-4*` | 15.00 | 75.00 | 18.75 | 1.50 |
-| `claude-sonnet-4*` | 3.00 | 15.00 | 3.75 | 0.30 |
-| `claude-haiku-4*` | 0.80 | 4.00 | 1.00 | 0.08 |
-
-新版本 / 不识别的模型，`estimated_usd` 返回 `null`，UI 显示 `—`（不显示 `$0.00` 避免误导）。Anthropic 调价时改这张表即可。
-
-**故障排查**：UI 用量面板空空如也 →
-
-1. 看 `/admin/usage?range=today&group_by=account` 是否 200。503 时 detail 字段会直接说明原因（"config.usage.enabled=false" / "usage store init failed: ... Permission denied" 等）
-2. Permission 问题最常见：宿主机 `./data` 目录在 docker 自动创建时是 root 所有 → `sudo chown -R 1000:1000 ./data && docker compose restart`
-3. 完全没数据：确认 `/v1/messages` 真的走完了（`/status` 里 `total_requests` 有增长）。mitm 始终对上游强制 `stream: true`，所以非流式 API 调用照样会触发 usage 抓取
-4. 数据只有部分行：通常是上游 429 / 错误响应（没有 `message_start` 就没 token 数）
-
-### 3.9 日志级别
-
-容器默认 `LOG_LEVEL=INFO`：只打 lifecycle 事件（worker spawn / restart / prewarm 起止 / OAuth refresh / 账号级 rate-limit 触发 / admin 调用）。**正常 traffic 不打 per-request 日志**——每请求几行的 INFO（mitm hijack、body 改写、SSE 流末等）全部降到 DEBUG，所以 `docker logs` 看到的是稀疏的运维信号。
-
-调试某次请求细节时切到 DEBUG：
-
-```yaml
-# docker-compose.yml
-environment:
-  LOG_LEVEL: DEBUG
-```
-
-restart 后 mitm hijack / claude CLI 外呼、body 字段改写、SSE 完成、429 详情等都会回来。
-
-### 3.10 dev 模式（不走 Docker）
-
-本机直跑要把 `config.yaml` 里两条路径改回相对：
-
-```yaml
-mitm:
-  ca_cert: ~/.mitmproxy/mitmproxy-ca-cert.pem
-claude:
-  home_template: ./users/{user_id}
-```
-
-启动：
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# 预生成 mitm CA
-timeout 5 mitmdump --listen-port 19998 -q
-
-# HOME 指向有 .claude/.credentials.json 的家目录
-HOME=/home/coder CONFIG=config.yaml LOG_LEVEL=INFO python3 -m src.main
-```
+可热重载字段见 §2.1 表"热重载"列。`mitm_intercept_seconds` / `response_stall_seconds` 通过 worker argv 注入，只对新 spawn 的 worker 生效——立即生效要 `POST /admin/workers/{id}/restart`。
 
 ---
 
-## 4. API 使用
+## 3. API 使用
 
 两种鉴权方式任选：`Authorization: Bearer <token>` 或 `x-api-key: <token>`。
-下面例子都用对外端口 `18787`。
 
-### 4.1 Anthropic 原生 — `POST /v1/messages`
+### 3.1 Anthropic 原生 — `POST /v1/messages`
 
 ```bash
-KEY=sk-internal-...
-
 # 非流
 curl -sS -X POST http://127.0.0.1:18787/v1/messages \
   -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-opus-4-7",
-    "max_tokens": 512,
-    "messages": [{"role":"user","content":"TCP 三次握手用 3 行解释"}]
-  }'
+  -d '{"model":"claude-opus-4-7","max_tokens":512,
+       "messages":[{"role":"user","content":"hi"}]}'
 
 # 流式
 curl -sS -N -X POST http://127.0.0.1:18787/v1/messages \
@@ -1347,195 +240,279 @@ curl -sS -N -X POST http://127.0.0.1:18787/v1/messages \
        "messages":[{"role":"user","content":"hi"}]}'
 ```
 
-**带自定义 system**（替换 claude code 原人设，只保留计费头）：
+**自定义 system**（替换 claude code 原人设，保留计费头）：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18787/v1/messages \
   -H "Authorization: Bearer $KEY" \
-  -d '{
-    "model": "claude-opus-4-7",
-    "max_tokens": 256,
-    "system": "You are a terse code reviewer. Reply in at most three bullets.",
-    "messages": [{"role":"user","content":"评审：`eval(user_input)` 有问题吗？"}]
-  }'
+  -d '{"model":"claude-opus-4-7","max_tokens":256,
+       "system":"You are a terse code reviewer. Reply in at most three bullets.",
+       "messages":[{"role":"user","content":"评审：eval(user_input)"}]}'
 ```
 
-你的 system 带自动 `cache_control: ephemeral`，重复用便宜很多
-（响应里 `usage.cache_read_input_tokens` 增长 = 命中缓存）。
+你的 system 自动带 `cache_control: ephemeral`，重复用便宜很多。
 
-**完全禁工具**（避免 claude code 内置工具污染输出）：
+**禁用 claude code 内置工具**：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:18787/v1/messages \
-  -H "Authorization: Bearer $KEY" \
-  -d '{
-    "model": "claude-opus-4-7",
-    "max_tokens": 256,
-    "tool_choice": {"type": "none"},
-    "messages": [{"role":"user","content":"翻译成英文：今天天气真好"}]
-  }'
+# 法 1：不调用任何工具
+"tool_choice": {"type": "none"}
+# 法 2：传你自己的 tools[] 完全覆盖内置 11 个
 ```
 
-或者传你自己的 `tools: [...]` 完全覆盖内置 11 个。
-
-### 4.2 OpenAI 兼容 — `POST /v1/chat/completions`
+### 3.2 OpenAI 兼容 — `POST /v1/chat/completions`
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18787/v1/chat/completions \
   -H "Authorization: Bearer $KEY" \
-  -d '{
-    "model": "claude-opus-4-7",
-    "stream": true,
-    "messages": [
-      {"role":"system","content":"Be concise."},
-      {"role":"user","content":"What is HTTP/2 multiplexing?"}
-    ]
-  }'
+  -d '{"model":"claude-opus-4-7","stream":true,
+       "messages":[
+         {"role":"system","content":"Be concise."},
+         {"role":"user","content":"What is HTTP/2 multiplexing?"}
+       ]}'
 ```
 
-字段转换在 `src/api/translate.py`：OpenAI 的 `messages[].role=system` 会
-被提取成 Anthropic 的 `system` 字段，`tools` / `tool_calls` 双向映射，
-响应里 Anthropic 的 `content[].type=tool_use` 转成 OpenAI 的
-`message.tool_calls`。
+字段转换由 `src/api/translate.py` 完成（OpenAI `system` → Anthropic `system`，`tools` / `tool_calls` 双向映射）。
 
-### 4.3 Python SDK
-
-**Anthropic SDK**：
+### 3.3 Python SDK
 
 ```python
+# Anthropic SDK
 from anthropic import Anthropic
 client = Anthropic(base_url="http://127.0.0.1:18787", api_key=KEY)
 resp = client.messages.create(
     model="claude-opus-4-7", max_tokens=256,
-    messages=[{"role": "user", "content": "Hi"}],
-)
-print(resp.content[0].text)
-```
+    messages=[{"role":"user","content":"hi"}])
 
-**OpenAI SDK**：
-
-```python
+# OpenAI SDK
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:18787/v1", api_key=KEY)
 resp = client.chat.completions.create(
     model="claude-opus-4-7",
-    messages=[{"role": "user", "content": "Hi"}],
-)
-print(resp.choices[0].message.content)
+    messages=[{"role":"user","content":"hi"}])
 ```
 
-### 4.4 LiteLLM 接入
+### 3.4 LiteLLM 接入
 
-`PROXY_HOST` 换成部署机 IP，端口用对外的 `18787`。配合 §3.2 的 user
-池写法，**LiteLLM 侧只配一个 key**，本服务自动并行到池里多个 worker。
-
-**LiteLLM Proxy（YAML）**：
+LiteLLM 侧**只配一个 key**，本服务自动 pool 并发。
 
 ```yaml
 model_list:
-  # Anthropic 原生路径（推荐：少一层转换）
-  - model_name: claude-opus-sub              # 下游用这个名字
+  # Anthropic 原生路径（推荐，少一层转换）
+  - model_name: claude-opus-sub
     litellm_params:
-      model: anthropic/claude-opus-4-7       # 真实模型 ID（必须！）
-      api_base: http://PROXY_HOST:18787      # 不带 /v1，不要尾斜杠
-      api_key: sk-internal-...               # 单 key 即可，本服务侧 pool 做并发
+      model: anthropic/claude-opus-4-7         # 真实模型 ID（必须！）
+      api_base: http://PROXY_HOST:18787        # 不带 /v1
+      api_key: sk-internal-...
 
-  # OpenAI 兼容路径（如果下游只发 /v1/chat/completions）
+  # OpenAI 兼容路径
   - model_name: claude-opus-openai
     litellm_params:
       model: openai/claude-opus-4-7
-      api_base: http://PROXY_HOST:18787/v1   # 注意带 /v1
+      api_base: http://PROXY_HOST:18787/v1     # 带 /v1
       api_key: sk-internal-...
 ```
 
-启动 + 验证：
+> 常见错配：把 `model_name` 和 `model` 填一样，LiteLLM 把别名当真实 ID 发出去 → `KeyError: 'stop_reason'`。
 
-```bash
-litellm --config proxy_config.yaml --port 4000
-
-curl -sS http://127.0.0.1:4000/v1/chat/completions \
-  -H 'Authorization: Bearer anything' \
-  -d '{"model":"claude-opus-sub","messages":[{"role":"user","content":"hi"}]}'
-```
-
-**LiteLLM Admin Web UI — Add Model**：
-
-| 字段 | 填什么 |
-|---|---|
-| **Provider** | `Anthropic` |
-| **LiteLLM Model** / **Model ID**（发给 provider 的字段） | `claude-opus-4-7` ← 必须是真实模型 ID |
-| **Public Model Name** / **Model Name**（对外别名） | `claude-opus-sub`（随便起） |
-| **API Key** | `sk-internal-...` |
-| **API Base**（在 Advanced 里展开） | `http://PROXY_HOST:18787` 不带 /v1 |
-
-> **最常见的错配**：把"Public Model Name"和"LiteLLM Model"两个字段填成
-> 一样，结果 LiteLLM 把 `claude-opus-sub` 当真实模型 ID 发给 Anthropic，
-> Anthropic 返回 error 事件 → LiteLLM 解析时 `KeyError: 'stop_reason'`。
-
-**透传 LiteLLM 用户身份到 /status 和 /ui**（可选）：
-
-LiteLLM Proxy 默认用自己配置里的 `api_key` 鉴权到我们，所以我们只看到
-LiteLLM 的"出口身份"，不知道终端用户是谁。打开下面这个开关后 LiteLLM
-会自动给上游请求加一组 `x-litellm-user-api-key-*` header（`alias` /
-`user_id` / `team_id` / `user_email` / `spend` 等），我们这边自动捕获
-并展示到 `/status` 的 `in_flight_detail[].body.litellm` 和 `/ui` 监控页
-的「LiteLLM 用户」列：
+**透传 LiteLLM 用户身份到 /ui**（可选，**需要 LiteLLM ≥ v1.85.0**）：
 
 ```yaml
-# 加在 LiteLLM proxy_config.yaml 顶层
+# proxy_config.yaml 顶层
 litellm_settings:
   add_user_information_to_llm_headers: true
 ```
 
-> ⚠ **必须 LiteLLM ≥ v1.85.0**。早期版本（包括 v1.84.x）有 [#27458](https://github.com/BerriAI/litellm/issues/27458)
-> bug：`add_user_information_to_llm_headers` 会把 `user_api_key_spend`
-> / `user_api_key_max_budget` 这些 float 字段直接当 header value 塞给
-> httpx，触发 `Header value must be str or bytes, not <class 'float'>`，
-> **所有请求都会 500**。修复在 v1.85.0-rc.2 起，建议直接升到 v1.85.1+。
+打开后 LiteLLM 会发 `x-litellm-user-api-key-*` 头，本服务自动捕获显示到 dashboard 的「LiteLLM 用户」列。v1.84.x 及更早有 [#27458](https://github.com/BerriAI/litellm/issues/27458) bug，**所有请求 500**。
 
-不开也完全能用，只是 /status 看不到上游用户归属。详见
-[LiteLLM 文档](https://docs.litellm.ai/docs/proxy/forward_client_headers#user-information-headers-optional)。
+### 3.5 支持的模型 ID
 
-**LiteLLM Python SDK 直调**：
+任何 Anthropic 接受的 ID 都行，proxy 不维护白名单。常用：
 
-```python
-from litellm import completion
-
-# Anthropic 原生
-resp = completion(
-    model="anthropic/claude-opus-4-7",
-    api_base="http://PROXY_HOST:18787",       # 不带 /v1
-    api_key="sk-internal-...",
-    messages=[{"role": "user", "content": "hi"}],
-)
-
-# OpenAI 兼容
-resp = completion(
-    model="openai/claude-opus-4-7",
-    api_base="http://PROXY_HOST:18787/v1",    # 带 /v1
-    api_key="sk-internal-...",
-    messages=[{"role": "user", "content": "hi"}],
-)
-```
-
-### 4.5 支持的模型 ID
-
-任何 Anthropic 接受的模型 ID 都能用 —— proxy 不维护白名单。常用：
-
-- `claude-opus-4-7`
-- `claude-sonnet-4-6`
+- `claude-opus-4-7` / `claude-opus-4-6` / `claude-opus-4-5-20251101`
+- `claude-sonnet-4-6` / `claude-sonnet-4-5-20250929`
 - `claude-haiku-4-5-20251001`
 
-### 4.6 响应里的关键字段
+---
 
-- `stop_reason: "end_turn"` —— 正常结束
-- `stop_reason: "max_tokens"` —— 达到长度上限
-- `stop_reason: "tool_use"` —— 模型想调工具（如果你启用了 tools）
-- `stop_reason: "error"` —— 上游异常，`content[0].text` 含 `[upstream xxx]` 错误描述
-- `usage.input_tokens` / `usage.output_tokens` —— 本次 token 用量
-- `usage.cache_read_input_tokens` —— 命中 prompt cache 的 input token 数
-  （> 0 说明走的是订阅配额，CLI 系统 prompt 被缓存了）
+## 4. 运维与监控
 
-非流式响应有空内容的情况兜底：`_collapse_stream` 会保证返回的 message
-一定有 `stop_reason` 字段，并把上游 error 内容塞进 `content[0].text`，
-下游 LiteLLM / SDK 不会因解析失败而崩。
+### 4.1 Dashboard `/ui`
+
+浏览器打开 `http://YOUR-HOST:18787/ui`，输入 API key。包含：
+
+- **系统概览**——worker / 账号 健康度汇总
+- **订阅配额**——按账号优先级分组的配额卡（5h / 7d 合计 / 7d sonnet 三条 bar）
+- **账号路由状态**——按优先级分组的可折叠列表，每行显示状态徽章 + lane pills（`5h / 7d / snt` 利用率）+ 剩余冷却；支持「全部 / 限流中 / 健康」过滤
+- **用量统计**——按账号 / worker / LiteLLM 用户聚合，估算 USD；按 lifecycle / today / 7d 切换
+- **Worker 运行状态**——每 worker 一行，含状态徽章 / 当前任务 preview / 重启按钮
+
+状态徽章会精确反映**车道**："sonnet 限流" / "全部限流" / "5h 限流"——比单纯说"限流"信息密度高一档。
+
+### 4.2 `/status` 实时状态
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/status | jq
+```
+
+关键字段：
+
+| 字段 | 含义 |
+|---|---|
+| `worker_count` / `alive_count` / `busy_count` / `stuck_count` | 顶层汇总，**真在干活 = busy - stuck** |
+| `workers[].in_flight` / `stuck` | 当前挂了几个请求 / 任一 stalled > 30s |
+| `workers[].in_flight_detail[].bytes_received` | 上游字节数；0 = 还没回过；150-170 = 典型错误信封 |
+| `workers[].in_flight_detail[].stalled_seconds` | 距上次收字节多久；> 90s watchdog 自动回收 |
+| `accounts[].lanes` | 按 lane 分的 RL 状态（`5h` / `unified` / `sonnet` / `degraded`） |
+
+### 4.3 `/admin/*` 运维端点
+
+```bash
+# 改完 config.yaml 后热重载
+curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/admin/reload
+
+# 单独重启 worker（drain in-flight → restart → prewarm）
+curl -X POST -H "Authorization: Bearer $KEY" \
+  http://127.0.0.1:18787/admin/workers/claude-1-0/restart
+
+# 强刷一次 OAuth（跳过 5min 周期）
+curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:18787/admin/refresh-now
+
+# token 用量查询
+curl -s -H "Authorization: Bearer $KEY" \
+  "http://127.0.0.1:18787/admin/usage?range=today&group_by=account"
+
+# 手动设置 / 解除限流标记
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"reset_at":"May 27, 12am UTC","reason":"weekly_limit"}' \
+  http://127.0.0.1:18787/admin/accounts/claude-1/set-rate-limit
+curl -X POST -H "Authorization: Bearer $KEY" \
+  http://127.0.0.1:18787/admin/accounts/claude-1/clear-rate-limit
+
+# Dashboard 添加新账号
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"name":"claude-3","workers":5,"priority":100}' \
+  http://127.0.0.1:18787/admin/accounts/new
+```
+
+### 4.4 加账号 / 加用户
+
+**加账号**（三处必须同时改）：
+
+1. 宿主机准备 `/data/shared-auth/claude-N/`，`chown -R 1000:1000`
+2. `docker-compose.yml` 的 `volumes:` 加 bind mount
+3. `config.yaml` 的 `accounts:` 加一段
+4. `docker compose up -d --force-recreate`（新挂载必须重建）
+
+**或者直接走 Dashboard**：`/ui` 右上角「+ 添加账号」会引导 OAuth login，自动写 `data/accounts.runtime.yaml`，热生效不用重启。
+
+### 4.5 日志级别
+
+容器默认 `LOG_LEVEL=INFO`——只打 lifecycle 事件（spawn / restart / 限流 / admin 调用），正常 traffic 不打 per-request 日志。
+
+调试切到 DEBUG：
+
+```yaml
+# docker-compose.yml
+environment:
+  LOG_LEVEL: DEBUG
+```
+
+restart 后 mitm hijack / body 改写 / SSE 末态 / 429 详情等都会回来。
+
+### 4.6 暴露给其他主机
+
+默认绑到 `0.0.0.0:18787`，局域网内可直接访问（用来接 LiteLLM）。强烈建议：
+
+- 仅在受信任内网开放
+- 或前置 nginx / caddy 做 TLS + IP 白名单
+- **绝不要暴露到公网**——无速率限制，且违反 ToS
+
+仅本机访问：把 compose 的 `ports` 改成 `"127.0.0.1:18787:8787"`。
+
+---
+
+## 5. 工作原理（简版）
+
+完整数据流：
+
+```
+HTTP 请求
+   ↓ FastAPI 鉴权 + 池子选 worker
+   ↓ stdin JSON 行 IPC
+worker 子进程：
+   · mitmproxy 监听 18000+N（HTTPS_PROXY + NODE_EXTRA_CA_CERTS 让 claude 信任 mitm CA）
+   · claude CLI 跑在 PTY 里
+   · "say hi\r" 触发 claude 发 POST /v1/messages?beta=true（带完整订阅指纹）
+   · mitm 拦下，按白名单合并用户 body 进去，转发
+   · 响应字节经 mitm `_tap` 双向喂：①送给 channel 流回主进程 ②回灌给 claude 让 TUI 不卡
+   ↓ stdout JSON 行 IPC
+主进程 StreamingResponse → 客户端
+```
+
+**为什么不直接拼请求？** Anthropic 用 10+ 项指纹（`system[0]` 计费头、`User-Agent`、`anthropic-beta`、`x-stainless-*`、完整 `tools[]`、`metadata` 等）判定订阅 vs API 配额。手工拼难以长期跟上 CLI 升级。让真实 CLI 发包是最稳的"借身份"。
+
+**body 合并规则**（`src/mitm/addon.py:_merge_body`）：
+
+| 字段 | 谁说了算 | 原因 |
+|---|---|---|
+| `messages` / `model` / `max_tokens` / `temperature` / `tools` / `tool_choice` | 用户 | 业务输入 |
+| `system` 块 0（计费头）+ 用户的 system 块（自动加 `cache_control: ephemeral`） | **混合** | 保身份 + 用户指令生效 + 后续缓存命中 |
+| `User-Agent` / `anthropic-*` / `x-stainless-*` / `metadata` / `thinking` / `output_config` | claude 原值 | identity 指纹 |
+
+> 客户端没传 `tools[]` 时 claude 内置的 11 个工具（Bash/Read/Edit/...）会原样留——模型可能去调它们。要禁工具：`"tool_choice": {"type": "none"}`，或传自己的 `tools[]` 覆盖。
+
+### 5.1 自愈兜底（部分）
+
+| 触发 | 行为 |
+|---|---|
+| PTY 触发后 90s 无 mitm 拦截 | 关闭 channel + dump PTY screen tail 到日志（覆盖 TUI 卡 modal 吞 keystroke） |
+| TUI 弹工具权限对话框 | 自动写 `\x1b` (Esc) dismiss（最常见的卡住根因） |
+| hijack 后 90s 无上游 chunk | watchdog 强制关闭 channel 唤醒 worker |
+| 流式响应 0 byte / 半截 SSE | 合成完整合法 SSE 序列防客户端崩 |
+| primary worker 10s 无首字节 | hedge 并发 backup worker，谁先吐字节用谁 |
+| 连续 N 次 intercept 失败 | 强制重启该 worker 自愈 |
+| 账号收到 `rate_limit_error` | 标进车道冷却表（5h / unified / sonnet 独立），picker 按 model 跳过 |
+| worker age > 4h | 定时 drain + restart + prewarm（清 CLI 内存 + 换 token） |
+
+详见 `src/session/manager.py` 和 `src/worker.py`。
+
+### 5.2 凭据共享
+
+每个账号一个目录 `/data/shared-auth/<name>/`，同账号的 N 个 worker 都把 `$HOME/.claude` **目录级 symlink** 到这里——共享 OAuth 凭据。主进程 `OAuthRefresher` 是该 `.credentials.json` 的**唯一写入者**（每 5min 检查，距过期 < 1h 就刷），物理上排除多 worker 撞 refresh_token 轮换的竞态。
+
+> 必须**目录级 symlink**：claude CLI 写 token 用"写 tmp + rename"，文件级 symlink 会被 rename 直接覆盖成真文件，导致 refresh 写不回源。
+
+---
+
+## 6. 常见问题
+
+**Q: 启动 entrypoint 报 `Missing: /data/shared-auth/claude-N/.credentials.json`？**
+A: docker-compose 的 `volumes:` 漏了对应账号的 bind mount。加上后 `docker compose up -d --force-recreate`。
+
+**Q: 启动卡在 `bootstrap prewarm`？**
+A: 90% 是 `.claude.json` 没拷上，TUI 显示 `Not logged in`。检查每个账号目录是否同时有 `.credentials.json` 和 `.claude.json` 两个文件。
+
+**Q: 请求一直 429？**
+A: 单账号 worker 数太多。订阅 OAuth 实测并发上限 2-3，pool 配 10 个 worker 共用一个账号 = 7-8 倍超限。把 `workers:` 降到 5 以下，或加多账号摊开。
+
+**Q: 监控面板上某个账号显示 `sonnet 限流` 但不是 `全部限流`？**
+A: Anthropic 的 sonnet 子配额满了，但 unified 7d 还有空间——proxy 现在按车道分离路由，opus 请求仍能落到这账号，sonnet 自动跳过。
+
+**Q: `usage.cache_read_input_tokens` 一直是 0？**
+A: 上游没命中 prompt cache，可能没走订阅配额。检查响应 header 里有没有 `anthropic-billing-tier`，或换台无中间代理直连试。
+
+**Q: token 刷新没生效？**
+A: 主进程是唯一刷新者，强刷一次 `POST /admin/refresh-now` 看返回。返回 `failed` 说明 OAuth 端点拒绝了，多半是 refresh_token 已被作废——需要重新 `claude /login` 后同步凭据目录。
+
+**Q: dev 模式本机直跑？**
+A: `config.yaml` 把两条路径改回 `~/.mitmproxy/...` 和 `./users/{user_id}`，然后 `HOME=/path/to/.claude-host CONFIG=config.yaml python3 -m src.main`。
+
+**Q: 想看更多实现细节？**
+A: 关键文件索引：
+- 请求流：`src/api/anthropic.py`（`_open_request`）+ `src/mitm/addon.py`（`_merge_body` / `responseheaders`）
+- 路由 + 限流 + affinity：`src/session/manager.py`（`pick` / `_account_rl` / `_select_for_new_session`）
+- worker 生命周期：`src/worker.py` + `src/pty_driver.py`
+- OAuth 刷新：`src/oauth_refresh.py`
+- 配额监控：`src/quota_probe.py`
+- Dashboard：`src/static/admin.html`
